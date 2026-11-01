@@ -102,7 +102,6 @@ _state = {
     "replaced_backend": None,
     "default_int8_configs": None,
     "w4a8": None,
-    "w4a8_int8_cache": True,
     "reason": "",
 }
 
@@ -195,7 +194,7 @@ def load_int8_gemv():
 
 
 def load_w4a8_gemv():
-    """Import the 4-bit decode GEMV kernel module shipped next to this file."""
+    """Import the 4-bit weight kernel module shipped next to this file."""
     try:
         from . import w4a8_gemv
         return w4a8_gemv
@@ -374,11 +373,11 @@ def _te_w4a8_ready(module, x):
 def te_w4a8_gemv(module, x):
     """Decode path for grouped 4-bit text-encoder weights.
 
-    The uniform grid is the only fast one: the shipped Lloyd-Max codebook decodes
-    through a per-group level table, so every weight would need its own lookup.
-    Requantized layers (`tools/requant_uniform4.py`) carry no codebook and go
-    straight to the register-level nibble unpack. Prefill and anything else
-    returns None and keeps the kitchen dequant + int8 GEMM path.
+    Uniform weights go straight to the register-level nibble unpack. A Lloyd-Max
+    codebook (the shipped w4a8 checkpoints) resolves through a 16-entry table:
+    eight bytes per `v_perm_b32` and the code's top bit picks which half, so the
+    decode stays in the dot. Prefill keeps the int8 route instead, one streaming
+    pass per layer, because its GEMM wants a contiguous int8 tile.
     """
     gemv = _state["w4a8"]
     if gemv is None:
@@ -389,41 +388,35 @@ def te_w4a8_gemv(module, x):
     params = weight._params
     rows = x.reshape(-1, x.shape[-1])
     qdata, s_rel, s_channel, correction, codebook = AsymW4A8Int8Layout.get_plain_tensors(weight)
-    if correction is not None or codebook is not None:
+    if correction is not None:
         return None
     if x.dtype is not torch.float32 or not x.is_contiguous():
         return None
     if rows.shape[0] > gemv.MAX_M:
-        if not _state["w4a8_int8_cache"]:
+        w8 = gemv.decode_int8(qdata, s_rel, params.group_size, codebook)
+        if w8 is None:
             return None
-        w8, s8 = _w4a8_int8_weight(module, qdata, s_rel, s_channel, params.group_size)
-        from comfy_kitchen.backends.triton import quantization
+        out = select_int8_gemv(rows, w8, s_channel, module.bias, x.dtype, None, None,
+                               params.convrot_groupsize)
+        if out is None:
+            from comfy_kitchen.backends.triton import quantization
 
-        out = quantization.int8_linear(rows, w8, s8, module.bias, out_dtype=x.dtype,
-                                       convrot=True, convrot_groupsize=params.convrot_groupsize)
+            out = quantization.int8_linear(rows, w8, s_channel, module.bias, out_dtype=x.dtype,
+                                           convrot=True, convrot_groupsize=params.convrot_groupsize)
     else:
+        levels = inv_level = None
+        if codebook is not None:
+            cached = getattr(module, "_gfx906_levels", None)
+            if cached is None:
+                cached = gemv.codebook_words(codebook)
+                module._gfx906_levels = cached
+            levels, inv_level = cached
         out = gemv.linear(rows, qdata, s_rel, s_channel, module.bias, x.dtype,
-                          params.group_size, params.convrot_groupsize)
+                          params.group_size, params.convrot_groupsize,
+                          levels=levels, inv_level=inv_level or 1.0)
     if out is None:
         return None
     return out.view(*x.shape[:-1], out.shape[-1])
-
-
-def _w4a8_int8_weight(module, qdata, s_rel, s_channel, group_size):
-    """Decode one layer to int8 once, for the prefill GEMM.
-
-    Prefill only happens once per generation but runs the widest matmul of the
-    step, and kitchen's w4a8 path pays a full dequant of every weight on every
-    call. Keeping one decoded copy per layer turns that back into the int8 GEMM
-    the int8 checkpoint already runs, at the cost of an int8-sized cache.
-    """
-    cached = getattr(module, "_gfx906_int8", None)
-    if cached is None:
-        from comfy_kitchen.backends.eager.w4a8_int8 import _dequant_int4_grouped_to_int8
-
-        cached = (_dequant_int4_grouped_to_int8(qdata, s_rel, None, group_size), s_channel)
-        module._gfx906_int8 = cached
-    return cached
 
 
 def _same_dtype(out, ref):
@@ -1434,11 +1427,9 @@ def apply():
     qwen35_on = os.getenv("COMFY_GFX906_QWEN35", "1").strip().lower() not in ("0", "off", "false", "no")
     qwen35_model = load_qwen35_model() if tuned and qwen35_on else None
     _state["qwen35_node_model"] = bool(qwen35_model and qwen35_model.install())
-    # decode-only 4-bit GEMV for AsymW4A8 weights; prefill keeps the kitchen path
+    # 4-bit weights: register-unpacked GEMV for decode, int8 decode for prefill
     w4a8_on = os.getenv("COMFY_GFX906_W4A8", "1").strip().lower() not in ("0", "off", "false", "no")
     _state["w4a8"] = load_w4a8_gemv() if tuned and w4a8_on else None
-    cache_on = os.getenv("COMFY_GFX906_W4A8_INT8_CACHE", "1").strip().lower() not in ("0", "off", "false", "no")
-    _state["w4a8_int8_cache"] = bool(tuned and w4a8_on and cache_on)
     # the per-block graph hooks live in core on purpose; say so when they are absent
     import comfy.model_prefetch
     _state["resident_graph_patch"] = hasattr(comfy.model_prefetch, "RESIDENT_GRAPH_MODULES")
@@ -1557,7 +1548,7 @@ def status():
         + (", inputs cast to fp16" if _state["attn_fp16"] else ", inputs left in the model dtype")
         + (f", rest to {_state['replaced_backend']}" if _state.get("replaced_backend") else ""),
         f"text encoder {'int8' if _state['te_int8'] else 'default (dequantize per call)'}"
-        + (", 4-bit decode gemv on" if _state["w4a8"] is not None else "")
+        + (", 4-bit weights on" if _state["w4a8"] is not None else "")
         + f", encoder attention {_state['te_attention']}",
     ]
     if _state["int8_linear"]:

@@ -130,11 +130,25 @@ python custom_nodes/ComfyUI-gfx906-Tuning/tools/requant_uniform4.py \
 才能和原 w4a8 的键集合一致；不带时 `mtp="auto"` 自动关闭，走普通单 token 解码。
 
 内核接受 **1–8 行**（MTP 的草拟/校验就是这个宽度），权重仍然只流一遍。prefill（更多行）
-走 int8 GEMM：每层在第一次用到时解码一份 int8 权重缓存下来，之后 prefill 与 int8 原版
-一样快（512 token：481 ms vs 486 ms）。代价是常驻一份 int8 权重（本模型约 6.8 GB），
-显存紧时用 `COMFY_GFX906_W4A8_INT8_CACHE=0` 关掉，prefill 退回每层现解码（约 0.87 s）。
+先用 `decode_int8` 把这一层解成 int8，再交给 kitchen 的 int8 GEMM：多一遍纯带宽的流式
+解码（12288×4096 一层 0.19 ms，全模型约 26 ms），临时显存只多一层 int8（本模型最大
+50 MB）。实测同一 prompt 的编码（1666 → 1785 ms，+7%，其中 GEMM 部分 +8.5%），
+换掉原来常驻 6.8 GB 的 int8 副本。不要把解 nibble 塞进 dot 流里做融合 GEMM：每个解出的
+tile 都要换布局才能进 `tl.dot`，实测比 int8 GEMM 慢 35%。
 
 不要按 8 行把 prefill 切块交给 4-bit 内核：每个块都要重读一遍完整权重。
+
+**原版 `w4a8`（带 16 级 codebook）同样可用**：codebook 在 GEMV 里用 `v_perm_b32` 查表
+（一条指令从 8 字节里按 lane 选一个，码的最高位决定选上半还是下半），级别落到每层一张
+int8 网格、倒数并进 epilogue；省掉的零点归约正好抵掉查表开销，200 层合计 16.4 ms/token
+（uniform 内核 17.5）。12288×4096 一层 0.13 ms。精度上表把码表量化到 1/127 网格，
+权重相对误差约 0.4%（codebook 本身是 7.4%）。prefill 仍先 `decode_int8`（一层 0.24 ms，
+与 `_dequant_int4_grouped_to_int8` 逐位相同）再走 int8 GEMM。
+
+实测（1425 token prompt、开 graph）：原版 w4a8 **1–2 tok/s → 44.6 tok/s**（mtp 关，
+22.4 ms/token，7.38 GB）；mtp 开是 13.5–14.4 tok/s（16.3 GB）。同条件 mtp 关下
+`int8_convrot_uniform4` 是 50.3 tok/s。这份文件带 `mtp.*` 键，`mtp="auto"` 会开启 MTP，
+而 MTP 本身更慢（草拟要跑 1+depth 行），想要速度就显式关掉。
 
 词表头和视觉塔不转换，保持 int8。编码时 `s_rel` 被约束在 `[1, 15.5]`：低于 1 会丢失
 4-bit 的级数、高于 127/8 时最高码被截断。
@@ -219,7 +233,7 @@ decode step 会在 CPU 上开内存。`COMFY_GFX906_GEMV=0` 可关掉 GEMV 与�
 | `COMFY_GFX906_TE` | `int8` | 文本编码器 int8（含生成时的 lm_head） |
 | `COMFY_GFX906_TE_ATTN` | `default` | 文本编码器注意力后端 |
 | `COMFY_GFX906_GEMV` | `1` | 单 token 解码走专用 int8 GEMV |
-| `COMFY_GFX906_W4A8` | `1` | 单 token 解码走 4-bit GEMV（仅无 codebook 的 uniform 权重） |
+| `COMFY_GFX906_W4A8` | `1` | 4-bit 权重：单 token 走 GEMV，prefill 现解 int8（仅无 codebook 的 uniform 权重） |
 | `COMFY_GFX906_VAE` | `1` | VAE conv3d → conv2d |
 | `COMFY_GFX906_QKV` | `1` | QKV 三合一 |
 | `COMFY_GFX906_PROFILE` | `0` | 每次 prompt 结束打印耗时分解 |
