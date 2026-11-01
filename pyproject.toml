@@ -1,0 +1,22 @@
+[project]
+name = "comfyui-gfx906-tuning"
+version = "0.1.0"
+description = "Runtime tuning for gfx906 (MI50 / MI60 / Radeon VII): int8 linear tiles, butterfly convrot rotation, gfx906 attention kernels"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = []
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Repository = "https://github.com/ai-infos/ComfyUI-gfx906-Tuning"
+
+[tool.comfy]
+PublisherId = "TODO-publisher-id"
+DisplayName = "ComfyUI-gfx906-Tuning"
+Icon = ""
+requires-comfyui = ">=0.3.60"
