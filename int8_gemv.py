@@ -32,21 +32,27 @@ ROTATE_WARPS = 4
 
 
 @triton.jit
-def rotate_kernel(x_ptr, h_ptr, out_ptr, gmax_ptr, G: tl.constexpr, BJ: tl.constexpr):
+def rotate_kernel(x_ptr, h_ptr, out_ptr, gmax_ptr, ngroups, k,
+                  G: tl.constexpr, BJ: tl.constexpr):
     """Rotate one activation group and record its max.
 
     out[g, j] = sum_i x[g, i] * h[i, j]; the max over the groups is the row max
     the quantizer needs, so it is collected here instead of in a second pass.
+    One program per (row, group), so a multi-row prefetch batch costs the same
+    launches as a single row.
     """
     pid = tl.program_id(0)
+    row = pid // ngroups
+    g = pid - row * ngroups
+    base = row * k + g * G
     offs = tl.arange(0, G)
-    xg = tl.load(x_ptr + pid * G + offs)
+    xg = tl.load(x_ptr + base + offs)
     mx = 0.0
     for j0 in range(0, G, BJ):
         offs_j = j0 + tl.arange(0, BJ)
         h = tl.load(h_ptr + offs_j[:, None] * G + offs[None, :])
         rot = tl.sum(h * xg[None, :], axis=1)
-        tl.store(out_ptr + pid * G + offs_j, rot)
+        tl.store(out_ptr + base + offs_j, rot)
         mx = tl.maximum(mx, tl.max(tl.abs(rot)))
     tl.store(gmax_ptr + pid, mx)
 
@@ -85,13 +91,14 @@ def gemv_kernel(a_ptr, b_ptr, c_ptr, gmax_ptr, b_scale_ptr, bias_ptr,
 
 
 def rotate(x, groupsize):
-    """Rotate a [1, k] activation; returns the rotated tensor and group maxima."""
-    ngroups = x.shape[1] // groupsize
+    """Rotate an [m, k] activation; returns the rotated tensor and group maxima [m, k // groupsize]."""
+    rows, k = x.shape
+    ngroups = k // groupsize
     h = _build_hadamard(groupsize, device=x.device, dtype=x.dtype)
     rotated = torch.empty_like(x)
-    gmax = torch.empty(ngroups, device=x.device, dtype=torch.float32)
-    rotate_kernel[(ngroups,)](x, h, rotated, gmax, G=groupsize, BJ=BLOCK_J,
-                              num_warps=ROTATE_WARPS)
+    gmax = torch.empty((rows, ngroups), device=x.device, dtype=torch.float32)
+    rotate_kernel[(rows * ngroups,)](x, h, rotated, gmax, ngroups, k, G=groupsize,
+                                     BJ=BLOCK_J, num_warps=ROTATE_WARPS)
     return rotated, gmax, ngroups
 
 

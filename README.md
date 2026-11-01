@@ -126,13 +126,14 @@ python custom_nodes/ComfyUI-gfx906-Tuning/tools/requant_uniform4.py \
   --dst models/text_encoders/xxx_int8_convrot_uniform4.safetensors
 ```
 
-`--merge 另一个checkpoint` 会把源里缺失的键拷过来（通常是 `mtp.*`），但**默认不要用**：
-uniform 4-bit 的权重误差（relL2 0.079）比原 codebook（0.074）略高，MTP 的 draft 对这点
-差异很敏感——带 MTP 时生成会退化成重复 token。不合并时文件里没有 `mtp.fc.weight`，
-`mtp="auto"` 自动关闭，走普通单 token 解码，4-bit GEMV 才生效（这也是它唯一能加速的路径）。
+`--merge 另一个checkpoint` 会把源里缺失的键拷过来（通常是 `mtp.*`）。带 MTP 时需要它
+才能和原 w4a8 的键集合一致；不带时 `mtp="auto"` 自动关闭，走普通单 token 解码。
 
-词表头和视觉塔不转换，保持 int8。编码时 `s_rel` 被约束在 `[1, 15.5]`：prefill 走
-kitchen，它把 `(code-8)·s_rel` 舍入到 int8，低于 1 会丢失 4-bit 的级数、高于 127/8 会截断。
+内核接受 **1–8 行**（MTP 的草拟/校验就是这个宽度），权重仍然只流一遍；prefill 的
+`>8` 行会按 8 行切块调用，所以多行路径也是精确解码，不再落到 kitchen 的中间 int8 网格。
+
+词表头和视觉塔不转换，保持 int8。编码时 `s_rel` 被约束在 `[1, 15.5]`：低于 1 会丢失
+4-bit 的级数、高于 127/8 时最高码被截断。
 
 质量（相对 int8 权重的 relL2，越小越好）：
 
