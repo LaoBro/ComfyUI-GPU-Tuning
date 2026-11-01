@@ -1325,6 +1325,12 @@ def apply():
     qwen35_on = os.getenv("COMFY_GFX906_QWEN35", "1").strip().lower() not in ("0", "off", "false", "no")
     qwen35_model = load_qwen35_model() if tuned and qwen35_on else None
     _state["qwen35_node_model"] = bool(qwen35_model and qwen35_model.install())
+    # the per-block graph hooks live in core on purpose; say so when they are absent
+    import comfy.model_prefetch
+    _state["resident_graph_patch"] = hasattr(comfy.model_prefetch, "RESIDENT_GRAPH_MODULES")
+    if tuned and not _state["resident_graph_patch"]:
+        logging.info("gfx906: resident graph hooks absent, decode runs without per-block CUDA graphs "
+                     "(see custom_nodes/ComfyUI-gfx906-Tuning/core-patches/README.md)")
     if tuned:
         patch_attention()
     else:
