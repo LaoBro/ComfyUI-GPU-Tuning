@@ -117,17 +117,29 @@ int8 张量与 scale，直接调 `int8_gemv.linear`；prefill（多行）和任�
 `w4a8_gemv.py` 用 inline asm 直接发；nibble 在寄存器里展开
 （`w & 0x0F0F0F0F` / `w >> 4`），零点用「组内和 − 8·Σq」修正（逐字节减 8 会借位）。
 
-商店里的 `asym_w4a8_int8` checkpoint 用 16 级 Lloyd-Max codebook，且解码后的
-int8 值每组不同表，等于每个权重一次查表，快不起来。先转成 uniform 网格：
+**优先从 convrot int8 转**：只量化一次，误差最小。已打包的 `asym_w4a8_int8`
+checkpoint 也能转，但它带 16 级 Lloyd-Max codebook，等于再量化一次，误差会多出来。
 
 ```bash
 python custom_nodes/ComfyUI-gfx906-Tuning/tools/requant_uniform4.py \
-  --src models/text_encoders/xxx_w4a8.safetensors \
-  --dst models/text_encoders/xxx_w4a8_uniform4.safetensors
+  --src models/text_encoders/xxx_int8_convrot.safetensors \
+  --dst models/text_encoders/xxx_int8_convrot_uniform4.safetensors \
+  --merge models/text_encoders/xxx_w4a8.safetensors   # 补 int8 源里没有的 mtp 层
 ```
 
-转换只做一次（本机 200 层约 15 s）。质量：相对 int8 权重的 relL2 0.073，
-原 codebook 是 0.070（差 6.5%）。实测 LM 的 linear 从 20.9 → **15.9 ms/step**。
+`--merge` 只拷贝源文件缺失的键（通常是 `mtp.*`）。MTP 存在与否会改变生成的解码
+路径，做 A/B 时两边必须一致。词表头和视觉塔不转换，保持 int8。
+
+质量（相对 int8 权重的 relL2，越小越好）：
+
+| 权重 | 大小 | relL2 |
+|---|---|---|
+| int8 convrot（源） | 9.47 GB | 基准 |
+| 原 w4a8（codebook） | 6.72 GB | 0.0736 |
+| **int8 → uniform4** | 6.72 GB | **0.0784** |
+| w4a8 → uniform4（二次量化） | 6.72 GB | 0.1042 |
+
+转换只做一次（本机 200 层约 13 s）。实测 LM 的 linear 从 20.9 → **15.9 ms/step**。
 
 只在 decode（单行）生效，prefill 仍走 kitchen 的 dequant + int8 GEMM；权重形状
 不被 2048 整除时同样回退。换好之后在 CLIP 加载器里选转换后的文件。
