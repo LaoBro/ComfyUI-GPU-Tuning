@@ -110,6 +110,28 @@ GEMV 内核自己合成行 scale 并在线量化，一条 linear 从 3 次启动
 int8 张量与 scale，直接调 `int8_gemv.linear`；prefill（多行）和任何不满足条件的形状
 照旧走 `F.linear`，行为不变。实测单次 159 → 81 µs，每步省 16 ms。
 
+### 4-bit 权重（可选，需先转换）
+
+解码是带宽问题，权重从 1 字节降到 4 bit 就能少流一半显存。gfx906 有
+`v_dot4_i32_i8`（MI50 的 53 TOPS INT8 就是靠它），Triton 本身不会发这条指令，
+`w4a8_gemv.py` 用 inline asm 直接发；nibble 在寄存器里展开
+（`w & 0x0F0F0F0F` / `w >> 4`），零点用「组内和 − 8·Σq」修正（逐字节减 8 会借位）。
+
+商店里的 `asym_w4a8_int8` checkpoint 用 16 级 Lloyd-Max codebook，且解码后的
+int8 值每组不同表，等于每个权重一次查表，快不起来。先转成 uniform 网格：
+
+```bash
+python custom_nodes/ComfyUI-gfx906-Tuning/tools/requant_uniform4.py \
+  --src models/text_encoders/xxx_w4a8.safetensors \
+  --dst models/text_encoders/xxx_w4a8_uniform4.safetensors
+```
+
+转换只做一次（本机 200 层约 15 s）。质量：相对 int8 权重的 relL2 0.073，
+原 codebook 是 0.070（差 6.5%）。实测 LM 的 linear 从 20.9 → **15.9 ms/step**。
+
+只在 decode（单行）生效，prefill 仍走 kitchen 的 dequant + int8 GEMM；权重形状
+不被 2048 整除时同样回退。换好之后在 CLIP 加载器里选转换后的文件。
+
 ### 现在的时间分解
 
 用真实 2226 token 系统提示词做差分 profile（两个长度相减，扣掉 prefill），每个 decode step：
@@ -176,6 +198,7 @@ decode step 会在 CPU 上开内存。`COMFY_GFX906_GEMV=0` 可关掉 GEMV 与�
 | `COMFY_GFX906_TE` | `int8` | 文本编码器 int8（含生成时的 lm_head） |
 | `COMFY_GFX906_TE_ATTN` | `default` | 文本编码器注意力后端 |
 | `COMFY_GFX906_GEMV` | `1` | 单 token 解码走专用 int8 GEMV |
+| `COMFY_GFX906_W4A8` | `1` | 单 token 解码走 4-bit GEMV（仅无 codebook 的 uniform 权重） |
 | `COMFY_GFX906_VAE` | `1` | VAE conv3d → conv2d |
 | `COMFY_GFX906_QKV` | `1` | QKV 三合一 |
 | `COMFY_GFX906_PROFILE` | `0` | 每次 prompt 结束打印耗时分解 |

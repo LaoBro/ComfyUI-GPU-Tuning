@@ -101,6 +101,7 @@ _state = {
     "triton_backend": None,
     "replaced_backend": None,
     "default_int8_configs": None,
+    "w4a8": None,
     "reason": "",
 }
 
@@ -188,6 +189,20 @@ def load_int8_gemv():
     try:
         import int8_gemv
         return int8_gemv
+    except ImportError:
+        return None
+
+
+def load_w4a8_gemv():
+    """Import the 4-bit decode GEMV kernel module shipped next to this file."""
+    try:
+        from . import w4a8_gemv
+        return w4a8_gemv
+    except ImportError:
+        pass
+    try:
+        import w4a8_gemv
+        return w4a8_gemv
     except ImportError:
         return None
 
@@ -331,6 +346,54 @@ def te_int8_gemv(module, x):
     params = weight._params
     groupsize = getattr(params, "convrot_groupsize", 256) if getattr(params, "convrot", False) else 0
     out = select_int8_gemv(rows, qdata, scale, module.bias, x.dtype, None, None, groupsize)
+    if out is None:
+        return None
+    return out.view(*x.shape[:-1], out.shape[-1])
+
+
+def _te_w4a8_ready(module, x):
+    """True when the packed 4-bit weight can be fed to the w4a8 GEMV."""
+    from comfy_kitchen.tensor import QuantizedTensor
+
+    weight = module.weight
+    return (
+        _state["te_int8"]
+        and _state["w4a8"] is not None
+        and x.is_cuda
+        and isinstance(weight, QuantizedTensor)
+        and weight._layout_cls == "AsymW4A8Int8Layout"
+        and not getattr(weight._params, "transposed", False)
+        and weight.device == x.device
+        and (module.bias is None or module.bias.device == x.device)
+        and not module.weight_function
+        and not module.bias_function
+    )
+
+
+def te_w4a8_gemv(module, x):
+    """Decode path for grouped 4-bit text-encoder weights.
+
+    The uniform grid is the only fast one: the shipped Lloyd-Max codebook decodes
+    through a per-group level table, so every weight would need its own lookup.
+    Requantized layers (`tools/requant_uniform4.py`) carry no codebook and go
+    straight to the register-level nibble unpack. Prefill and anything else
+    returns None and keeps the kitchen dequant + int8 GEMM path.
+    """
+    gemv = _state["w4a8"]
+    if gemv is None:
+        return None
+    from comfy_kitchen.tensor.w4a8_int8 import AsymW4A8Int8Layout
+
+    weight = module.weight
+    params = weight._params
+    rows = x.reshape(-1, x.shape[-1])
+    qdata, s_rel, s_channel, correction, codebook = AsymW4A8Int8Layout.get_plain_tensors(weight)
+    if correction is not None or codebook is not None or rows.shape[0] != 1:
+        return None
+    if x.dtype is not torch.float32 or not x.is_contiguous():
+        return None
+    out = gemv.linear(rows, qdata, s_rel, s_channel, module.bias, x.dtype,
+                      params.group_size, params.convrot_groupsize)
     if out is None:
         return None
     return out.view(*x.shape[:-1], out.shape[-1])
@@ -911,6 +974,11 @@ def patch_text_encoder():
                 if out is not None:
                     return out
                 return torch.nn.functional.linear(input, self.weight, self.bias)
+            if _te_w4a8_ready(self, input):
+                out = te_w4a8_gemv(self, input)
+                if out is not None:
+                    return out
+                return torch.nn.functional.linear(input, self.weight, self.bias)
             out = te_plain_gemv(self, input, compute_dtype, want_requant, weight_only_quant)
             if out is not None:
                 return out
@@ -1325,6 +1393,9 @@ def apply():
     qwen35_on = os.getenv("COMFY_GFX906_QWEN35", "1").strip().lower() not in ("0", "off", "false", "no")
     qwen35_model = load_qwen35_model() if tuned and qwen35_on else None
     _state["qwen35_node_model"] = bool(qwen35_model and qwen35_model.install())
+    # decode-only 4-bit GEMV for AsymW4A8 weights; prefill keeps the kitchen path
+    w4a8_on = os.getenv("COMFY_GFX906_W4A8", "1").strip().lower() not in ("0", "off", "false", "no")
+    _state["w4a8"] = load_w4a8_gemv() if tuned and w4a8_on else None
     # the per-block graph hooks live in core on purpose; say so when they are absent
     import comfy.model_prefetch
     _state["resident_graph_patch"] = hasattr(comfy.model_prefetch, "RESIDENT_GRAPH_MODULES")
@@ -1443,7 +1514,8 @@ def status():
         + (", inputs cast to fp16" if _state["attn_fp16"] else ", inputs left in the model dtype")
         + (f", rest to {_state['replaced_backend']}" if _state.get("replaced_backend") else ""),
         f"text encoder {'int8' if _state['te_int8'] else 'default (dequantize per call)'}"
-        f", encoder attention {_state['te_attention']}",
+        + (", 4-bit decode gemv on" if _state["w4a8"] is not None else "")
+        + f", encoder attention {_state['te_attention']}",
     ]
     if _state["int8_linear"]:
         tile = ", ".join(f"{k}={v}" for k, v in INT8_TILE.items())
