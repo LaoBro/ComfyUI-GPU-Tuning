@@ -123,12 +123,16 @@ checkpoint 也能转，但它带 16 级 Lloyd-Max codebook，等于再量化一�
 ```bash
 python custom_nodes/ComfyUI-gfx906-Tuning/tools/requant_uniform4.py \
   --src models/text_encoders/xxx_int8_convrot.safetensors \
-  --dst models/text_encoders/xxx_int8_convrot_uniform4.safetensors \
-  --merge models/text_encoders/xxx_w4a8.safetensors   # 补 int8 源里没有的 mtp 层
+  --dst models/text_encoders/xxx_int8_convrot_uniform4.safetensors
 ```
 
-`--merge` 只拷贝源文件缺失的键（通常是 `mtp.*`）。MTP 存在与否会改变生成的解码
-路径，做 A/B 时两边必须一致。词表头和视觉塔不转换，保持 int8。
+`--merge 另一个checkpoint` 会把源里缺失的键拷过来（通常是 `mtp.*`），但**默认不要用**：
+uniform 4-bit 的权重误差（relL2 0.079）比原 codebook（0.074）略高，MTP 的 draft 对这点
+差异很敏感——带 MTP 时生成会退化成重复 token。不合并时文件里没有 `mtp.fc.weight`，
+`mtp="auto"` 自动关闭，走普通单 token 解码，4-bit GEMV 才生效（这也是它唯一能加速的路径）。
+
+词表头和视觉塔不转换，保持 int8。编码时 `s_rel` 被约束在 `[1, 15.5]`：prefill 走
+kitchen，它把 `(code-8)·s_rel` 舍入到 int8，低于 1 会丢失 4-bit 的级数、高于 127/8 会截断。
 
 质量（相对 int8 权重的 relL2，越小越好）：
 
@@ -136,8 +140,8 @@ python custom_nodes/ComfyUI-gfx906-Tuning/tools/requant_uniform4.py \
 |---|---|---|
 | int8 convrot（源） | 9.47 GB | 基准 |
 | 原 w4a8（codebook） | 6.72 GB | 0.0736 |
-| **int8 → uniform4** | 6.72 GB | **0.0784** |
-| w4a8 → uniform4（二次量化） | 6.72 GB | 0.1042 |
+| **int8 → uniform4** | 6.45 GB | **0.0786** |
+| w4a8 → uniform4（二次量化） | 6.63 GB | 0.1042 |
 
 转换只做一次（本机 200 层约 13 s）。实测 LM 的 linear 从 20.9 → **15.9 ms/step**。
 

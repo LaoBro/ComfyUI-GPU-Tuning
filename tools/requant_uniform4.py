@@ -28,6 +28,12 @@ DTYPE_SIZE = {"F32": 4, "BF16": 2, "F16": 2, "I8": 1, "U8": 1, "F8_E4M3": 1,
               "F8_E5M2": 1, "I32": 4, "I64": 8, "U32": 4, "U64": 8, "BOOL": 1}
 SCALE_CANDIDATES = (0.85, 0.95, 1.0, 1.05, 1.15)
 ALS_ITERS = 2
+# Both decode paths share one int8 grid: prefill runs kitchen, which rounds
+# (code-8) * s_rel to int8. Below 1 the 16 codes collapse onto fewer int8 values
+# (the layer silently loses resolution), above 127/8 the top code clamps. The
+# decode GEMV uses s_rel * s_channel directly, so only the split is constrained.
+SREL_MIN = 1.0
+SREL_MAX = 15.5
 # Neither the vocabulary head nor the vision tower runs the per-token decode the
 # 4-bit kernel speeds up, so they keep the int8 weight they already have.
 SKIP = ("lm_head", "embed_tokens", ".visual.")
@@ -71,6 +77,12 @@ def search_scale(w, gs):
     return best_s
 
 
+def grid_scale(s_abs, s_channel):
+    """Split a physical group scale into the fp8 s_rel kitchen and the GEMV share."""
+    rel = (s_abs / s_channel.view(-1, 1, 1)).clamp(SREL_MIN, SREL_MAX)
+    return rel.to(torch.float8_e4m3fn)
+
+
 def requant(qdata, s_rel, s_channel, codebook, gs):
     """Returns (packed nibbles, fp8 group scale) on the uniform grid."""
     from comfy_kitchen.backends.eager.w4a8_int8 import _dequant_int4_grouped_to_int8
@@ -81,7 +93,7 @@ def requant(qdata, s_rel, s_channel, codebook, gs):
     w = int8_w.float().view(n, k // gs, gs) * s_channel.view(-1, 1, 1)
     del int8_w
 
-    s_rel_new = (search_scale(w.view(n, k), gs) / s_channel.view(-1, 1, 1)).to(torch.float8_e4m3fn)
+    s_rel_new = grid_scale(search_scale(w.view(n, k), gs), s_channel)
     s_eff = s_rel_new.float() * s_channel.view(-1, 1, 1)
     codes = ((w / s_eff).round().clamp(-8, 7) + 8).to(torch.int32).view(n, k)
     packed = ((codes[:, 0::2] & 0xF) | ((codes[:, 1::2] & 0xF) << 4)).to(torch.int8).contiguous()
@@ -97,7 +109,7 @@ def requant_int8(weight, scale, gs):
     n, k = weight.shape
     w = weight.float() * (scale.view(-1, 1) if scale.numel() > 1 else scale.reshape(()))
     s_channel = (w.abs().amax(1) / 127.0).clamp(min=1e-8)
-    s_rel = (search_scale(w, gs) / s_channel.view(-1, 1, 1)).to(torch.float8_e4m3fn)
+    s_rel = grid_scale(search_scale(w, gs), s_channel)
     s_eff = s_rel.float() * s_channel.view(-1, 1, 1)
     codes = ((w.view(n, k // gs, gs) / s_eff).round().clamp(-8, 7) + 8).to(torch.int32).view(n, k)
     packed = ((codes[:, 0::2] & 0xF) | ((codes[:, 1::2] & 0xF) << 4)).to(torch.int8).contiguous()

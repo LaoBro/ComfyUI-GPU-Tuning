@@ -399,6 +399,20 @@ def te_w4a8_gemv(module, x):
     return out.view(*x.shape[:-1], out.shape[-1])
 
 
+def _same_dtype(out, ref):
+    """Keep a fallback linear in the caller's dtype.
+
+    A quantized layout answers F.linear in its own out_dtype (the weight's
+    orig_dtype), not in the dtype the text encoder executes in. On gfx906
+    should_use_bf16 is False, so generation runs in fp32 while the weights were
+    stored with a bf16/fp16 orig_dtype: the projection comes back bf16, the KV
+    cache is fp32, and attention fails with "expected scalar type BFloat16 but
+    found Float". Every layout that reaches its fallback needs the cast, which is
+    why it sits on the wrapper instead of one branch.
+    """
+    return out if out.dtype == ref.dtype else out.to(ref.dtype)
+
+
 def te_plain_gemv(module, x, compute_dtype=None, want_requant=False, weight_only_quant=False):
     """Single-row GEMV for unquantized text-encoder weights.
 
@@ -973,16 +987,16 @@ def patch_text_encoder():
                 out = te_int8_gemv(self, input)
                 if out is not None:
                     return out
-                return torch.nn.functional.linear(input, self.weight, self.bias)
+                return _same_dtype(torch.nn.functional.linear(input, self.weight, self.bias), input)
             if _te_w4a8_ready(self, input):
                 out = te_w4a8_gemv(self, input)
                 if out is not None:
                     return out
-                return torch.nn.functional.linear(input, self.weight, self.bias)
+                return _same_dtype(torch.nn.functional.linear(input, self.weight, self.bias), input)
             out = te_plain_gemv(self, input, compute_dtype, want_requant, weight_only_quant)
             if out is not None:
                 return out
-            return previous(self, input, compute_dtype, want_requant, weight_only_quant)
+            return _same_dtype(previous(self, input, compute_dtype, want_requant, weight_only_quant), input)
 
         linear.forward_comfy_cast_weights = forward_comfy_cast_weights
         linear._gfx906_te = True
