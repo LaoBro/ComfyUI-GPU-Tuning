@@ -129,8 +129,9 @@ python custom_nodes/ComfyUI-gfx906-Tuning/tools/requant_uniform4.py \
 `--merge 另一个checkpoint` 会把源里缺失的键拷过来（通常是 `mtp.*`）。带 MTP 时需要它
 才能和原 w4a8 的键集合一致；不带时 `mtp="auto"` 自动关闭，走普通单 token 解码。
 
-内核接受 **1–8 行**（MTP 的草拟/校验就是这个宽度），权重仍然只流一遍；prefill 的
-`>8` 行会按 8 行切块调用，所以多行路径也是精确解码，不再落到 kitchen 的中间 int8 网格。
+内核接受 **1–8 行**（MTP 的草拟/校验就是这个宽度），权重仍然只流一遍。prefill（更多行）
+仍走 kitchen 的 dequant + int8 GEMM——那是每次生成一次的成本，而按 8 行切块会让每个块
+重读一遍完整权重，实测把 512 token 的 prefill 从 0.87 s 拖成几十秒。
 
 词表头和视觉塔不转换，保持 int8。编码时 `s_rel` 被约束在 `[1, 15.5]`：低于 1 会丢失
 4-bit 的级数、高于 127/8 时最高码被截断。

@@ -388,20 +388,12 @@ def te_w4a8_gemv(module, x):
     params = weight._params
     rows = x.reshape(-1, x.shape[-1])
     qdata, s_rel, s_channel, correction, codebook = AsymW4A8Int8Layout.get_plain_tensors(weight)
-    if correction is not None or codebook is not None:
+    if correction is not None or codebook is not None or rows.shape[0] > gemv.MAX_M:
         return None
     if x.dtype is not torch.float32 or not x.is_contiguous():
         return None
-    step = gemv.MAX_M
-    args = (qdata, s_rel, s_channel, module.bias, x.dtype,
-            params.group_size, params.convrot_groupsize)
-    if rows.shape[0] <= step:
-        out = gemv.linear(rows, *args)
-    else:
-        # prefill: the kernel takes at most MAX_M rows, and each row's activation
-        # scale is its own, so slicing the batch changes nothing
-        parts = [gemv.linear(rows[i:i + step], *args) for i in range(0, rows.shape[0], step)]
-        out = None if any(p is None for p in parts) else torch.cat(parts, 0)
+    out = gemv.linear(rows, qdata, s_rel, s_channel, module.bias, x.dtype,
+                      params.group_size, params.convrot_groupsize)
     if out is None:
         return None
     return out.view(*x.shape[:-1], out.shape[-1])
