@@ -32,6 +32,8 @@ kernel. Prefill still unpacks whole layers to int8 (`decode_int8`), because the
 int8 GEMM needs a contiguous tile.
 """
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -46,10 +48,17 @@ BN = 16
 MAX_M = 8
 WARPS = 4
 STAGES = 2
+DOT_BN = 32
+DOT_M = 16
 DECODE_BN = 2
 DECODE_BK = 1024
 DECODE_WARPS = 4
 CB_BLOCK_K = 1024
+
+_hip = None
+_hip_checked = False
+_asm_ok = None
+_backend = None
 
 
 def _block_k(m):
@@ -65,7 +74,7 @@ def _row_block(rows):
 
 
 @triton.jit
-def _dot4(a, b):
+def _dot4_asm(a, b):
     """Four int8 products accumulated into int32, one instruction."""
     return tl.inline_asm_elementwise(
         "v_dot4_i32_i8 $0, $1, $2, $3",
@@ -144,15 +153,15 @@ def gemv_kernel(a_ptr, b_ptr, c_ptr, gmax_ptr, srel_ptr, sch_ptr, bias_ptr, cb_p
         sg = tl.load(srel_ptr + offs_n[:, None] * stride_bs + grp[None, :]).to(tl.float32)
         if HAS_CB:
             # the table's levels already carry the zero point and the group scale
-            pair = (_dot4(_lut_bytes(w, t0, t1, t2, t3)[None, :, :], pe[:, None, :])
-                    + _dot4(_lut_bytes(w >> 4, t0, t1, t2, t3)[None, :, :], po[:, None, :]))
+            pair = (_dot4_asm(_lut_bytes(w, t0, t1, t2, t3)[None, :, :], pe[:, None, :])
+                    + _dot4_asm(_lut_bytes(w >> 4, t0, t1, t2, t3)[None, :, :], po[:, None, :]))
             part = tl.sum(tl.reshape(pair, (M, BN, ngpc, bpgw)), axis=3)
             acc += tl.sum(part.to(tl.float32) * sg[None, :, :], axis=2)
         else:
             qsum = (tl.sum(tl.reshape(qe, (M, ngpc, epg)), axis=2)
                     + tl.sum(tl.reshape(qo, (M, ngpc, epg)), axis=2))       # [M, ngpc]
-            pair = (_dot4(w[None, :, :] & 0x0F0F0F0F, pe[:, None, :])
-                    + _dot4((w[None, :, :] >> 4) & 0x0F0F0F0F, po[:, None, :]))
+            pair = (_dot4_asm(w[None, :, :] & 0x0F0F0F0F, pe[:, None, :])
+                    + _dot4_asm((w[None, :, :] >> 4) & 0x0F0F0F0F, po[:, None, :]))
             part = tl.sum(tl.reshape(pair, (M, BN, ngpc, bpgw)), axis=3)
             acc += tl.sum((part - 8 * qsum[:, None, :]).to(tl.float32) * sg[None, :, :], axis=2)
 
@@ -161,6 +170,114 @@ def gemv_kernel(a_ptr, b_ptr, c_ptr, gmax_ptr, srel_ptr, sch_ptr, bias_ptr, cb_p
         acc += tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)[None, :]
     tl.store(c_ptr + offs_m[:, None] * n + offs_n[None, :], acc.to(c_ptr.dtype.element_ty),
              mask=mask_m[:, None] & mask_n[None, :])
+
+
+@triton.jit
+def dot_kernel(a_ptr, b_ptr, c_ptr, gmax_ptr, srel_ptr, sch_ptr, bias_ptr, cb_ptr,
+               m, n, k, ngroups, stride_bn, stride_bs, inv_level,
+               GS: tl.constexpr, BN: tl.constexpr, MM: tl.constexpr,
+               NG: tl.constexpr, HAS_BIAS: tl.constexpr, HAS_CB: tl.constexpr):
+    """Portable fallback: one int8 tl.dot per weight group of GS elements."""
+    pid = tl.program_id(0)
+    offs_n = pid * BN + tl.arange(0, BN)
+    mask_n = offs_n < n
+    offs_m = tl.arange(0, MM)
+    mask_m = offs_m < m
+
+    gm = tl.load(gmax_ptr + offs_m[:, None] * ngroups + tl.arange(0, NG)[None, :],
+                 mask=mask_m[:, None] & (tl.arange(0, NG)[None, :] < ngroups), other=0.0)
+    a_scale = tl.maximum(tl.max(gm, axis=1) / 127.0, 1e-30)
+    sch = tl.load(sch_ptr + offs_n, mask=mask_n, other=0.0)
+
+    acc = tl.zeros((MM, BN), dtype=tl.float32)
+    aidx = tl.arange(0, GS)
+    cidx = tl.arange(0, GS // 2)
+    for g in range(0, k // GS):
+        off = g * GS
+        a = tl.load(a_ptr + offs_m[:, None] * k + off + aidx[None, :], mask=mask_m[:, None], other=0.0)
+        q = tl.clamp(libdevice.rint(a / a_scale[:, None]), -128.0, 127.0).to(tl.int8)
+        b = tl.load(b_ptr + offs_n[None, :] * stride_bn + (off // 2 + cidx)[:, None],
+                    mask=mask_n[None, :], other=0).to(tl.int32)
+        lo = b & 0x0F
+        hi = (b >> 4) & 0x0F
+        code = tl.reshape(tl.permute(tl.join(lo, hi), (0, 2, 1)), (GS, BN))
+        if HAS_CB:
+            word = tl.load(cb_ptr + (code >> 2))
+            byte = (word >> ((code & 3) * 8)) & 0xFF
+            w8 = tl.where(byte >= 128, byte - 256, byte).to(tl.int8)
+        else:
+            w8 = (code - 8).to(tl.int8)
+        sg = tl.load(srel_ptr + offs_n * stride_bs + g, mask=mask_n, other=0.0)
+        acc += tl.dot(q, w8, out_dtype=tl.int32).to(tl.float32) \
+            * (a_scale[:, None] * (sg * sch)[None, :] * inv_level)
+
+    if HAS_BIAS:
+        acc += tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)[None, :]
+    tl.store(c_ptr + offs_m[:, None] * n + offs_n[None, :], acc.to(c_ptr.dtype.element_ty),
+             mask=mask_m[:, None] & mask_n[None, :])
+
+
+@triton.jit
+def _probe_dot4(a, b, c):
+    x = tl.load(a + tl.arange(0, 1))
+    y = tl.load(b + tl.arange(0, 1))
+    tl.store(c + tl.arange(0, 1), _dot4_asm(x, y))
+
+
+def _load_hip():
+    """Optional pure-HIP extension next to this file."""
+    global _hip, _hip_checked
+    if _hip_checked:
+        return _hip
+    _hip_checked = True
+    try:
+        from . import w4a8_hip as hip
+    except ImportError:
+        try:
+            import w4a8_hip as hip
+        except ImportError:
+            return None
+    if not hasattr(hip, "linear"):
+        return None
+    _hip = hip
+    return hip
+
+
+def _asm_supported():
+    """Whether the v_dot4 inline asm compiles on this device."""
+    global _asm_ok
+    if _asm_ok is not None:
+        return _asm_ok
+    mode = os.getenv("COMFY_GFX906_W4A8_ASM", "auto").strip().lower()
+    if mode in ("off", "triton", "0", "false", "no"):
+        _asm_ok = False
+        return False
+    if mode in ("on", "asm", "1", "true", "yes"):
+        _asm_ok = True
+        return True
+    try:
+        a = torch.zeros(1, device="cuda", dtype=torch.int32)
+        b = torch.zeros(1, device="cuda", dtype=torch.int32)
+        c = torch.zeros(1, device="cuda", dtype=torch.int32)
+        _probe_dot4[(1,)](a, b, c)
+        _asm_ok = True
+    except Exception:
+        _asm_ok = False
+    return _asm_ok
+
+
+def backend_name():
+    """hip > asm (when it compiles) > portable tl.dot."""
+    global _backend
+    if _backend is not None:
+        return _backend
+    if _load_hip() is not None:
+        _backend = "hip"
+    elif _asm_supported():
+        _backend = "asm"
+    else:
+        _backend = "triton"
+    return _backend
 
 
 def codebook_words(codebook):
@@ -182,16 +299,8 @@ def codebook_words(codebook):
     return torch.tensor(words, dtype=torch.int32, device=codebook.device), 1.0 / scale
 
 
-def linear(x, qdata, s_rel, s_channel, bias, out_dtype, group_size, convrot_groupsize,
-           levels=None, inv_level=1.0):
-    """x @ W.T for one to eight rows, or None when the shape is not a decode of that size.
-
-    qdata is the packed nibble plane [n, k/2], s_rel the fp8 per-group scale
-    [n, k/group_size], s_channel the per-row scale [n]. convrot_groupsize 0
-    skips the Hadamard rotation and uses the raw row max, matching int8_gemv.
-    `levels`/`inv_level` are `codebook_words` output: they replace the uniform
-    `code - 8` ramp with a table lookup and fold the level grid into the scale.
-    """
+def _linear_asm(x, qdata, s_rel, s_channel, bias, out_dtype, group_size, convrot_groupsize,
+                levels=None, inv_level=1.0):
     rows, xk = x.shape
     n, half = qdata.shape
     k = s_rel.shape[1] * group_size
@@ -226,6 +335,69 @@ def linear(x, qdata, s_rel, s_channel, bias, out_dtype, group_size, convrot_grou
         HAS_BIAS=bias is not None, HAS_CB=levels is not None,
         num_warps=WARPS, num_stages=STAGES)
     return out
+
+
+def _linear_dot(x, qdata, s_rel, s_channel, bias, out_dtype, group_size, convrot_groupsize,
+                levels=None, inv_level=1.0):
+    """Portable fallback: one tl.dot per group; needs group_size >= 16."""
+    rows, xk = x.shape
+    n, half = qdata.shape
+    k = s_rel.shape[1] * group_size
+    if rows < 1 or rows > MAX_M or xk != k or half * 2 != k:
+        return None
+    if group_size < DOT_M or group_size % DOT_M:
+        return None
+    if qdata.stride(0) != half or not qdata.is_contiguous() or s_rel.stride(0) != s_rel.shape[1]:
+        return None
+    if s_channel.numel() != n or s_channel.dtype != torch.float32:
+        return None
+    if convrot_groupsize and k % convrot_groupsize:
+        return None
+    if levels is not None and levels.numel() != 4:
+        return None
+
+    if convrot_groupsize:
+        x, gmax, ngroups = int8_gemv.rotate(x, convrot_groupsize)
+    else:
+        gmax, ngroups = x.abs().amax(dim=1, keepdim=True), 1
+
+    out = torch.empty((rows, n), device=qdata.device, dtype=out_dtype)
+    dot_kernel[(triton.cdiv(n, DOT_BN),)](
+        x, qdata, out, gmax, s_rel, s_channel,
+        bias if bias is not None else x,
+        levels if levels is not None else qdata.view(torch.int32).reshape(-1)[:4],
+        rows, n, k, ngroups, half, s_rel.stride(0), inv_level,
+        GS=group_size, BN=DOT_BN, MM=DOT_M, NG=triton.next_power_of_2(ngroups),
+        HAS_BIAS=bias is not None, HAS_CB=levels is not None,
+        num_warps=WARPS, num_stages=STAGES)
+    return out
+
+
+def linear(x, qdata, s_rel, s_channel, bias, out_dtype, group_size, convrot_groupsize,
+           levels=None, inv_level=1.0):
+    """x @ W.T for one to eight rows, or None when the shape is not a decode of that size.
+
+    qdata is the packed nibble plane [n, k/2], s_rel the fp8 per-group scale
+    [n, k/group_size], s_channel the per-row scale [n]. convrot_groupsize 0
+    skips the Hadamard rotation and uses the raw row max, matching int8_gemv.
+    `levels`/`inv_level` are `codebook_words` output: they replace the uniform
+    `code - 8` ramp with a table lookup and fold the level grid into the scale.
+
+    Backend order: an optional w4a8_hip extension, the v_dot4 asm path when it
+    compiles here, then the portable per-group tl.dot kernel.
+    """
+    backend = backend_name()
+    if backend == "hip":
+        out = _hip.linear(x, qdata, s_rel, s_channel, bias, out_dtype, group_size,
+                          convrot_groupsize, levels=levels, inv_level=inv_level)
+        if out is not None:
+            return out
+        backend = "asm" if _asm_supported() else "triton"
+    if backend == "asm":
+        return _linear_asm(x, qdata, s_rel, s_channel, bias, out_dtype, group_size,
+                           convrot_groupsize, levels=levels, inv_level=inv_level)
+    return _linear_dot(x, qdata, s_rel, s_channel, bias, out_dtype, group_size,
+                       convrot_groupsize, levels=levels, inv_level=inv_level)
 
 
 @triton.jit

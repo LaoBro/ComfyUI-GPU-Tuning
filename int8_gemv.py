@@ -16,6 +16,8 @@ three launches a decode step used to pay for, which matters more than the kernel
 itself at these sizes.
 """
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -29,6 +31,11 @@ BLOCK_J = 32
 WARPS = 4
 STAGES = 2
 ROTATE_WARPS = 4
+ASM_BLOCK_N = 16
+ASM_BLOCK_K = 2048
+
+_asm_ok = None
+_backend = None
 
 
 @triton.jit
@@ -102,13 +109,110 @@ def rotate(x, groupsize):
     return rotated, gmax, ngroups
 
 
-def linear(x, weight, weight_scale, bias, out_dtype, groupsize):
-    """C = x @ weight.T for a single row, with convrot rotation when groupsize is set.
+@triton.jit
+def _dot4_asm(a, b):
+    return tl.inline_asm_elementwise(
+        "v_dot4_i32_i8 $0, $1, $2, $3",
+        "=v,v,v,v", [a, b, tl.zeros_like(a)], dtype=tl.int32, is_pure=True, pack=1)
 
-    x: [1, k] float32, weight: [n, k] int8, weight_scale: [n] or [1].
-    The activation is quantized per row inside the kernel; groupsize 0 skips
-    rotation and uses the row max of the raw activation.
-    """
+
+@triton.jit
+def _pack4(q):
+    return tl.sum((q & 0xFF) << (tl.arange(0, 4) * 8)[None, None, :], axis=2)
+
+
+@triton.jit
+def asm_kernel(a_ptr, b_ptr, c_ptr, gmax_ptr, b_scale_ptr, bias_ptr,
+               n, k, ngroups, stride_bn_words,
+               BN: tl.constexpr, BK: tl.constexpr, NG: tl.constexpr,
+               BSCALE_VEC: tl.constexpr, HAS_BIAS: tl.constexpr):
+    pid = tl.program_id(0)
+    offs_n = pid * BN + tl.arange(0, BN)
+    mask_n = offs_n < n
+    offs_g = tl.arange(0, NG)
+    gmax = tl.load(gmax_ptr + offs_g, mask=offs_g < ngroups, other=0.0)
+    a_scale = tl.maximum(tl.max(gmax) / 127.0, 1e-30)
+
+    acc = tl.zeros((BN,), dtype=tl.int32)
+    for kk in range(0, k, BK):
+        offs_k = kk + tl.arange(0, BK)
+        mask_k = offs_k < k
+        a = tl.load(a_ptr + offs_k, mask=mask_k, other=0.0)
+        q = tl.clamp(libdevice.rint(a / a_scale), -128.0, 127.0).to(tl.int32)
+        qp = _pack4(tl.reshape(q, (1, BK // 4, 4)))
+        w = tl.load(b_ptr + offs_n[:, None] * stride_bn_words + (kk // 4 + tl.arange(0, BK // 4))[None, :],
+                    mask=mask_n[:, None], other=0)
+        qrow = tl.broadcast_to(qp, (BN, BK // 4))
+        acc += tl.sum(_dot4_asm(w, qrow), axis=1)
+
+    if BSCALE_VEC:
+        b_scale = tl.load(b_scale_ptr + offs_n, mask=mask_n, other=0.0)
+    else:
+        b_scale = tl.load(b_scale_ptr)
+    out = acc.to(tl.float32) * (a_scale * b_scale)
+    if HAS_BIAS:
+        out += tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)
+    tl.store(c_ptr + offs_n, out.to(c_ptr.dtype.element_ty), mask=mask_n)
+
+
+@triton.jit
+def _probe_dot4(a, b, c):
+    x = tl.load(a + tl.arange(0, 1))
+    y = tl.load(b + tl.arange(0, 1))
+    tl.store(c + tl.arange(0, 1), _dot4_asm(x, y))
+
+
+def _asm_supported():
+    global _asm_ok
+    if _asm_ok is not None:
+        return _asm_ok
+    mode = os.getenv("COMFY_GFX906_INT8_GEMV_ASM", "auto").strip().lower()
+    if mode in ("off", "triton", "0", "false", "no"):
+        _asm_ok = False
+        return False
+    if mode in ("on", "asm", "1", "true", "yes"):
+        _asm_ok = True
+        return True
+    try:
+        a = torch.zeros(1, device="cuda", dtype=torch.int32)
+        b = torch.zeros(1, device="cuda", dtype=torch.int32)
+        c = torch.zeros(1, device="cuda", dtype=torch.int32)
+        _probe_dot4[(1,)](a, b, c)
+        _asm_ok = True
+    except Exception:
+        _asm_ok = False
+    return _asm_ok
+
+
+def backend_name():
+    global _backend
+    if _backend is not None:
+        return _backend
+    _backend = "asm" if _asm_supported() else "triton"
+    return _backend
+
+
+def _linear_asm(x, weight, weight_scale, bias, out_dtype, groupsize):
+    n, k = weight.shape
+    if x.shape[0] != 1 or k % 4 or not weight.is_contiguous():
+        return None
+    if groupsize:
+        x, gmax, ngroups = rotate(x, groupsize)
+    else:
+        gmax, ngroups = x.abs().amax().reshape(1), 1
+    out = torch.empty((1, n), device=x.device, dtype=out_dtype)
+    b32 = weight.view(torch.int32)
+    b_scale = weight_scale.reshape(-1)
+    asm_kernel[(triton.cdiv(n, ASM_BLOCK_N),)](
+        x, b32, out, gmax, b_scale, bias if bias is not None else x,
+        n, k, ngroups, b32.stride(0),
+        BN=ASM_BLOCK_N, BK=ASM_BLOCK_K, NG=triton.next_power_of_2(ngroups),
+        BSCALE_VEC=b_scale.numel() > 1, HAS_BIAS=bias is not None,
+        num_warps=WARPS, num_stages=STAGES)
+    return out
+
+
+def _linear_triton(x, weight, weight_scale, bias, out_dtype, groupsize):
     n, k = weight.shape
     if groupsize:
         x, gmax, ngroups = rotate(x, groupsize)
@@ -124,3 +228,20 @@ def linear(x, weight, weight_scale, bias, out_dtype, groupsize):
         BSCALE_VEC=b_scale.numel() > 1, HAS_BIAS=bias is not None,
         num_warps=WARPS, num_stages=STAGES)
     return out
+
+
+def linear(x, weight, weight_scale, bias, out_dtype, groupsize):
+    """C = x @ weight.T for a single row, with convrot rotation when groupsize is set.
+
+    x: [1, k] float32, weight: [n, k] int8, weight_scale: [n] or [1].
+    The activation is quantized per row inside the kernel; groupsize 0 skips
+    rotation and uses the row max of the raw activation.
+
+    Backend: v_dot4 asm when it compiles here, otherwise the int32 tl.sum kernel.
+    COMFY_GFX906_INT8_GEMV_ASM=auto/on/off selects it.
+    """
+    if backend_name() == "asm":
+        out = _linear_asm(x, weight, weight_scale, bias, out_dtype, groupsize)
+        if out is not None:
+            return out
+    return _linear_triton(x, weight, weight_scale, bias, out_dtype, groupsize)

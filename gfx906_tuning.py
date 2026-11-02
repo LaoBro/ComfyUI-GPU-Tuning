@@ -1859,8 +1859,11 @@ def status():
     else:
         prefix_line = "prefix kv torch.cat (off, installed)"
     gemv_loaded = _state.get("gemv_module") is not None
-    gemv_line = ("gemv on" if _state.get("gemv") else
-                 ("gemv off (installed)" if gemv_loaded else "gemv n/a"))
+    if _state.get("gemv"):
+        gemv_backend = getattr(_state.get("gemv_module"), "backend_name", None)
+        gemv_line = "gemv on" + (f" (backend={gemv_backend()})" if gemv_backend is not None else "")
+    else:
+        gemv_line = "gemv off (installed)" if gemv_loaded else "gemv n/a"
     if _state.get("text_gemv_enabled", True):
         text_gemv_line = (f"text gemv on: {_state.get('te_gemv_calls', 0)} direct / "
                           f"{_state.get('te_plain_calls', 0)} mv calls" if _state.get("te_patched")
@@ -1870,10 +1873,13 @@ def status():
     w4a8_loaded = _state.get("w4a8_module") is not None
     if _state.get("w4a8") is not None:
         calls = _state.get("w4a8_calls", 0)
+        backend = getattr(_state["w4a8"], "backend_name", None)
+        backend_name = backend() if backend is not None else "?"
         if not _state.get("te_int8"):
-            w4a8_line = "w4a8 on (needs text encoder int8)"
+            w4a8_line = f"w4a8 on: backend={backend_name} (needs text encoder int8)"
         else:
-            w4a8_line = f"w4a8 on: {calls} calls" + (" (no 4-bit weights seen yet)" if not calls else "")
+            w4a8_line = (f"w4a8 on: {calls} calls, backend={backend_name}"
+                         + (" (no 4-bit weights seen yet)" if not calls else ""))
     elif w4a8_loaded:
         w4a8_line = "w4a8 off (installed)"
     else:
