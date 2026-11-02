@@ -145,6 +145,7 @@ _state = {
     "int8_tile_enabled": True,
     "small_batch_env": True,
     "small_batch_enabled": True,
+    "tile_measured": False,
     "tuned": False,
 }
 
@@ -265,9 +266,32 @@ def _triton_available(patch):
     return True
 
 
+def _tile_spec(name):
+    """Parse e.g. COMFY_GFX906_TILE_CONFIG="block_m=128,block_n=256,block_k=32,..."."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    try:
+        values = {}
+        for part in raw.split(","):
+            key, _, value = part.partition("=")
+            values[key.strip()] = int(value)
+        spec = {k: values[k] for k in ("block_m", "block_n", "block_k")}
+        spec["group_size_m"] = values.get("group_size_m", 8)
+        warps = values.get("warps", values.get("num_warps", 4))
+        stages = values.get("stages", values.get("num_stages", 2))
+        return spec, warps, stages
+    except (KeyError, ValueError):
+        logging.warning("gfx906: %s=%r is not a tile spec, using the built-in tile", name, raw)
+        return None
+
+
 def _triton_config():
     import triton
 
+    spec = _tile_spec("COMFY_GFX906_TILE_CONFIG")
+    if spec is not None:
+        return triton.Config(dict(spec[0]), num_warps=spec[1], num_stages=spec[2])
     return triton.Config(dict(INT8_TILE), num_warps=INT8_WARPS, num_stages=INT8_STAGES)
 
 
@@ -283,6 +307,9 @@ def _int8_kernels():
 def _small_tile_config():
     import triton
 
+    spec = _tile_spec("COMFY_GFX906_SMALL_TILE_CONFIG")
+    if spec is not None:
+        return triton.Config(dict(spec[0]), num_warps=spec[1], num_stages=spec[2])
     return triton.Config(dict(INT8_TILE_SMALL), num_warps=INT8_SMALL_WARPS, num_stages=INT8_SMALL_STAGES)
 
 
@@ -292,9 +319,12 @@ def select_int8_tile(m):
     Autotune caches its pick per (m, n, k), and a shape never moves between the
     two buckets, so swapping the list only happens when the bucket changes: no
     sweep is paid for the decode shapes, and the DiT keeps the 128-row tile.
-    Off while the stock list is restored for a measurement.
+    Off while the stock list is restored for a measurement, and on cards whose
+    best tile we have not measured: there both tiles stay autotune candidates.
     """
     if not _state.get("int8_tile_switch"):
+        return
+    if not _state.get("int8_tile_replaced"):
         return
     small = _state.get("small_batch_enabled", True) and m <= INT8_SMALL_MAX_M
     if _state.get("int8_tile_small") == small:
@@ -637,6 +667,34 @@ def patch_int8_tile_switch():
     return True
 
 
+def _has_config(configs, ours):
+    return any(c.kwargs == ours.kwargs and c.num_warps == ours.num_warps
+               and c.num_stages == ours.num_stages for c in configs)
+
+
+def _untuned_tile_configs():
+    """Stock candidates plus the gfx906 tiles, for cards without measured tiles."""
+    configs = list(_state.get("default_int8_configs") or [])
+    cards = [_triton_config()]
+    if _state.get("small_batch_enabled", True):
+        cards.append(_small_tile_config())
+    for cfg in cards:
+        if not _has_config(configs, cfg):
+            configs.append(cfg)
+    return configs
+
+
+def set_untuned_tiles():
+    """Refresh the candidate list after the small_batch switch changes."""
+    if _state.get("int8_tile_replaced") or not _state.get("int8_linear"):
+        return
+    if _state.get("default_int8_configs") is None:
+        return
+    for kernel in _int8_kernels():
+        kernel.configs = _untuned_tile_configs()
+        kernel.cache.clear()
+
+
 def patch_int8_linear(replace):
     """Add the gfx906 tile to the autotune sweep (or make it the only candidate).
 
@@ -655,16 +713,15 @@ def patch_int8_linear(replace):
         _state["reason"] = "comfy-kitchen triton int8 kernels not found"
         return False
 
-    _state["default_int8_configs"] = list(kernels[0].configs)
+    if _state.get("default_int8_configs") is None:
+        _state["default_int8_configs"] = list(kernels[0].configs)
     _state["int8_tile_replaced"] = replace
     for kernel in kernels:
-        current = list(kernel.configs)
         ours = _triton_config()
         if replace:
             kernel.configs = [ours]
-        elif not any(c.kwargs == ours.kwargs and c.num_warps == ours.num_warps
-                     and c.num_stages == ours.num_stages for c in current):
-            kernel.configs = current + [ours]
+        else:
+            kernel.configs = _untuned_tile_configs()
         kernel.cache.clear()
     _state["int8_tile_small"] = None
     _state["int8_tile_switch"] = patch_int8_tile_switch()
@@ -685,7 +742,7 @@ def set_int8_tile(enabled):
     """Switch the gfx906 tile list on/off without a reload."""
     if enabled:
         if _state.get("int8_linear") and _state.get("default_int8_configs") is not None:
-            patch_int8_linear(replace=bool(_state.get("tuned")))
+            patch_int8_linear(replace=bool(_state.get("tile_measured")))
     elif _state.get("default_int8_configs") is not None:
         restore_int8_defaults()
 
@@ -1137,7 +1194,10 @@ def configure(attention=None, smooth=None, convrot=None, profile=None, text_enco
             set_int8_tile(want)
         _state["int8_tile_enabled"] = want
     if small_batch is not None:
-        _state["small_batch_enabled"] = resolve_flag(small_batch, _state.get("small_batch_env", True))
+        want = resolve_flag(small_batch, _state.get("small_batch_env", True))
+        if want != _state.get("small_batch_enabled"):
+            _state["small_batch_enabled"] = want
+            set_untuned_tiles()
     # something may have disabled the backend after apply(); the node runs per
     # workflow, so this is the last chance to put it back before the model does
     # its first int8 matmul
@@ -1662,7 +1722,9 @@ def apply():
 
     tuned = on_target_arch()
     _state["tuned"] = tuned
-    patch_int8_linear(replace=tuned)
+    # a hand-measured tile spec is enough to skip autotune on this card
+    _state["tile_measured"] = tuned or _tile_spec("COMFY_GFX906_TILE_CONFIG") is not None
+    patch_int8_linear(replace=_state["tile_measured"])
     if _state.get("int8_linear") and not _state.get("int8_tile_env", True):
         restore_int8_defaults()
     patch_convrot()
@@ -1770,6 +1832,11 @@ def report_lines():
     return lines
 
 
+def _format_tile(config):
+    params = ", ".join(f"{k}={v}" for k, v in config.kwargs.items())
+    return f"{params}, warps={config.num_warps}, stages={config.num_stages}"
+
+
 def status():
     tile_state = {True: "tuned", False: "config appended, autotune decides", None: "off"}
     if not _state["int8_linear"]:
@@ -1780,8 +1847,10 @@ def status():
         tile_line = f"int8 linear {tile_state[_state['int8_tile_replaced']]}, tile switch off (stock list)"
     if not _state["int8_linear"] or not _state.get("int8_tile_enabled", True):
         small_line = "small batch tile n/a"
+    elif _state.get("int8_tile_replaced"):
+        small_line = f"small batch tile {'on' if _state.get('small_batch_enabled', True) else 'off (large tile only)'}"
     else:
-        small_line = (f"small batch tile {'on' if _state.get('small_batch_enabled', True) else 'off (large tile only)'}")
+        small_line = (f"small batch tile {'candidate' if _state.get('small_batch_enabled', True) else 'off (not a candidate)'}")
     prefix_patched = _state.get("prefix_kv_patched")
     if not prefix_patched:
         prefix_line = "prefix kv n/a"
@@ -1837,10 +1906,13 @@ def status():
         f"resident graph hooks {'present' if _state.get('resident_graph_patch') else 'absent'}",
     ]
     if _state["int8_linear"] and _state.get("int8_tile_enabled", True):
-        large = ", ".join(f"{k}={v}" for k, v in INT8_TILE.items())
-        small = ", ".join(f"{k}={v}" for k, v in INT8_TILE_SMALL.items())
-        lines.append(f"int8 tiles: large {large}; "
-                     + (f"small {small}" if _state.get("small_batch_enabled", True) else "small batch off"))
+        if _state.get("tile_measured"):
+            suffix = "env tile" if _tile_spec("COMFY_GFX906_TILE_CONFIG") is not None else "forced"
+        else:
+            suffix = "autotune candidates"
+        lines.append(f"int8 tiles ({suffix}): large {_format_tile(_triton_config())}; "
+                     + (f"small {_format_tile(_small_tile_config())}"
+                        if _state.get("small_batch_enabled", True) else "small batch off"))
     cast = _state["attn_cast"]
     if cast:
         lines.append(f"attention calls: fp16-ok {cast['fp16']}, amax overflow {cast['fp32']}"

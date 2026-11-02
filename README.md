@@ -234,10 +234,50 @@ CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`text
 - `linear8`：把 `in_features >= 1280` 的 fp16 Linear 权重按行量化成 int8 并走 kitchen 内核（SDXL 类未量化 checkpoint）；640 宽的层保持 fp16。
 - `amax_guard`：注意力输入绝对值超过 60000 时放弃 fp16 转换，留在模型 dtype，避免 fp16 溢出。
 - `int8_tile`：关闭后恢复上游 autotune 的 tile 列表，不再注入 gfx906 的 `128×256×32`；GEMV 仍由 `gemv` 单独控制。
-- `small_batch`：把“`m≤8` 切到 `16×32×64` 窄 tile、`m>8` 切回 `128×256×32`”单独控制；需要 `int8_tile` 为 on，否则显示 n/a。GEMV 仍由 `gemv` 单独控制。
+- `small_batch`：gfx906 上把“`m≤8` 切到 `16×32×64` 窄 tile、`m>8` 切回 `128×256×32`”单独控制；其它 AMD 上表示“把窄 tile 追加为 autotune 候选”（是否真的用它由该卡实测决定）。需要 `int8_tile` 为 on，否则显示 n/a。GEMV 仍由 `gemv` 单独控制。
 - `text_gemv`：单行文本编码器解码时，int8 权重直调 GEMV、未量化的小投影走 `torch.mv`；关闭后两者都回到分派层。
 - `w4a8`：4-bit 权重解码；`status()` 会打印实际调用次数，换 checkpoint 后可据此确认是否真的走到了 w4a8 内核（`on: 0 calls (no 4-bit weights seen yet)` 表示权重布局没被识别）。
 - `textgen`：一次控制 DeltaNet 内核、KV decode 折叠、llama RMSNorm/RoPE 缓存、Qwen3.5 计算类；关闭时逐调用委托回 core 实现（Qwen3.5 类符号本身不换回）。
+
+### 在其它显卡上扫描 int8 tile
+
+`tools/tile_sweep.py` 在本机逐个实测候选 tile，打印每个 `(shape, m)` 的前几名，并给出大/小 batch 的 winner：
+
+```bash
+# 默认：stock 6 个 + gfx906 大/小 tile，5 个 m，3 个 NxK
+python custom_nodes/ComfyUI-gfx906-Tuning/tools/tile_sweep.py
+
+# 只测自己的候选（可重复 --candidate）
+python .../tools/tile_sweep.py \
+  --candidate block_m=128,block_n=128,block_k=64,group_size_m=8,warps=8,stages=3 \
+  --candidate block_m=16,block_n=64,block_k=64,group_size_m=8,warps=4,stages=3 \
+  --m 1,2,8,128,4032 --shapes 4096x4096,4096x12288
+
+# 打印可直接用的启动变量
+python .../tools/tile_sweep.py --emit
+```
+
+脚本不调用 `apply()`；它把 kitchen 的 `configs` 临时设成单个候选再调 `int8_linear`，所以每次只编译/运行这一个 tile，不会触发 autotune 扫参。结果会输出：
+
+```text
+4096x4096 m=1: 16x32x64 w4 s3 0.30 ms, 128x32x32 w4 s4 0.37 ms, ...
+large tile (m>8): block_m=128,...  median 1.24 ms
+small tile (m<=8): block_m=16,...  median 0.31 ms
+```
+
+`--emit` 给出的两个变量可直接启动使用，无需改代码：
+
+```bash
+COMFY_GFX906_TILE_CONFIG="block_m=128,block_n=256,block_k=32,group_size_m=8,warps=4,stages=2" \
+COMFY_GFX906_SMALL_TILE_CONFIG="block_m=16,block_n=32,block_k=64,group_size_m=8,warps=4,stages=3" \
+python main.py
+```
+
+- 设置 `COMFY_GFX906_TILE_CONFIG` 后，该卡被视为“tile 已实测”：列表只放这一个配置，**不跑 autotune**；
+- 只设置 `COMFY_GFX906_SMALL_TILE_CONFIG` 时不会变成“已实测”，但会替换小 tile 候选/强制值，适合只换窄 tile；
+- 两个变量都是启动期读取；节点 `int8_tile` / `small_batch` 的 `default` 仍会沿用它们。
+
+扫描结果也可以整理成 `INT8_TILE_TABLE` 条目提交上游，让同型号显卡默认免 autotune。
 
 ### 注意力模式怎么选
 
@@ -256,7 +296,7 @@ CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`text
 | 设备 | 生效范围 |
 |---|---|
 | gfx906（Vega 56/64、MI50/60、Radeon VII） | 全部补丁，用实测 tile，不跑 autotune |
-| 其它 AMD（gfx900、gfx90a/94x、RDNA1 后期、RDNA2） | int8 tile 追加进 autotune 候选、convrot、VAE、文本编码器全部生效；注意力首次调用现场扫 tile 并与 SDPA 比快慢 |
+| 其它 AMD（gfx900、gfx90a/94x、RDNA1 后期、RDNA2） | int8 大/小 tile 都追加进 autotune 候选（由该卡实测决定），convrot、VAE、文本编码器全部生效；注意力首次调用现场扫 tile 并与 SDPA 比快慢 |
 | NVIDIA / CPU | 整包跳过（Triton 的 NVIDIA 后端最低 Volta，Pascal 及更老无解） |
 
 ## 开关
@@ -278,7 +318,9 @@ CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`text
 | `COMFY_GFX906_CONVROT` | `fused` | `fused` / `butterfly` / `off` |
 | `COMFY_GFX906_LINEAR8` | `1` | 未量化 fp16 Linear 走 int8（SDXL 类） |
 | `COMFY_GFX906_INT8_TILE` | `1` | 注入 gfx906 的 `128×256×32` int8 tile |
-| `COMFY_GFX906_SMALL_BATCH` | `1` | `m≤8` 切 `16×32×64` 窄 tile |
+| `COMFY_GFX906_SMALL_BATCH` | `1` | `m≤8` 切 `16×32×64` 窄 tile（其它 AMD 作为候选） |
+| `COMFY_GFX906_TILE_CONFIG` | 空 | 手工实测的大 tile，设置后该卡视为已实测（跳过 autotune） |
+| `COMFY_GFX906_SMALL_TILE_CONFIG` | 空 | 手工实测的窄 tile，替换候选/强制值 |
 | `COMFY_GFX906_TE` | `int8` | 文本编码器 int8（含生成时的 lm_head） |
 | `COMFY_GFX906_TE_ATTN` | `default` | 文本编码器注意力后端 |
 | `COMFY_GFX906_TE_GEMV` | `1` | TE 单行直调 GEMV + 未量化小投影 `torch.mv` |

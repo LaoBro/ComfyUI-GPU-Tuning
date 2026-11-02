@@ -77,10 +77,11 @@ class Gfx906ModelSettings(io.ComfyNode):
                                        "kitchen autotune list. default keeps COMFY_GFX906_INT8_TILE; off "
                                        "restores the stock list. The m<=8 narrow tile has its own switch."),
                 io.Combo.Input("small_batch", options=list(TRISTATE), default="default",
-                               tooltip="Switch the int8 kernel to the 16x32x64 narrow tile when m<=8 (text "
-                                       "decode / MTP verify), and back to 128x256x32 for larger batches. "
-                                       "default keeps COMFY_GFX906_SMALL_BATCH; needs int8_tile on. GEMV "
-                                       "has its own switch."),
+                               tooltip="gfx906: switch the int8 kernel to the 16x32x64 narrow tile when m<=8 "
+                                       "(text decode / MTP verify), and back to 128x256x32 for larger batches. "
+                                       "Other AMD: add the narrow tile as an autotune candidate and let that "
+                                       "card decide. default keeps COMFY_GFX906_SMALL_BATCH; needs int8_tile on. "
+                                       "GEMV has its own switch."),
                 io.Combo.Input("qkv", options=list(TRISTATE), default="default",
                                tooltip="One int8 GEMM for q/k/v instead of three (Qwen-Image 2.1): -81 ms "
                                        "of a 5.24 s step (1.5%), bit-exact. The merged weights stay resident "
