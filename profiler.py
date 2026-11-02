@@ -1,9 +1,9 @@
 """Per-call GPU timers for the hot ComfyUI entry points.
 
-Opt-in: COMFY_GFX906_PROFILE=1. Each instrumented call records a CUDA event
-pair, and the Gfx906Profiler node sums and clears them. Because the node runs
-before the sampler in a normal graph, it reports the prompt that ran before the
-node last executed - run the workflow twice and read the second output.
+Opt-in: COMFY_GFX906_PROFILE=1 or the model node's profile switch. Each
+instrumented call records a CUDA event pair, and the report is printed when a
+prompt finishes; there is no profiler node. Because the model node runs before
+the sampler in a normal graph, its one-shot status covers the next prompt.
 """
 
 import logging

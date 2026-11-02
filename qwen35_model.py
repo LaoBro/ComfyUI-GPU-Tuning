@@ -17,13 +17,25 @@ import torch.nn.functional as F
 import comfy_kitchen
 import comfy.model_management
 import comfy.ops
+import comfy.text_encoders.qwen35 as _core
 from comfy.quant_ops import QuantizedTensor
 from comfy.text_encoders.llama import Llama2_, MLP, RMSNorm, precompute_freqs_cis, rope_matrix
 from comfy.text_encoders.qwen35 import RMSNormGated, torch_chunk_gated_delta_rule
 
+# Set by install(); read per call. When the gate is off these classes delegate to
+# the shipped methods, so the CLIP node can switch the qwen35 patch off without
+# rebuilding the text encoder.
+_gate = None
+
+
+def _enabled():
+    return _gate is None or _gate()
+
 
 def apply_partial_rope(xq, xk, freqs_cis, rotary_dim):
     """Apply RoPE to only the first rotary_dim dimensions."""
+    if not _enabled():
+        return _core.apply_partial_rope(xq, xk, freqs_cis, rotary_dim)
     # rotate the rotary slice where it lies: the pass-through dims need no reassembly,
     # which drops two copies and two temporaries per layer
     comfy_kitchen.apply_rope_split_half_(xq[..., :rotary_dim], xk[..., :rotary_dim], rope_matrix(freqs_cis))
@@ -52,6 +64,9 @@ class GatedAttention(nn.Module):
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps, add=config.rms_norm_add, device=device, dtype=dtype)
 
     def forward(self, x, attention_mask=None, freqs_cis=None, optimized_attention=None, past_key_value=None):
+        if not _enabled():
+            return _core.GatedAttention.forward(self, x, attention_mask=attention_mask, freqs_cis=freqs_cis,
+                                               optimized_attention=optimized_attention, past_key_value=past_key_value)
         batch_size, seq_length, _ = x.shape
 
         # Project Q (with gate), K, V
@@ -130,6 +145,8 @@ class GatedDeltaNet(nn.Module):
         return cached[0]
 
     def forward(self, x, past_key_value=None, **kwargs):
+        if not _enabled():
+            return _core.GatedDeltaNet.forward(self, x, past_key_value=past_key_value, **kwargs)
         batch_size, seq_len, _ = x.shape
 
         use_recurrent = (
@@ -316,8 +333,14 @@ class Qwen35Transformer(Llama2_):
                                     rope_dims=self.config.mrope_section, interleaved_mrope=True, device=device)
 
 
-def install():
-    """Swap the backbone the core wrapper builds (it looks the name up per load)."""
+def install(gate=None, freqs_gate=None):
+    """Swap the backbone the core wrapper builds (it looks the name up per load).
+
+    ``gate`` is the qwen35 switch, ``freqs_gate`` the llama one (the position
+    table belongs to the llama patch even when this class is in use).
+    """
+    global _gate
+    _gate = gate
     import comfy.text_encoders.qwen35 as core
     from comfy.text_encoders.llama import Llama2_
 
@@ -330,7 +353,7 @@ def install():
             from . import core_llama_patches as patches
         except ImportError:
             import core_llama_patches as patches
-        wrapped = patches.table_compute_freqs_cis(Qwen35Transformer.__dict__["compute_freqs_cis"])
+        wrapped = patches.table_compute_freqs_cis(Qwen35Transformer.__dict__["compute_freqs_cis"], freqs_gate)
         wrapped._gfx906_table = True
         Qwen35Transformer.compute_freqs_cis = wrapped
     Qwen35Transformer._gfx906_node = True

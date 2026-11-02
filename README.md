@@ -18,7 +18,7 @@
 | 注意力 | 641 ms（sub_quad，fp32） | **57 ms**（gemm，fp16） | 布局 × dtype × 内核，合计 11x |
 | int8 linear | 默认 tile 列表 | **8.3–10.2 TMAC/s** | 本包追加的 tile 比上游 autotune 可选的最优配置快 ~26% |
 | VAE 解码（1024²） | 2016 ms | **787 ms** | conv3d → conv2d，2.6x |
-| QKV 投影 | 3 次 GEMM | 1 次 | -0.08 s/步 |
+| QKV 投影 | 3 次 GEMM | 1 次（默认关） | -0.08 s/步 |
 | 文本编码 | 反量化每次调用 | int8 常驻 | 编码快 2.4x |
 | 文本生成 | 786 ms/token | **58 ms/token** | tile + lm_head 量化 + 单 token GEMV + 直调内核，13.6x |
 
@@ -33,6 +33,8 @@
    `sub_quad` / `split` 等全部后端。
 4. **文本编码器 int8**：权重保持量化（每次调用不再反量化）。
 5. **QKV 三合一**：q/k/v 三个投影合成一次 int8 GEMM（逐行 scale 拼接，bit-exact）。
+   只省 1.5%（5.24 s 步里 -81 ms），却常驻 1.6 GB 合并权重，所以**默认关**，
+   Model Settings 节点的 `qkv` 开关或 `COMFY_GFX906_QKV=1` 打开。
 6. **VAE conv3d → conv2d**：图像模型带的视频 VAE 有 76 个 depth=1 的 Conv3d，
    gfx906 没有 conv3d 内核，torch 会降级成 im2col + bmm（占解码时间 47%）。
 7. **lm_head 保持量化**：逐 token 生成时 ComfyUI 的 `BaseGenerate.logits` 会先走
@@ -42,6 +44,19 @@
 8. **单 token int8 GEMV**：m=1 时不走分块 GEMM，一程序 16 行输出、沿 K 累加 int32，
    旋转 + 量化 + 点积压成两次启动。文本编码器的 Linear 在解码时直接调这个内核，
    跳过 `QuantizedTensor` 的分派层（159 → 81 µs/次，详见下面「文本生成」）。
+
+除这 8 项外，包内还有几组独立补丁，各自有节点开关：
+
+- **linear8**：SDXL 这类没有 `QuantizedTensor` 的 checkpoint，把 `in_features >= 1280`
+  的 fp16 Linear 一次性重量化成 int8 并走 kitchen 内核；热路径按 `linear8` 开关回退。
+- **int8 tile 注入**：`int8_tile` 关闭时恢复上游 autotune 列表，不再注入 gfx906 tile；
+  `small_batch` 单独控制 `m≤8` 的窄 tile 切换。
+- **prefix KV 复用**：`prefix_kv` 关闭时 `prefix_cached_attention` 回到 `torch.cat`。
+- **TE GEMV**：`text_gemv` 控制文本编码器的直调 int8 GEMV 与未量化小投影的 `torch.mv`。
+- **4-bit w4a8**：`w4a8` 控制 4-bit 权重的 decode GEMV 与 prefill 现解 int8。
+- **文本生成组**：`textgen` 一次控制 `deltanet`、`kvdecode`、`llama`、`qwen35` 四项；
+  `default` 时仍按各自环境变量独立生效。
+- **amax 保护**：`amax_guard` 控制注意力输入溢出时是否放弃 fp16 转换。
 
 ## 安装
 
@@ -55,7 +70,8 @@ git clone https://github.com/<your>/ComfyUI-gfx906-Tuning custom_nodes/ComfyUI-g
 
 ```
 gfx906 tuning active: int8 linear tuned + decode gemv, convrot fused, vae conv3d->conv2d,
-qkv fused, attention int8, text encoder int8 + lm_head, encoder attention default
+qkv off, attention int8, text encoder int8 + lm_head, encoder attention default,
+textgen deltanet on, kvdecode on, llama on, qwen35 on
 ```
 
 ## 文本生成（单 token 解码）
@@ -188,15 +204,40 @@ GPU 37 ms 已经和 CPU 打平，剩下的开销是每步约 7000 个零碎算�
 三个已知前置障碍：KV 位置在 python 侧、prefetch 每层一次 CPU→CUDA 拷贝、delta-rule 首个
 decode step 会在 CPU 上开内存。`COMFY_GFX906_GEMV=0` 可关掉 GEMV 与直调做对比。
 
-## 三个节点
+## 两个节点
 
 | 节点 | 位置 | 作用 |
 |---|---|---|
-| **GFX906 Model Settings** | 模型链（加载器 → 采样器之间） | 选注意力模式、fp16 开关、convrot 模式、profiler 开关 |
-| **GFX906 CLIP Settings** | CLIP 链（加载器 → 编码） | 文本编码器 int8 开关、编码器注意力后端 |
-| **GFX906 Tuning Info** | 任意位置（可选） | 打印当前生效的配置、实时计数，`run_benchmark` 可现场复测 int8 linear |
+| **GFX906 Model Settings** | 模型链（加载器 → 采样器之间） | 注意力模式、连续布局、int8qk 中心化、fp16、amax 保护、convrot、linear8、int8 tile、`m≤8` 窄 tile、QKV、VAE、GEMV、prefix KV、profiler |
+| **GFX906 CLIP Settings** | CLIP 链（加载器 → 编码） | 文本编码器 int8、编码器注意力后端、TE GEMV、4-bit w4a8、文本生成补丁组 |
 
-设置节点改动**下一次执行就生效**，不用重启。
+设置节点改动**下一次执行就生效**，不用重启。命令行复测 `benchmark()` 已删除：它没有节点注册、也没有任何调用者，长期是死代码；需要复测时直接用 `gfx906fix/` 下的独立脚本，避免再维护第三个节点。
+
+所有开关都是三态 combo：
+
+- `default`：沿用该功能的 `COMFY_GFX906_*` 启动值（完全不改变现有默认行为）；
+- `on` / `off`：显式覆盖 env；
+- `text_encoder` / `text_attention` 用 `auto` 表示“跟随 env”，因为这两个参数里的 `default` 已有既定含义。
+
+优先级：**节点显式 on/off > 环境变量 > 内置默认**。以前“节点默认值会覆盖 env”的问题已修掉。
+
+### 节点开关清单
+
+Model Settings：`attention`、`contiguous`、`smooth`、`fp16`、`amax_guard`、`convrot`、`linear8`、`int8_tile`、`small_batch`、`qkv`、`vae`、`gemv`、`prefix_kv`、`profile`。
+
+CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`textgen`。
+
+补充说明：
+
+- `contiguous`：选中 `basic`/`pytorch`/`sub_quad`/`split` 等 core 后端时，调用前把输入转成连续的 `[B,H,S,D]`；关闭可复现 core 的原始转置视图调用。
+- `smooth`：SageAttention2 的均值中心化，只在 `int8qk` 模式下生效。
+- `linear8`：把 `in_features >= 1280` 的 fp16 Linear 权重按行量化成 int8 并走 kitchen 内核（SDXL 类未量化 checkpoint）；640 宽的层保持 fp16。
+- `amax_guard`：注意力输入绝对值超过 60000 时放弃 fp16 转换，留在模型 dtype，避免 fp16 溢出。
+- `int8_tile`：关闭后恢复上游 autotune 的 tile 列表，不再注入 gfx906 的 `128×256×32`；GEMV 仍由 `gemv` 单独控制。
+- `small_batch`：把“`m≤8` 切到 `16×32×64` 窄 tile、`m>8` 切回 `128×256×32`”单独控制；需要 `int8_tile` 为 on，否则显示 n/a。GEMV 仍由 `gemv` 单独控制。
+- `text_gemv`：单行文本编码器解码时，int8 权重直调 GEMV、未量化的小投影走 `torch.mv`；关闭后两者都回到分派层。
+- `w4a8`：4-bit 权重解码；`status()` 会打印实际调用次数，换 checkpoint 后可据此确认是否真的走到了 w4a8 内核（`on: 0 calls (no 4-bit weights seen yet)` 表示权重布局没被识别）。
+- `textgen`：一次控制 DeltaNet 内核、KV decode 折叠、llama RMSNorm/RoPE 缓存、Qwen3.5 计算类；关闭时逐调用委托回 core 实现（Qwen3.5 类符号本身不换回）。
 
 ### 注意力模式怎么选
 
@@ -220,7 +261,11 @@ decode step 会在 CPU 上开内存。`COMFY_GFX906_GEMV=0` 可关掉 GEMV 与�
 
 ## 开关
 
-全部可用环境变量覆盖（重启生效）：
+环境变量在 `apply()`（进程启动）时读一次，作为**启动默认值**；节点里显式选 `on/off` 时覆盖它，`default/auto` 时回落到它。所以：
+
+**节点显式 on/off > 环境变量 > 内置默认**
+
+`COMFY_GFX906_TUNING` 是唯一无法被节点替代的开关：补丁在节点执行前就已安装，且没有卸载路径；不接节点的用户也靠它关闭整包。`COMFY_GFX906_ARCHS` 同理，它决定启动期是否替换 tile、是否安装 DeltaNet/Qwen3.5。`COMFY_GFX906_PROFILE` 保留为无节点/headless 启动时的入口。
 
 | 变量 | 默认 | 作用 |
 |---|---|---|
@@ -229,20 +274,30 @@ decode step 会在 CPU 上开内存。`COMFY_GFX906_GEMV=0` 可关掉 GEMV 与�
 | `COMFY_GFX906_FP16` | `1` | 注意力输入转 fp16 |
 | `COMFY_GFX906_CONTIG` | `1` | 后端调用前转连续布局 |
 | `COMFY_GFX906_SMOOTH` | `1` | int8qk 的均值中心化 |
+| `COMFY_GFX906_AMAX_GUARD` | `1` | 输入 abs-max ≥ 60000 时跳过 fp16 转换 |
 | `COMFY_GFX906_CONVROT` | `fused` | `fused` / `butterfly` / `off` |
+| `COMFY_GFX906_LINEAR8` | `1` | 未量化 fp16 Linear 走 int8（SDXL 类） |
+| `COMFY_GFX906_INT8_TILE` | `1` | 注入 gfx906 的 `128×256×32` int8 tile |
+| `COMFY_GFX906_SMALL_BATCH` | `1` | `m≤8` 切 `16×32×64` 窄 tile |
 | `COMFY_GFX906_TE` | `int8` | 文本编码器 int8（含生成时的 lm_head） |
 | `COMFY_GFX906_TE_ATTN` | `default` | 文本编码器注意力后端 |
-| `COMFY_GFX906_GEMV` | `1` | 单 token 解码走专用 int8 GEMV |
+| `COMFY_GFX906_TE_GEMV` | `1` | TE 单行直调 GEMV + 未量化小投影 `torch.mv` |
+| `COMFY_GFX906_GEMV` | `1` | 模型 int8 linear 的单 token 解码 GEMV |
 | `COMFY_GFX906_W4A8` | `1` | 4-bit 权重：单 token 走 GEMV，prefill 现解 int8（仅无 codebook 的 uniform 权重） |
+| `COMFY_GFX906_DELTANET` | `1` | DeltaNet 解码 Triton 内核 |
+| `COMFY_GFX906_KVDECODE` | `1` | 折叠 GQA 的 KV decode |
+| `COMFY_GFX906_LLAMA` | `1` | llama RMSNorm 预计算 + RoPE 频率表 |
+| `COMFY_GFX906_QWEN35` | `1` | Qwen3.5 计算类替换 |
 | `COMFY_GFX906_VAE` | `1` | VAE conv3d → conv2d |
-| `COMFY_GFX906_QKV` | `1` | QKV 三合一 |
+| `COMFY_GFX906_QKV` | `0` | QKV 三合一（打开需 1.6 GB 常驻） |
+| `COMFY_GFX906_PREFIXKV` | `1` | prefix cache 的 K/V 合并用复用 buffer + `copy_` 代替 `torch.cat` |
 | `COMFY_GFX906_PROFILE` | `0` | 每次 prompt 结束打印耗时分解 |
 | `COMFY_GFX906_ARCHS` | `gfx906` | 视为"已实测"的架构名单 |
 
 ## 已知边界
 
-- **QKV 三合一额外占 1.6 GB 显存**（50 MB × 32 层）。1024² 无压力；1328² 以上若显存吃紧，
-  先试 `COMFY_GFX906_QKV=0` 对比。
+- **QKV 三合一额外占 1.6 GB 显存**（50 MB × 32 层）且只快 1.5%，因此默认关；
+  显存富余时再用节点开关（或 `COMFY_GFX906_QKV=1`）打开。
 - **int8 注意力在 D=128/长 K 上不再是首选**（77.7 ms vs gemm 57 ms），只在 D=64 的 SDXL 形状占优。
 - **不要试图用 fp16 模拟 int8 linear**：实测慢 1.16–1.85 倍（形状越大差得越少）。int8 只赢
   1.3–1.8 倍而不是规格上的 2 倍，因为瓶颈是每线程的独立累加链数，不是精度格式；换 fp16 一样

@@ -164,16 +164,42 @@ def gated_delta_decode_fused(mixed_qkv, x, w_a, w_b, dt_bias, g_decay, state,
     return out.to(out_dtype) if out.dtype != out_dtype else out
 
 
-def install():
-    """Point comfy_kitchen's DeltaNet decode at these kernels (gfx906 has no HIP build)."""
+def install(gate=None):
+    """Point comfy_kitchen's DeltaNet decode at these kernels (gfx906 has no HIP build).
+
+    ``gate`` is read per call: when it returns False the shipped
+    comfy_kitchen functions run instead, so the CLIP node's textgen switch can
+    turn this off without a reload.
+    """
     import comfy_kitchen
 
     if getattr(comfy_kitchen.gated_delta_decode_fused, "_gfx906_triton", False):
         return True
-    gated_delta_decode_fused._gfx906_triton = True
-    conv_step._gfx906_triton = True
-    is_available._gfx906_triton = True
-    comfy_kitchen.gated_delta_decode_fused = gated_delta_decode_fused
-    comfy_kitchen.deltanet_conv_step = conv_step
-    comfy_kitchen.gated_delta_decode_is_available = is_available
+
+    original_fused = comfy_kitchen.gated_delta_decode_fused
+    original_conv = comfy_kitchen.deltanet_conv_step
+    original_avail = getattr(comfy_kitchen, "gated_delta_decode_is_available", None)
+
+    def enabled():
+        return gate is None or gate()
+
+    def gated_delta_decode_fused_(*args, **kwargs):
+        if not enabled():
+            return original_fused(*args, **kwargs)
+        return gated_delta_decode_fused(*args, **kwargs)
+
+    def gated_conv_step(*args, **kwargs):
+        if not enabled():
+            return original_conv(*args, **kwargs)
+        return conv_step(*args, **kwargs)
+
+    def gated_availability(device=None, key_head_dim=128, value_head_dim=128):
+        if not enabled():
+            return bool(original_avail(device, key_head_dim, value_head_dim)) if original_avail is not None else False
+        return is_available(device, key_head_dim, value_head_dim)
+
+    gated_delta_decode_fused_._gfx906_triton = True
+    comfy_kitchen.gated_delta_decode_fused = gated_delta_decode_fused_
+    comfy_kitchen.deltanet_conv_step = gated_conv_step
+    comfy_kitchen.gated_delta_decode_is_available = gated_availability
     return True

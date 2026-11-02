@@ -17,6 +17,14 @@ import torch
 import comfy.ldm.common_dit
 import comfy.model_management
 
+# Set by install(); read on every call so the CLIP node's textgen switch can
+# fall back without a reload. None means "always on".
+_gate = None
+
+
+def _enabled():
+    return _gate is None or _gate()
+
 
 def patch_rmsnorm():
     import comfy.text_encoders.llama as llama
@@ -24,7 +32,11 @@ def patch_rmsnorm():
     if getattr(llama.RMSNorm.forward, "_gfx906_prepared", False):
         return True
 
+    original = llama.RMSNorm.forward
+
     def forward(self, x):
+        if not _enabled():
+            return original(self, x)
         prepared = getattr(self, "_gfx906_prepared", None)
         w = self.weight
         if prepared is None or prepared[1] is not w or prepared[0].dtype != x.dtype or prepared[0].device != x.device:
@@ -57,11 +69,20 @@ def _slice(tensors, start, n):
     return [tuple(t[:, :, start:start + n] for t in group) for group in tensors]
 
 
-def table_compute_freqs_cis(original):
-    """Wrap compute_freqs_cis(self, position_ids, device) with a position table."""
+def table_compute_freqs_cis(original, gate=None):
+    """Wrap compute_freqs_cis(self, position_ids, device) with a position table.
+
+    ``gate`` defaults to the module gate set by install(); qwen35_model passes
+    the llama gate explicitly because its class overrides the method.
+    """
     cache = {}
 
+    def enabled():
+        return _enabled() if gate is None else gate()
+
     def compute_freqs_cis(self, position_ids, device):
+        if not enabled():
+            return original(self, position_ids, device)
         if position_ids.dim() == 2 and position_ids.shape[0] == 1 and position_ids.numel() > 0:
             positions = position_ids.reshape(-1)
             start = int(positions[0])
@@ -99,5 +120,7 @@ def patch_freqs_table():
     return patched
 
 
-def install():
+def install(gate=None):
+    global _gate
+    _gate = gate
     return patch_rmsnorm() and patch_freqs_table()

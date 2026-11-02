@@ -59,6 +59,12 @@ CONVROT_MODES = ("fused", "butterfly", "off")
 # the auto-tune fallback when a tile loses to SDPA on an untested card.
 ATTENTION_KERNELS = ("hand", "int8", "int8qk", "gemm")
 
+# Node switches are three-state: "default" keeps the startup/env value,
+# "on"/"off" are explicit overrides. None is the internal spelling of "default".
+TRISTATE = ("default", "on", "off")
+# Text-generation group: the CLIP node's textgen switch covers all four.
+TEXTGEN_ITEMS = ("deltanet", "kvdecode", "llama", "qwen35")
+
 
 def stock_backend(name):
     """The ComfyUI attention function behind a backend name, or None for our own modes.
@@ -102,12 +108,131 @@ _state = {
     "replaced_backend": None,
     "default_int8_configs": None,
     "w4a8": None,
+    "qkv": False,
+    "prefix_kv": False,
     "reason": "",
+    "attn_env": "int8",
+    "smooth_env": True,
+    "fp16_env": True,
+    "contig_env": True,
+    "convrot_env": "fused",
+    "linear8_env": True,
+    "qkv_env": False,
+    "te_env": "int8",
+    "te_attn_env": "default",
+    "profile_env": False,
+    "vae_env": True,
+    "vae_enabled": True,
+    "vae_patched": False,
+    "gemv_env": True,
+    "gemv_module": None,
+    "textgen_env": {},
+    "textgen_ready": {},
+    "textgen_override": None,
+    "prefix_kv_env": True,
+    "prefix_kv_enabled": True,
+    "prefix_kv_patched": False,
+    "text_gemv_env": True,
+    "text_gemv_enabled": True,
+    "te_gemv_calls": 0,
+    "te_plain_calls": 0,
+    "w4a8_env": True,
+    "w4a8_module": None,
+    "w4a8_calls": 0,
+    "amax_env": True,
+    "amax_guard": True,
+    "int8_tile_env": True,
+    "int8_tile_enabled": True,
+    "small_batch_env": True,
+    "small_batch_enabled": True,
+    "tuned": False,
 }
 
 
 def enabled():
     return os.getenv("COMFY_GFX906_TUNING", "1").lower() not in ("0", "off", "false", "no")
+
+
+def env_flag(name, default="1"):
+    return os.getenv(name, default).strip().lower() not in ("0", "off", "false", "no")
+
+
+def flag_value(value):
+    """None means "follow the startup/env value"; True/False are explicit."""
+    if value is None or isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ("default", "auto", ""):
+        return None
+    if text in ("on", "1", "true", "yes"):
+        return True
+    if text in ("off", "0", "false", "no"):
+        return False
+    return None
+
+
+def resolve_flag(value, env_value):
+    want = flag_value(value)
+    return bool(env_value) if want is None else want
+
+
+def textgen_requested(name):
+    override = _state.get("textgen_override")
+    if override is not None:
+        return override
+    return bool(_state.get("textgen_env", {}).get(name, True))
+
+
+def textgen_active(name):
+    return bool(_state.get("textgen_ready", {}).get(name)) and textgen_requested(name)
+
+
+def textgen_summary():
+    ready = _state.get("textgen_ready", {})
+    return ", ".join(
+        f"{name} {'on' if textgen_active(name) else ('off (installed)' if ready.get(name) else 'n/a')}"
+        for name in TEXTGEN_ITEMS)
+
+
+def _init_env_settings():
+    """Startup defaults from the environment, read once by apply().
+
+    Node switches override these per execution; "default" falls back here, so
+    an unset node parameter never clobbers an env value.
+    """
+    _state["attn_env"] = os.getenv("COMFY_GFX906_ATTN", "int8").strip().lower()
+    _state["smooth_env"] = env_flag("COMFY_GFX906_SMOOTH")
+    _state["fp16_env"] = env_flag("COMFY_GFX906_FP16")
+    _state["contig_env"] = env_flag("COMFY_GFX906_CONTIG")
+    convrot = os.getenv("COMFY_GFX906_CONVROT", "fused").strip().lower()
+    _state["convrot_env"] = convrot if convrot in CONVROT_MODES else "fused"
+    _state["linear8_env"] = env_flag("COMFY_GFX906_LINEAR8")
+    _state["qkv_env"] = env_flag("COMFY_GFX906_QKV", "0")
+    _state["te_env"] = os.getenv("COMFY_GFX906_TE", "int8").strip().lower()
+    _state["te_attn_env"] = os.getenv("COMFY_GFX906_TE_ATTN", "default").strip().lower()
+    _state["profile_env"] = os.getenv("COMFY_GFX906_PROFILE", "0").lower() in ("1", "on", "true", "yes")
+    _state["vae_env"] = env_flag("COMFY_GFX906_VAE")
+    _state["vae_enabled"] = _state["vae_env"]
+    _state["gemv_env"] = env_flag("COMFY_GFX906_GEMV")
+    _state["textgen_env"] = {
+        "deltanet": env_flag("COMFY_GFX906_DELTANET"),
+        "kvdecode": env_flag("COMFY_GFX906_KVDECODE"),
+        "llama": env_flag("COMFY_GFX906_LLAMA"),
+        "qwen35": env_flag("COMFY_GFX906_QWEN35"),
+    }
+    _state["textgen_ready"] = {name: False for name in TEXTGEN_ITEMS}
+    _state["textgen_override"] = None
+    _state["prefix_kv_env"] = env_flag("COMFY_GFX906_PREFIXKV")
+    _state["prefix_kv_enabled"] = _state["prefix_kv_env"]
+    _state["text_gemv_env"] = env_flag("COMFY_GFX906_TE_GEMV")
+    _state["text_gemv_enabled"] = _state["text_gemv_env"]
+    _state["w4a8_env"] = env_flag("COMFY_GFX906_W4A8")
+    _state["amax_env"] = env_flag("COMFY_GFX906_AMAX_GUARD")
+    _state["amax_guard"] = _state["amax_env"]
+    _state["int8_tile_env"] = env_flag("COMFY_GFX906_INT8_TILE")
+    _state["int8_tile_enabled"] = _state["int8_tile_env"]
+    _state["small_batch_env"] = env_flag("COMFY_GFX906_SMALL_BATCH")
+    _state["small_batch_enabled"] = _state["small_batch_env"]
 
 
 def target_archs():
@@ -171,7 +296,7 @@ def select_int8_tile(m):
     """
     if not _state.get("int8_tile_switch"):
         return
-    small = m <= INT8_SMALL_MAX_M
+    small = _state.get("small_batch_enabled", True) and m <= INT8_SMALL_MAX_M
     if _state.get("int8_tile_small") == small:
         return
     _state["int8_tile_small"] = small
@@ -207,7 +332,7 @@ def load_w4a8_gemv():
         return None
 
 
-def patch_kv_decode():
+def patch_kv_decode(gate=None):
     """4-D GQA matmul in FixedKVBias.decode.
 
     The 5-D form broadcasts the KV over the GQA groups, and ATen answers that by
@@ -215,6 +340,9 @@ def patch_kv_decode():
     layer per step: 37 MB at a 2.3k prompt, 0.73 ms per layer here. Folding the
     groups into the query rows removes the copy; the math is unchanged (bmm
     blocking order only, <= 7e-7).
+
+    ``gate`` is read per call, so the node switch can fall back to the shipped
+    decode without a reload.
     """
     import comfy_kitchen
     import comfy.text_encoders.llama as llama
@@ -223,7 +351,11 @@ def patch_kv_decode():
     if getattr(kv.decode, "_gfx906_folded", False):
         return True
 
+    original = kv.decode
+
     def decode(self, xq, xk, xv, num_kv_heads):
+        if gate is not None and not gate():
+            return original(self, xq, xk, xv, num_kv_heads)
         batch_size, num_heads, seq, head_dim = xq.shape
         self.key.index_copy_(2, self.position[:seq], xk)
         self.value.index_copy_(2, self.position[:seq], xv)
@@ -336,7 +468,7 @@ def te_int8_gemv(module, x):
     single-row call goes straight to the GEMV. Multi-row (prefill) calls and
     anything the GEMV does not support return None and keep the dispatch path.
     """
-    if _state.get("gemv") is None:
+    if _state.get("gemv") is None or not _state.get("text_gemv_enabled", True):
         return None
     from comfy_kitchen.tensor import TensorWiseINT8Layout
 
@@ -348,6 +480,7 @@ def te_int8_gemv(module, x):
     out = select_int8_gemv(rows, qdata, scale, module.bias, x.dtype, None, None, groupsize)
     if out is None:
         return None
+    _state["te_gemv_calls"] = _state.get("te_gemv_calls", 0) + 1
     return out.view(*x.shape[:-1], out.shape[-1])
 
 
@@ -416,6 +549,7 @@ def te_w4a8_gemv(module, x):
                           levels=levels, inv_level=inv_level or 1.0)
     if out is None:
         return None
+    _state["w4a8_calls"] = _state.get("w4a8_calls", 0) + 1
     return out.view(*x.shape[:-1], out.shape[-1])
 
 
@@ -443,6 +577,8 @@ def te_plain_gemv(module, x, compute_dtype=None, want_requant=False, weight_only
     cast. fp32 accumulation either way; only the sum order differs from the
     GEMM, so results match to rounding.
     """
+    if not _state.get("text_gemv_enabled", True):
+        return None
     if want_requant or weight_only_quant or compute_dtype not in (None, torch.float32):
         return None
     if x.dtype is not torch.float32 or not x.is_contiguous():
@@ -456,6 +592,7 @@ def te_plain_gemv(module, x, compute_dtype=None, want_requant=False, weight_only
     if module.bias is not None or module.weight_function or module.bias_function:
         return None
     out = torch.mv(weight.to(x.dtype), rows[0])
+    _state["te_plain_calls"] = _state.get("te_plain_calls", 0) + 1
     return out.view(*x.shape[:-1], out.shape[-1])
 
 
@@ -477,8 +614,9 @@ def patch_int8_tile_switch():
     if getattr(previous, "_gfx906_tile_switch", False):
         return True
 
-    gemv_on = os.getenv("COMFY_GFX906_GEMV", "1").strip().lower() not in ("0", "off", "false")
-    _state["gemv"] = load_int8_gemv() if gemv_on else None
+    gemv_on = _state.get("gemv_env", True)
+    _state["gemv_module"] = load_int8_gemv()
+    _state["gemv"] = _state["gemv_module"] if gemv_on else None
 
     def int8_linear(x, weight, weight_scale, bias=None, out_dtype=torch.bfloat16, convrot=False,
                     convrot_groupsize=256, input_act=None, input_act_weight=None,
@@ -541,6 +679,15 @@ def restore_int8_defaults():
         kernel.cache.clear()
     _state["int8_tile_switch"] = False
     _state["int8_tile_small"] = None
+
+
+def set_int8_tile(enabled):
+    """Switch the gfx906 tile list on/off without a reload."""
+    if enabled:
+        if _state.get("int8_linear") and _state.get("default_int8_configs") is not None:
+            patch_int8_linear(replace=bool(_state.get("tuned")))
+    elif _state.get("default_int8_configs") is not None:
+        restore_int8_defaults()
 
 
 def _sdpa(q, k, v, softmax_scale):
@@ -742,14 +889,15 @@ def patch_attention(auto_tune=False):
             return None
         if q.dtype in (torch.float32, torch.bfloat16):
             if _state["attn_fp16"]:
-                # vector_norm(inf) is max(abs()) without materializing the 66 MB temporary
-                amax = max(torch.linalg.vector_norm(t, ord=float("inf")).item() for t in (q, k, v))
-                if amax >= FP16_SAFE_AMAX:
-                    if not stats["fp32"]:
-                        logging.warning("gfx906: attention amax %.0f exceeds %d, leaving the inputs alone",
-                                        amax, FP16_SAFE_AMAX)
-                    stats["fp32"] += 1
-                    return None
+                if _state.get("amax_guard", True):
+                    # vector_norm(inf) is max(abs()) without materializing the 66 MB temporary
+                    amax = max(torch.linalg.vector_norm(t, ord=float("inf")).item() for t in (q, k, v))
+                    if amax >= FP16_SAFE_AMAX:
+                        if not stats["fp32"]:
+                            logging.warning("gfx906: attention amax %.0f exceeds %d, leaving the inputs alone",
+                                            amax, FP16_SAFE_AMAX)
+                        stats["fp32"] += 1
+                        return None
                 q, k, v = q.half(), k.half(), v.half()
                 stats["fp16"] += 1
         elif q.dtype != torch.float16:
@@ -915,39 +1063,92 @@ def triton_backend_active():
 
 
 def configure(attention=None, smooth=None, convrot=None, profile=None, text_encoder=None,
-              fp16=None, text_attention=None, contiguous=None, linear8=None):
-    """Runtime settings, used by the GFX906 Tuning node."""
+              fp16=None, text_attention=None, contiguous=None, linear8=None, qkv=None,
+              vae=None, gemv=None, textgen=None, prefix_kv=None, text_gemv=None, w4a8=None,
+              amax_guard=None, int8_tile=None, small_batch=None):
+    """Runtime settings, used by the GFX906 nodes.
+
+    Every argument is three-state: None/"default" keeps the startup/env value,
+    True/"on"/"off" is an explicit override. Node parameters therefore win over
+    COMFY_GFX906_*, which win over the built-in defaults.
+    """
     if attention is not None:
+        wanted = str(attention).strip().lower()
+        if wanted in ("default", "auto"):
+            wanted = _state.get("attn_env", "int8")
         # combo values are untrusted: stale workflows may still carry removed names
-        _state["attn_kernel"] = (attention if attention in ATTENTION_KERNELS
-                                 or stock_backend(attention) is not None else "int8")
+        _state["attn_kernel"] = (wanted if wanted in ATTENTION_KERNELS
+                                 or stock_backend(wanted) is not None else "int8")
         _state["attn_backend_fn"] = stock_backend(_state["attn_kernel"])
     if contiguous is not None:
-        _state["attn_contiguous"] = bool(contiguous)
+        _state["attn_contiguous"] = resolve_flag(contiguous, _state.get("contig_env", True))
     if smooth is not None:
-        _state["smooth"] = bool(smooth)
+        _state["smooth"] = resolve_flag(smooth, _state.get("smooth_env", True))
     if fp16 is not None:
-        _state["attn_fp16"] = bool(fp16)
+        _state["attn_fp16"] = resolve_flag(fp16, _state.get("fp16_env", True))
     if convrot is not None:
-        _state["convrot_mode"] = convrot
-    if linear8 is not None and _state.get("linear8_enabled") is not None:
-        _state["linear8_enabled"] = bool(linear8)
+        wanted = str(convrot).strip().lower()
+        if wanted in ("default", "auto"):
+            wanted = _state.get("convrot_env", "fused")
+        _state["convrot_mode"] = wanted if wanted in CONVROT_MODES else _state.get("convrot_env", "fused")
+    if linear8 is not None:
+        _state["linear8_enabled"] = resolve_flag(linear8, _state.get("linear8_env", True))
+    if qkv is not None and _state.get("qkv_patched"):
+        _state["qkv"] = resolve_flag(qkv, _state.get("qkv_env", False))
     if text_encoder is not None and _state["applied"]:
-        _state["te_int8"] = text_encoder == "int8" and _state["te_patched"]
+        wanted = str(text_encoder).strip().lower()
+        if wanted == "auto":
+            wanted = _state.get("te_env", "int8")
+        _state["te_int8"] = wanted == "int8" and _state["te_patched"]
     if text_attention is not None:
+        wanted = str(text_attention).strip().lower()
+        if wanted == "auto":
+            wanted = _state.get("te_attn_env", "default")
         # an unknown combo value leaves whatever the previous selection was
-        _state["te_attention"] = (text_attention if text_attention == "default"
-                                  or stock_backend(text_attention) is not None else "default")
+        _state["te_attention"] = (wanted if wanted == "default"
+                                  or stock_backend(wanted) is not None else "default")
+    if vae is not None:
+        _state["vae_enabled"] = resolve_flag(vae, _state.get("vae_env", True))
+    if gemv is not None:
+        want = flag_value(gemv)
+        if want is None:
+            want = _state.get("gemv_env", True)
+        if want and _state.get("gemv_module") is None:
+            _state["gemv_module"] = load_int8_gemv()
+        _state["gemv"] = _state.get("gemv_module") if want else None
+    if textgen is not None:
+        _state["textgen_override"] = flag_value(textgen)
+    if prefix_kv is not None:
+        _state["prefix_kv_enabled"] = resolve_flag(prefix_kv, _state.get("prefix_kv_env", True))
+    if text_gemv is not None:
+        _state["text_gemv_enabled"] = resolve_flag(text_gemv, _state.get("text_gemv_env", True))
+    if w4a8 is not None:
+        want = flag_value(w4a8)
+        if want is None:
+            want = _state.get("w4a8_env", True)
+        if want and _state.get("w4a8_module") is None:
+            _state["w4a8_module"] = load_w4a8_gemv()
+        _state["w4a8"] = _state.get("w4a8_module") if want else None
+    if amax_guard is not None:
+        _state["amax_guard"] = resolve_flag(amax_guard, _state.get("amax_env", True))
+    if int8_tile is not None:
+        want = resolve_flag(int8_tile, _state.get("int8_tile_env", True))
+        if want != _state.get("int8_tile_enabled"):
+            set_int8_tile(want)
+        _state["int8_tile_enabled"] = want
+    if small_batch is not None:
+        _state["small_batch_enabled"] = resolve_flag(small_batch, _state.get("small_batch_env", True))
     # something may have disabled the backend after apply(); the node runs per
     # workflow, so this is the last chance to put it back before the model does
     # its first int8 matmul
     _state["triton_backend"] = enable_triton_backend()
     if profile is not None and _state["applied"]:
+        want = resolve_flag(profile, _state.get("profile_env", False))
         was = _profiler_enabled()
-        _set_profiler(profile)
-        if profile and not was:
-            # absorbed the Tuning Info node: its one-shot report ships with the
-            # first profiled prompt
+        _set_profiler(want)
+        if want and not was:
+            # the model node absorbed the old Tuning Info node: its one-shot
+            # report ships with the first profiled prompt
             logging.info("gfx906 tuning status:\n%s", status())
     return _state
 
@@ -1185,11 +1386,13 @@ def patch_qkv():
     """One int8 GEMM for q/k/v instead of three (Qwen-Image 2.1 attention).
 
     to_q/to_k/to_v share M and K, so the fused call is the same per-row dequant
-    kernel with N three times wider: at the block shape (M=4032, K=4096) three
-    calls cost 26.12 ms and one fused call 23.40 ms, i.e. -163 ms per step.
+    kernel with N three times wider: on the production tile at (M=4032, K=4096)
+    three calls cost 23.5 ms and one fused call 21.1 ms, i.e. -81 ms per step.
+
+    Off by default: the merged weights stay resident (50 MB per block, 1.6 GB
+    for a 32-block DiT) and the step is only 1.5% faster. The patch itself is
+    always installed; ``_state["qkv"]`` decides per call whether it is used.
     """
-    if os.getenv("COMFY_GFX906_QKV", "1").lower() in ("0", "off", "false", "no"):
-        return False
     from comfy.ldm.qwen_image21 import model as qwen
     import comfy.model_management
 
@@ -1219,7 +1422,12 @@ def patch_qkv():
             module.forward = project.__get__(module)
 
     def forward(self, x, pe, attn_fn, prefix_len, transformer_options={}):
-        self._gfx906_fused = None if comfy.model_management.in_training else _fused_qkv(self, x)
+        if comfy.model_management.in_training or not _state["qkv"]:
+            self._gfx906_fused = None
+            # turning the switch off mid-run drops the 1.6 GB of merged weights too
+            self._gfx906_merged = None
+        else:
+            self._gfx906_fused = _fused_qkv(self, x)
         try:
             return original_forward(self, x, pe, attn_fn, prefix_len, transformer_options)
         finally:
@@ -1228,7 +1436,7 @@ def patch_qkv():
     attention.__init__ = __init__
     attention.forward = forward
     attention._gfx906_qkv = True
-    _state["qkv_fused"] = True
+    _state["qkv_patched"] = True
     return True
 
 
@@ -1344,6 +1552,61 @@ def patch_linear8():
     return True
 
 
+def _prefix_merge(prefix, target, buffers, slot):
+    """Copy prefix and target rows into one reused buffer, as torch.cat would.
+
+    buffers[slot] is allocated by the first call and reused for the block's
+    only attention call, so the merge is two copy_ kernels on a fresh
+    allocation of exactly the size torch.cat would have made.
+    """
+    out = buffers[slot]
+    if out is None:
+        out = buffers[slot] = torch.empty((prefix.shape[0], prefix.shape[1] + target.shape[1], *prefix.shape[2:]),
+                                          dtype=prefix.dtype, device=prefix.device)
+    out[:, :prefix.shape[1]].copy_(prefix)
+    out[:, prefix.shape[1]:].copy_(target)
+    return out
+
+
+def patch_prefix_kv():
+    """Merge the cached prefix K/V with copy_ instead of torch.cat.
+
+    prefix_cached_attention rebuilds [prefix_k; k] with torch.cat on every
+    block: 4032 target rows against a 4058 row prefix is two 132 MB copies in
+    fp32, and cat pays the same copies plus its own dispatch. A buffer sized
+    exactly like the cat result, filled with two copy_ kernels, measures
+    0.39 -> 0.33 ms per call; the buffer dies with the per-block closure, the
+    same lifetime as the cat tensors it replaces.
+
+    The switch is read per call; off hands the call back to the shipped
+    torch.cat version.
+    """
+    import comfy.ldm.qwen_image21.model as qwen
+    if getattr(qwen, "_gfx906_prefixkv", False):
+        return True
+
+    original = qwen.prefix_cached_attention
+    _state["prefix_kv_patched"] = True
+
+    def prefix_cached_attention(prefix_k, prefix_v, transformer_options={}):
+        if not _state.get("prefix_kv_enabled", True):
+            return original(prefix_k, prefix_v, transformer_options)
+        # target-only queries: block-causal reduces to full attention over [cached prefix, target]
+        buffers = [None, None]
+
+        def attn(q, k, v, heads, preferred_attention=None):
+            q = qwen.AttentionTensorContainer(q.take().flatten(2))
+            k = qwen.AttentionTensorContainer(_prefix_merge(prefix_k, k.take(), buffers, 0).flatten(2))
+            v = qwen.AttentionTensorContainer(_prefix_merge(prefix_v, v.take(), buffers, 1).flatten(2))
+            return qwen.optimized_attention(q, k, v, heads, transformer_options=transformer_options, preferred_attention=preferred_attention)
+        return attn
+
+    qwen.prefix_cached_attention = prefix_cached_attention
+    qwen._gfx906_prefixkv = True
+    _state["prefix_kv"] = True
+    return True
+
+
 def patch_vae():
     """Run depth-1 Conv3d as Conv2d.
 
@@ -1353,29 +1616,31 @@ def patch_vae():
     lowers every one of them to im2col + bmm; the profiler puts that at 47% of
     decode time. Squeezing the depth axis makes them ordinary conv2d calls that
     land on the fp16 MIOpen kernels: 2.31 s -> 1.09 s at 1024x1024.
+
+    The switch is read in the hot path, so the node can turn it off without a
+    reload; the shipped Conv3d path is still reachable when the gate is off.
     """
-    if os.getenv("COMFY_GFX906_VAE", "1").lower() in ("0", "off", "false", "no"):
-        return False
     import comfy.ops
 
     conv3d = comfy.ops.disable_weight_init.Conv3d
     if getattr(conv3d, "_gfx906_vae", False):
         return True
     original = conv3d._conv_forward
+    _state["vae_patched"] = True
 
     def _conv_forward(self, input, weight, bias, autopad=None, *args, **kwargs):
-        if autopad == "causal_zero":
-            weight = weight[:, :, -input.shape[2]:, :, :]
-            autopad = None
-        if input.ndim == 5 and input.shape[2] == 1 and weight.shape[2] == 1:
-            return torch.nn.functional.conv2d(
-                input[:, :, 0], weight[:, :, 0], bias, self.stride[1:],
-                self.padding[1:], self.dilation[1:], self.groups).unsqueeze(2)
+        if _state.get("vae_enabled", True):
+            if autopad == "causal_zero":
+                weight = weight[:, :, -input.shape[2]:, :, :]
+                autopad = None
+            if input.ndim == 5 and input.shape[2] == 1 and weight.shape[2] == 1:
+                return torch.nn.functional.conv2d(
+                    input[:, :, 0], weight[:, :, 0], bias, self.stride[1:],
+                    self.padding[1:], self.dilation[1:], self.groups).unsqueeze(2)
         return original(self, input, weight, bias, autopad=autopad, *args, **kwargs)
 
     conv3d._conv_forward = _conv_forward
     conv3d._gfx906_vae = True
-    _state["vae_conv2d"] = True
     return True
 
 
@@ -1384,6 +1649,9 @@ def apply():
         return _state
     _state["applied"] = True
     _state["arch"] = arch_name()
+    # parse the startup defaults before any early return, so status() and the
+    # nodes can fall back to them on every platform
+    _init_env_settings()
     if not enabled():
         _state["reason"] = "disabled by COMFY_GFX906_TUNING"
         return _state
@@ -1393,10 +1661,16 @@ def apply():
         return _state
 
     tuned = on_target_arch()
+    _state["tuned"] = tuned
     patch_int8_linear(replace=tuned)
+    if _state.get("int8_linear") and not _state.get("int8_tile_env", True):
+        restore_int8_defaults()
     patch_convrot()
     patch_vae()
+    # opt-in: the fused GEMM is 1.5% faster but holds 1.6 GB of merged weights
+    _state["qkv"] = _state["qkv_env"]
     patch_qkv()
+    patch_prefix_kv()
     patch_linear8()
     # before any prompt runs: the queue thread binds execute_async when a prompt
     # starts, so a hook installed later would only report from the next one
@@ -1406,30 +1680,35 @@ def apply():
     # the triton backend again when --enable-triton-backend was not passed
     _state["triton_backend"] = enable_triton_backend()
     _state["te_patched"] = te_ready
-    te = os.getenv("COMFY_GFX906_TE", "int8").strip().lower()
-    _state["te_int8"] = te != "default" and te_ready
-    te_attn = os.getenv("COMFY_GFX906_TE_ATTN", "default").strip().lower()
-    _state["te_attention"] = te_attn if te_attn == "default" or stock_backend(te_attn) is not None else "default"
+    _state["te_int8"] = _state["te_env"] != "default" and te_ready
+    _state["te_attention"] = (_state["te_attn_env"] if _state["te_attn_env"] == "default"
+                              or stock_backend(_state["te_attn_env"]) is not None else "default")
     _state["logits_patched"] = patch_logits()
     patch_te_attention()
-    # the kitchen fused DeltaNet decode has no gfx906 code object; these triton kernels
-    # replace it for the text encoder's linear-attention layers
-    deltanet_on = os.getenv("COMFY_GFX906_DELTANET", "1").strip().lower() not in ("0", "off", "false", "no")
-    deltanet_kernels = load_deltanet() if tuned and deltanet_on else None
-    _state["deltanet_fused"] = bool(deltanet_kernels and deltanet_kernels.install())
-    kv_decode_on = os.getenv("COMFY_GFX906_KVDECODE", "1").strip().lower() not in ("0", "off", "false", "no")
-    _state["kv_decode_folded"] = patch_kv_decode() if kv_decode_on else False
-    llama_on = os.getenv("COMFY_GFX906_LLAMA", "1").strip().lower() not in ("0", "off", "false", "no")
-    llama_patches = load_llama_patches() if llama_on else None
-    _state["llama_patches"] = bool(llama_patches and llama_patches.install())
-    # after the base-class patches: the qwen35 class wraps its own compute_freqs_cis
-    # only when the shared base carries the position table
-    qwen35_on = os.getenv("COMFY_GFX906_QWEN35", "1").strip().lower() not in ("0", "off", "false", "no")
-    qwen35_model = load_qwen35_model() if tuned and qwen35_on else None
-    _state["qwen35_node_model"] = bool(qwen35_model and qwen35_model.install())
+    # text-generation group: installed once with a live gate, so the CLIP node
+    # can turn it off without a reload. Modules are loaded on the measured arch
+    # even when the env default is off, otherwise the node could not turn them on.
+    if tuned:
+        deltanet_kernels = load_deltanet()
+        if deltanet_kernels:
+            _state["textgen_ready"]["deltanet"] = bool(
+                deltanet_kernels.install(lambda: textgen_active("deltanet")))
+    _state["textgen_ready"]["kvdecode"] = bool(
+        patch_kv_decode(lambda: textgen_active("kvdecode")))
+    llama_patches = load_llama_patches()
+    if llama_patches:
+        _state["textgen_ready"]["llama"] = bool(
+            llama_patches.install(lambda: textgen_active("llama")))
+    if tuned:
+        qwen35_model = load_qwen35_model()
+        if qwen35_model:
+            # the freqs table belongs to the llama item, not the qwen35 class swap
+            _state["textgen_ready"]["qwen35"] = bool(
+                qwen35_model.install(lambda: textgen_active("qwen35"),
+                                     lambda: textgen_active("llama")))
     # 4-bit weights: register-unpacked GEMV for decode, int8 decode for prefill
-    w4a8_on = os.getenv("COMFY_GFX906_W4A8", "1").strip().lower() not in ("0", "off", "false", "no")
-    _state["w4a8"] = load_w4a8_gemv() if tuned and w4a8_on else None
+    _state["w4a8_module"] = load_w4a8_gemv() if tuned else None
+    _state["w4a8"] = _state["w4a8_module"] if _state.get("w4a8_env", True) else None
     # the per-block graph hooks live in core on purpose; say so when they are absent
     import comfy.model_prefetch
     _state["resident_graph_patch"] = hasattr(comfy.model_prefetch, "RESIDENT_GRAPH_MODULES")
@@ -1444,19 +1723,19 @@ def apply():
         patch_attention(auto_tune=True)
     logging.info(
         "gfx906 tuning active: int8 linear %s%s, convrot %s, vae %s, qkv %s, attention %s%s%s%s, "
-        "text encoder %s + lm_head, encoder attention %s, deltanet %s",
+        "text encoder %s + lm_head, encoder attention %s, textgen %s",
         "tuned" if _state.get("int8_tile_replaced") else ("on (tile appended)" if _state["int8_linear"] else "off"),
         " + decode gemv" if _state.get("gemv") else "",
         _state["convrot_mode"] if _state["convrot"] else "off",
-        "conv3d->conv2d" if _state.get("vae_conv2d") else "off",
-        "fused" if _state.get("qkv_fused") else "off",
+        "conv3d->conv2d" if _state.get("vae_patched") and _state.get("vae_enabled") else "off",
+        "fused" if _state.get("qkv") else "off",
         _state["attn_kernel"] if _state["attention"] else "off",
         f" (other calls go to {_state['replaced_backend']})" if _state.get("replaced_backend") else "",
         ", fp16 cast off" if not _state["attn_fp16"] else "",
         ", contiguous off" if not _state.get("attn_contiguous", True) else "",
         "int8" if _state["te_int8"] else "default",
         _state["te_attention"],
-        "fused decode" if _state["deltanet_fused"] else "eager",
+        textgen_summary(),
     )
     return _state
 
@@ -1472,45 +1751,6 @@ def _bench(fn, iters=5, warmup=3):
     end.record()
     torch.cuda.synchronize()
     return start.elapsed_time(end) / iters
-
-
-def benchmark(m=4032, iters=5):
-    """Per-layer cost of the three linear shapes in a 4096-token quantized DiT."""
-    from comfy_kitchen.backends.triton import quantization
-
-    if not _state["int8_linear"]:
-        return ["int8 linear patch not applied, nothing to compare"]
-
-    lines = []
-    for n, k in ((4096, 4096), (24576, 4096), (4096, 12288)):
-        x = torch.randn(m, k, device="cuda", dtype=torch.float32)
-        w = torch.randint(-127, 127, (n, k), device="cuda", dtype=torch.int8)
-        ws = torch.rand(n, 1, device="cuda", dtype=torch.float32) * 0.01
-        run = lambda: quantization.int8_linear(x, w, ws, None, out_dtype=torch.float32, convrot=True)
-        tuned = _bench(run, iters=iters)
-        if _state["default_int8_configs"] is not None:
-            restore_int8_defaults()
-            base = _bench(run, iters=iters)
-            patch_int8_linear(replace=True)
-            lines.append(f"N={n:5d} K={k:5d}  {tuned:6.2f} ms  vs {base:6.2f} ms stock  ({base/tuned:.2f}x)")
-        else:
-            lines.append(f"N={n:5d} K={k:5d}  {tuned:6.2f} ms")
-    lines.extend(_bench_convrot(m))
-    return lines
-
-
-def _bench_convrot(m):
-    original = _state.get("original_rotate")
-    if original is None:
-        return []
-    from comfy_kitchen.backends.triton import quantization
-    from comfy_kitchen.tensor.int8_utils import _build_hadamard
-
-    x = torch.randn(m, 4096, device="cuda", dtype=torch.float32)
-    h = _build_hadamard(CONVROT_GROUP, device=x.device, dtype=x.dtype)
-    fast = _bench(lambda: quantization.triton_quantize_rowwise(quantization._rotate_activation(x, h, CONVROT_GROUP)), iters=10)
-    slow = _bench(lambda: quantization.triton_quantize_rowwise(original(x, h, CONVROT_GROUP)), iters=10)
-    return [f"convrot rotate+quant  {fast:6.2f} ms  vs {slow:6.2f} ms matmul  ({slow/fast:.2f}x)"]
 
 
 def report_lines():
@@ -1532,28 +1772,75 @@ def report_lines():
 
 def status():
     tile_state = {True: "tuned", False: "config appended, autotune decides", None: "off"}
+    if not _state["int8_linear"]:
+        tile_line = "int8 linear off"
+    elif _state.get("int8_tile_enabled", True):
+        tile_line = f"int8 linear {tile_state[_state['int8_tile_replaced']]}"
+    else:
+        tile_line = f"int8 linear {tile_state[_state['int8_tile_replaced']]}, tile switch off (stock list)"
+    if not _state["int8_linear"] or not _state.get("int8_tile_enabled", True):
+        small_line = "small batch tile n/a"
+    else:
+        small_line = (f"small batch tile {'on' if _state.get('small_batch_enabled', True) else 'off (large tile only)'}")
+    prefix_patched = _state.get("prefix_kv_patched")
+    if not prefix_patched:
+        prefix_line = "prefix kv n/a"
+    elif _state.get("prefix_kv_enabled", True):
+        prefix_line = "prefix kv reused buffer"
+    else:
+        prefix_line = "prefix kv torch.cat (off, installed)"
+    gemv_loaded = _state.get("gemv_module") is not None
+    gemv_line = ("gemv on" if _state.get("gemv") else
+                 ("gemv off (installed)" if gemv_loaded else "gemv n/a"))
+    if _state.get("text_gemv_enabled", True):
+        text_gemv_line = (f"text gemv on: {_state.get('te_gemv_calls', 0)} direct / "
+                          f"{_state.get('te_plain_calls', 0)} mv calls" if _state.get("te_patched")
+                          else "text gemv on (TE patch n/a)")
+    else:
+        text_gemv_line = "text gemv off (fallback)"
+    w4a8_loaded = _state.get("w4a8_module") is not None
+    if _state.get("w4a8") is not None:
+        calls = _state.get("w4a8_calls", 0)
+        if not _state.get("te_int8"):
+            w4a8_line = "w4a8 on (needs text encoder int8)"
+        else:
+            w4a8_line = f"w4a8 on: {calls} calls" + (" (no 4-bit weights seen yet)" if not calls else "")
+    elif w4a8_loaded:
+        w4a8_line = "w4a8 off (installed)"
+    else:
+        w4a8_line = "w4a8 n/a"
     lines = [
         f"arch {_state['arch']}",
         f"comfy-kitchen triton backend {triton_backend_active()}",
-        f"int8 linear {tile_state[_state['int8_tile_replaced'] if _state['int8_linear'] else None]}",
+        tile_line,
+        small_line,
         f"convrot {_state['convrot_mode'] or 'off'}",
-        f"vae {'conv3d as conv2d' if _state.get('vae_conv2d') else 'off'}",
-        f"qkv {'one int8 gemm' if _state.get('qkv_fused') else 'off'}"
+        f"qkv {'one int8 gemm' if _state.get('qkv') else 'off'}"
         + (f", {_state['qkv_calls']} fused / {_state.get('qkv_fallbacks', 0)} fallback"
            if _state.get("qkv_calls") or _state.get("qkv_fallbacks") else ""),
+        prefix_line,
         f"linear8 {'on' if _state.get('linear8_enabled', True) else 'off'}: "
         f"{_state.get('linear8_modules', 0)} layers, {_state.get('linear8_calls', 0)} calls",
+        gemv_line,
+        text_gemv_line,
+        w4a8_line,
+        f"vae {'conv3d as conv2d' if _state.get('vae_patched') and _state.get('vae_enabled') else ('off (patched)' if _state.get('vae_patched') else 'off')}",
+        f"textgen {textgen_summary()}",
         f"attention {_state['attn_kernel'] if _state['attention'] else 'off'}"
         + (f", smoothing {'on' if _state['smooth'] else 'off'}" if _state["attn_kernel"] == "int8qk" else "")
         + (", inputs cast to fp16" if _state["attn_fp16"] else ", inputs left in the model dtype")
+        + (f", amax guard {'on' if _state.get('amax_guard', True) else 'off'}")
         + (f", rest to {_state['replaced_backend']}" if _state.get("replaced_backend") else ""),
         f"text encoder {'int8' if _state['te_int8'] else 'default (dequantize per call)'}"
-        + (", 4-bit weights on" if _state["w4a8"] is not None else "")
+        + f", lm_head {'int8' if _state.get('logits_patched') and _state['te_int8'] else 'default'}"
         + f", encoder attention {_state['te_attention']}",
+        f"resident graph hooks {'present' if _state.get('resident_graph_patch') else 'absent'}",
     ]
-    if _state["int8_linear"]:
-        tile = ", ".join(f"{k}={v}" for k, v in INT8_TILE.items())
-        lines.append(f"int8 tile {tile}, {INT8_WARPS} warps, {INT8_STAGES} stages")
+    if _state["int8_linear"] and _state.get("int8_tile_enabled", True):
+        large = ", ".join(f"{k}={v}" for k, v in INT8_TILE.items())
+        small = ", ".join(f"{k}={v}" for k, v in INT8_TILE_SMALL.items())
+        lines.append(f"int8 tiles: large {large}; "
+                     + (f"small {small}" if _state.get("small_batch_enabled", True) else "small batch off"))
     cast = _state["attn_cast"]
     if cast:
         lines.append(f"attention calls: fp16-ok {cast['fp16']}, amax overflow {cast['fp32']}"
