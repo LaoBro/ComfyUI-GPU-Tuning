@@ -50,6 +50,13 @@ def fmt(spec):
     return f"{body} w{warps} s{stages}"
 
 
+def spec_label(spec):
+    """Bare-key-safe name for a tile, for the manifest's ms table: 128x256x32g8w4s2."""
+    params, warps, stages = spec
+    body = "x".join(str(params[k]) for k in ("block_m", "block_n", "block_k"))
+    return f"{body}g{params['group_size_m']}w{warps}s{stages}"
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--m", default="1,2,8,128,4032", help="comma separated batch widths")
@@ -94,6 +101,60 @@ def bench(fn, iters, warmup):
     return statistics.median(samples)
 
 
+def sweep(kernels, shapes, batch_widths, candidates, iters=3, warmup=2, top=3):
+    """Time every candidate tile on every (shape, batch width).
+
+    Each candidate is installed alone in the config list, so comfy-kitchen's
+    autotune compiles and measures only that tile. Returns
+    {(n, k, m, spec_text): ms}; the original list is restored on the way out,
+    including after a compile failure.
+    """
+    from comfy_kitchen.backends.triton import quantization
+
+    original = [list(kernel.configs) for kernel in kernels]
+    results = {}
+    try:
+        for n, k in shapes:
+            weight = torch.randint(-127, 127, (n, k), device="cuda", dtype=torch.int8)
+            scale = torch.rand(n, 1, device="cuda", dtype=torch.float32) * 0.01
+            for m in batch_widths:
+                x = torch.randn(m, k, device="cuda", dtype=torch.float32)
+                rows = []
+                for spec in candidates:
+                    for kernel in kernels:
+                        kernel.configs = [triton.Config(dict(spec[0]), num_warps=spec[1], num_stages=spec[2])]
+                        kernel.cache.clear()
+                    run = lambda: quantization.int8_linear(x, weight, scale, None, out_dtype=torch.float32, convrot=True)
+                    try:
+                        elapsed = bench(run, iters, warmup)
+                        results[(n, k, m, spec_text(spec))] = elapsed
+                        rows.append((elapsed, spec))
+                    except Exception as exc:
+                        print(f"  {n}x{k} m={m} {fmt(spec)} failed: {type(exc).__name__}: {exc}")
+                if not rows:
+                    continue
+                rows.sort(key=lambda item: item[0])
+                best = ", ".join(f"{fmt(spec)} {elapsed:.2f} ms" for elapsed, spec in rows[:top])
+                print(f"{n}x{k} m={m}: {best}")
+    finally:
+        for kernel, configs in zip(kernels, original):
+            kernel.configs = configs
+            kernel.cache.clear()
+    return results
+
+
+def winner(results, want_small):
+    """(spec_text, median ms) for the fastest tile in one batch-width bucket."""
+    scores = {}
+    for (n, k, m, key), elapsed in results.items():
+        if (m <= 8) == want_small:
+            scores.setdefault(key, []).append(elapsed)
+    if not scores:
+        return None, None
+    key = min(scores, key=lambda name: statistics.median(scores[name]))
+    return key, statistics.median(scores[key])
+
+
 def main():
     args = parse_args()
     if not torch.cuda.is_available():
@@ -101,7 +162,6 @@ def main():
         return 1
 
     import gfx906_tuning as tuning
-    from comfy_kitchen.backends.triton import quantization
 
     tuning.enable_triton_backend()
     kernels = list(tuning._int8_kernels())
@@ -124,49 +184,10 @@ def main():
     print(f"arch {arch} | {len(candidates)} candidates | {len(shapes)} shapes | m={ms}")
     print("each candidate is compiled once per (m,n,k); the first run can take seconds")
 
-    original = [list(kernel.configs) for kernel in kernels]
-    results = {}
-    try:
-        for n, k in shapes:
-            weight = torch.randint(-127, 127, (n, k), device="cuda", dtype=torch.int8)
-            scale = torch.rand(n, 1, device="cuda", dtype=torch.float32) * 0.01
-            for m in ms:
-                x = torch.randn(m, k, device="cuda", dtype=torch.float32)
-                rows = []
-                for spec in candidates:
-                    for kernel in kernels:
-                        kernel.configs = [triton.Config(dict(spec[0]), num_warps=spec[1], num_stages=spec[2])]
-                        kernel.cache.clear()
-                    run = lambda: quantization.int8_linear(x, weight, scale, None, out_dtype=torch.float32, convrot=True)
-                    try:
-                        elapsed = bench(run, args.iters, args.warmup)
-                        results[(n, k, m, spec_text(spec))] = elapsed
-                        rows.append((elapsed, spec))
-                    except Exception as exc:
-                        print(f"  {n}x{k} m={m} {fmt(spec)} failed: {type(exc).__name__}: {exc}")
-                if not rows:
-                    continue
-                rows.sort(key=lambda item: item[0])
-                best = ", ".join(f"{fmt(spec)} {elapsed:.2f} ms" for elapsed, spec in rows[:args.top])
-                print(f"{n}x{k} m={m}: {best}")
-    finally:
-        for kernel, configs in zip(kernels, original):
-            kernel.configs = configs
-            kernel.cache.clear()
+    results = sweep(kernels, shapes, ms, candidates, args.iters, args.warmup, args.top)
 
-    def winner(want_small):
-        scores = {}
-        for (n, k, m, key), elapsed in results.items():
-            in_bucket = m <= 8 if want_small else m > 8
-            if in_bucket:
-                scores.setdefault(key, []).append(elapsed)
-        if not scores:
-            return None, None
-        key = min(scores, key=lambda name: statistics.median(scores[name]))
-        return key, statistics.median(scores[key])
-
-    large_key, large_ms = winner(False)
-    small_key, small_ms = winner(True)
+    large_key, large_ms = winner(results, False)
+    small_key, small_ms = winner(results, True)
     if large_key is None:
         print("no large-m results")
         return 1
@@ -183,12 +204,8 @@ def main():
             print(f'COMFY_GFX906_SMALL_TILE_CONFIG="{small_key}"')
         print("TILE_CONFIG makes this card 'measured' (single config, no autotune).")
         print("SMALL_TILE_CONFIG alone only changes the candidate / forced small tile.")
-        print("\nFor an upstream INT8_TILE_TABLE entry:")
-        print(f'    "{arch}": {{')
-        print(f'        "large": ({parse_spec(large_key)[0]}, {parse_spec(large_key)[1]}, {parse_spec(large_key)[2]}),')
-        if small_key is not None:
-            print(f'        "small": ({parse_spec(small_key)[0]}, {parse_spec(small_key)[1]}, {parse_spec(small_key)[2]}),')
-        print("    },")
+        print("\nTo store both for this card instead of exporting variables, run")
+        print("tools/bench.py --all --write: it fills arch/<gcn>/manifest.toml.")
     return 0
 
 

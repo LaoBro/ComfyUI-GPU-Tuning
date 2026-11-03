@@ -6,6 +6,10 @@
 本包在启动时给 int8 权重、注意力、VAE 换成本机实测更快的实现，**不改 ComfyUI 源码**，
 `COMFY_GFX906_TUNING=off` 可整体关闭。
 
+内核加速是 gfx906 专属的；**文本生成的改写不是**——m=1 走 GEMM、每层分派开销、
+KV cache 容量级拷贝、launch 开销，这些在别的卡上一样存在。所以有 kitchen 原生后端
+的设备（RDNA2+、NVIDIA）装文本生成改写组；triton 内核补丁只在 AMD 上装、由 dispatch 决定何时运行（见“兼容性”）。
+
 实测（ComfyUI 0.39.0 + torch 2.15 ROCm + triton 3.9，MI50 32 GB）：
 
 - 图像：Qwen-Image 2.1 turbo（int8 convrot，1024²，8 步）**18.66 → 5.25 s/it**
@@ -47,8 +51,6 @@
 
 除这 8 项外，包内还有几组独立补丁，各自有节点开关：
 
-- **linear8**：SDXL 这类没有 `QuantizedTensor` 的 checkpoint，把 `in_features >= 1280`
-  的 fp16 Linear 一次性重量化成 int8 并走 kitchen 内核；热路径按 `linear8` 开关回退。
 - **int8 tile 注入**：`int8_tile` 关闭时恢复上游 autotune 列表，不再注入 gfx906 tile；
   `small_batch` 单独控制 `m≤8` 的窄 tile 切换。
 - **prefix KV 复用**：`prefix_kv` 关闭时 `prefix_cached_attention` 回到 `torch.cat`。
@@ -69,7 +71,7 @@ git clone https://github.com/<your>/ComfyUI-gfx906-Tuning custom_nodes/ComfyUI-g
 重启 ComfyUI，启动日志里会出现：
 
 ```
-gfx906 tuning active: int8 linear tuned + decode gemv, convrot fused, vae conv3d->conv2d,
+gfx906 tuning active: int8 linear measured tile + decode gemv, convrot fused, vae conv3d->conv2d,
 qkv off, attention int8, text encoder int8 + lm_head, encoder attention default,
 textgen deltanet on, kvdecode on, llama on, qwen35 on
 ```
@@ -208,7 +210,7 @@ decode step 会在 CPU 上开内存。`COMFY_GFX906_GEMV=0` 可关掉 GEMV 与�
 
 | 节点 | 位置 | 作用 |
 |---|---|---|
-| **GFX906 Model Settings** | 模型链（加载器 → 采样器之间） | 注意力模式、连续布局、int8qk 中心化、fp16、amax 保护、convrot、linear8、int8 tile、`m≤8` 窄 tile、QKV、VAE、GEMV、prefix KV、profiler |
+| **GFX906 Model Settings** | 模型链（加载器 → 采样器之间） | 注意力模式、连续布局、int8qk 中心化、fp16、amax 保护、convrot、int8 tile、`m≤8` 窄 tile、QKV、VAE、GEMV、prefix KV、profiler |
 | **GFX906 CLIP Settings** | CLIP 链（加载器 → 编码） | 文本编码器 int8、编码器注意力后端、TE GEMV、4-bit w4a8、文本生成补丁组 |
 
 设置节点改动**下一次执行就生效**，不用重启。命令行复测 `benchmark()` 已删除：它没有节点注册、也没有任何调用者，长期是死代码；需要复测时直接用 `gfx906fix/` 下的独立脚本，避免再维护第三个节点。
@@ -223,7 +225,7 @@ decode step 会在 CPU 上开内存。`COMFY_GFX906_GEMV=0` 可关掉 GEMV 与�
 
 ### 节点开关清单
 
-Model Settings：`attention`、`contiguous`、`smooth`、`fp16`、`amax_guard`、`convrot`、`linear8`、`int8_tile`、`small_batch`、`qkv`、`vae`、`gemv`、`prefix_kv`、`profile`。
+Model Settings：`attention`、`contiguous`、`smooth`、`fp16`、`amax_guard`、`convrot`、`int8_tile`、`small_batch`、`qkv`、`vae`、`gemv`、`prefix_kv`、`profile`。
 
 CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`textgen`。
 
@@ -231,7 +233,6 @@ CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`text
 
 - `contiguous`：选中 `basic`/`pytorch`/`sub_quad`/`split` 等 core 后端时，调用前把输入转成连续的 `[B,H,S,D]`；关闭可复现 core 的原始转置视图调用。
 - `smooth`：SageAttention2 的均值中心化，只在 `int8qk` 模式下生效。
-- `linear8`：把 `in_features >= 1280` 的 fp16 Linear 权重按行量化成 int8 并走 kitchen 内核（SDXL 类未量化 checkpoint）；640 宽的层保持 fp16。
 - `amax_guard`：注意力输入绝对值超过 60000 时放弃 fp16 转换，留在模型 dtype，避免 fp16 溢出。
 - `int8_tile`：关闭后恢复上游 autotune 的 tile 列表，不再注入 gfx906 的 `128×256×32`；GEMV 仍由 `gemv` 单独控制。
 - `small_batch`：gfx906 上把“`m≤8` 切到 `16×32×64` 窄 tile、`m>8` 切回 `128×256×32`”单独控制；其它 AMD 上表示“把窄 tile 追加为 autotune 候选”（是否真的用它由该卡实测决定）。需要 `int8_tile` 为 on，否则显示 n/a。GEMV 仍由 `gemv` 单独控制。
@@ -241,11 +242,11 @@ CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`text
 
 ### 在其它显卡上使用 / 扫描 int8 tile
 
-其它 AMD 显卡上的功能分级（直接可用 / 需测量 / 需移植 / 不可用）、`tuned` 的含义、扫描工具 `tools/tile_sweep.py` 的完整用法，以及 `COMFY_GFX906_TILE_CONFIG` / `SMALL_TILE_CONFIG` 的使用方式，见：
+其它 AMD 显卡上的功能分级（常开 / 可选开关 / 测量门 / 不可用）、门控与 dispatch 的分工、扫描工具 `tools/tile_sweep.py` 的完整用法，以及 `COMFY_GFX906_TILE_CONFIG` / `SMALL_TILE_CONFIG` 的使用方式，见：
 
 **[PORTING.md — 其它显卡移植与二次开发指南](PORTING.md)**
 
-最短路径：先用节点默认值跑通，再运行 `python custom_nodes/ComfyUI-gfx906-Tuning/tools/tile_sweep.py --emit`，把输出的两个 env 变量加到启动命令里即可免 autotune；不要直接把新卡名加进 `COMFY_GFX906_ARCHS`。
+最短路径：先用节点默认值跑通（没跑过 bench 的卡上测量门功能是关的），再运行一次 `python custom_nodes/ComfyUI-gfx906-Tuning/tools/bench.py --all --write`。它测出这张卡的 int8 tile、attention tile/mode、GEMV/w4a8/vae/convrot 的开或关，写进 `~/.config/comfy-gfx-tune/arch/<gcn>/manifest.toml`，之后启动不再 autotune。
 
 ### 注意力模式怎么选
 
@@ -263,9 +264,15 @@ CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`text
 
 | 设备 | 生效范围 |
 |---|---|
-| gfx906（Vega 56/64、MI50/60、Radeon VII） | 全部补丁，用实测 tile，不跑 autotune |
-| 其它 AMD（gfx900、gfx90a/94x、RDNA1 后期、RDNA2） | int8 大/小 tile 都追加进 autotune 候选（由该卡实测决定），convrot、VAE、文本编码器全部生效；注意力首次调用现场扫 tile 并与 SDPA 比快慢 |
-| NVIDIA / CPU | 整包跳过（Triton 的 NVIDIA 后端最低 Volta，Pascal 及更老无解） |
+功能分三类：**常开**（prefix KV、KV decode、llama、TE GEMV、TE int8）、**可选开关**（qkv、qwen35）、**测量门**（int8 tile、attention、w4a8、deltanet、vae、convrot、gemv——没跑过 bench 就是关，跑过之后由本机/出厂 manifest 决定开或关）。
+
+| 设备 | 生效范围 |
+|---|---|
+| gfx906（Vega 56/64、MI50/60、Radeon VII） | 全部生效：出厂自带实测表（`arch/gfx906/manifest.toml`），测量门功能开箱即得，不跑 autotune |
+| 其它 AMD，kitchen 无后端（gfx900、gfx90a/94x、RDNA1 后期） | 测量门功能默认关（tile 走 stock autotune、attention 首调现场扫参）；跑一次 `bench.py --all --write` 后按本机实测自动开关，启动即免 autotune |
+| 其它 AMD，kitchen 已有 hip 后端（RDNA2/3/4） | 同上；tile 补丁照装但退为兜底（dispatch 优先 hip）。attention 照装并自测与 SDPA 的快慢。常开组始终生效 |
+| NVIDIA（有 GPU） | triton 内核补丁与 attention 不装（`is_amd()` 为假；cuda 的 capability 集没有 `int8_linear`，N 卡的 int8 线性走 triton，但本包没在 N 卡测过 tile，保持 stock autotune）。常开组生效：prefix KV、KV decode 折叠、llama 缓存、TE GEMV、TE int8；`w4a8`/`deltanet` 由本机 bench 的 `feature.*` 决定（manifest key 是 `sm<major><minor>`）。**未实测**，性能结论要由有卡的人跑；强烈建议加 core-patches（per-block CUDA graph，与 GPU 无关） |
+| CPU | `torch.cuda.is_available()` 为假，整包不安装 |
 
 其它 AMD 的功能分级、需要测量/移植的项和扫描工具用法见 [PORTING.md](PORTING.md)。
 
@@ -275,28 +282,27 @@ CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`text
 
 **节点显式 on/off > 环境变量 > 内置默认**
 
-`COMFY_GFX906_TUNING` 是唯一无法被节点替代的开关：补丁在节点执行前就已安装，且没有卸载路径；不接节点的用户也靠它关闭整包。`COMFY_GFX906_ARCHS` 同理，它决定启动期是否替换 tile、是否安装 DeltaNet/Qwen3.5。`COMFY_GFX906_PROFILE` 保留为无节点/headless 启动时的入口。
+`COMFY_GFX906_TUNING` 是唯一无法被节点替代的开关：补丁在节点执行前就已安装，且没有卸载路径；不接节点的用户也靠它关闭整包。`COMFY_GFX906_PROFILE` 保留为无节点/headless 启动时的入口。
 
 | 变量 | 默认 | 作用 |
 |---|---|---|
 | `COMFY_GFX906_TUNING` | `1` | `off` 整包关闭 |
-| `COMFY_GFX906_ATTN` | `int8` | 注意力模式 |
+| `COMFY_GFX906_ATTN` | `int8` | 注意力模式（int8 / int8qk / hand / gemm / sdpa）：内核质量不同（int8 PV rel ~2% vs hand ~0.03%），是手动质量取舍，不进测量门 |
 | `COMFY_GFX906_FP16` | `1` | 注意力输入转 fp16 |
 | `COMFY_GFX906_CONTIG` | `1` | 后端调用前转连续布局 |
 | `COMFY_GFX906_SMOOTH` | `1` | int8qk 的均值中心化 |
 | `COMFY_GFX906_AMAX_GUARD` | `1` | 输入 abs-max ≥ 60000 时跳过 fp16 转换 |
-| `COMFY_GFX906_CONVROT` | `fused` | `fused` / `butterfly` / `off` |
-| `COMFY_GFX906_LINEAR8` | `1` | 未量化 fp16 Linear 走 int8（SDXL 类） |
+| `COMFY_GFX906_CONVROT | 空 | `fused` / `butterfly` / `off`；空表示用 manifest 的 `convrot.mode`，且 `feature.convrot` 决定装不装 |
 | `COMFY_GFX906_INT8_TILE` | `1` | 注入 gfx906 的 `128×256×32` int8 tile |
 | `COMFY_GFX906_SMALL_BATCH` | `1` | `m≤8` 切 `16×32×64` 窄 tile（其它 AMD 作为候选） |
-| `COMFY_GFX906_TILE_CONFIG` | 空 | 手工实测的大 tile，设置后该卡视为已实测（跳过 autotune） |
+| `COMFY_GFX906_TILE_CONFIG` | 空 | 手工实测的大 tile，设置后该卡视为已实测（跳过 autotune）；不设时用 manifest 的 `int8_gemm.tile/large` |
 | `COMFY_GFX906_SMALL_TILE_CONFIG` | 空 | 手工实测的窄 tile，替换候选/强制值 |
 | `COMFY_GFX906_TE` | `int8` | 文本编码器 int8（含生成时的 lm_head） |
 | `COMFY_GFX906_TE_ATTN` | `default` | 文本编码器注意力后端 |
 | `COMFY_GFX906_TE_GEMV` | `1` | TE 单行直调 GEMV + 未量化小投影 `torch.mv` |
-| `COMFY_GFX906_GEMV` | `1` | 模型 int8 linear 的单 token 解码 GEMV |
+| `COMFY_GFX906_GEMV` | 空 | 模型 int8 linear 的单 token 解码 GEMV；空表示用 manifest 的 `feature.gemv` |
 | `COMFY_GFX906_INT8_GEMV_ASM` | `auto` | int8 解码 GEMV 后端：`auto` 编译探测 / `on` 强制 asm / `off` 强制 int32 tl.sum |
-| `COMFY_GFX906_W4A8` | `1` | 4-bit 权重：单 token 走 GEMV，prefill 现解 int8（仅无 codebook 的 uniform 权重） |
+| `COMFY_GFX906_W4A8` | `1` | 4-bit 权重：单 token 走 GEMV（uniform 或 16 级 codebook），prefill 现解 int8；安装判定见 `feature.w4a8`，`FORCE` 可强开 |
 | `COMFY_GFX906_W4A8_ASM` | `auto` | 4-bit GEMV 后端：`auto` 编译探测 / `on` 强制 asm / `off` 跳过 asm（还有 HIP 扩展时仍用 HIP，见下一行） |
 | `COMFY_GFX906_W4A8_HIP` | `auto` | 节点目录下的 `w4a8_hip` 扩展：`auto` 有就用 / `off` 忽略它，让 `W4A8_ASM` 的 off 真正落到 per-group tl.dot |
 | `COMFY_GFX906_MEASURED` | `1` | 用 `arch/<gcn>/manifest.toml` 的实测记录按形状选后端；`0` 关掉这一层，回到纯探测 |
@@ -304,12 +310,11 @@ CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`text
 | `COMFY_GFX906_DELTANET` | `1` | DeltaNet 解码 Triton 内核 |
 | `COMFY_GFX906_KVDECODE` | `1` | 折叠 GQA 的 KV decode |
 | `COMFY_GFX906_LLAMA` | `1` | llama RMSNorm 预计算 + RoPE 频率表 |
-| `COMFY_GFX906_QWEN35` | `1` | Qwen3.5 计算类替换 |
-| `COMFY_GFX906_VAE` | `1` | VAE conv3d → conv2d |
+| `COMFY_GFX906_QWEN35` | `1` | Qwen3.5 计算类替换（等价改写，逐方法对过 core） |
+| `COMFY_GFX906_VAE` | 空 | VAE conv3d → conv2d；空表示用 manifest 的 `feature.vae` |
 | `COMFY_GFX906_QKV` | `0` | QKV 三合一（打开需 1.6 GB 常驻） |
 | `COMFY_GFX906_PREFIXKV` | `1` | prefix cache 的 K/V 合并用复用 buffer + `copy_` 代替 `torch.cat` |
 | `COMFY_GFX906_PROFILE` | `0` | 每次 prompt 结束打印耗时分解 |
-| `COMFY_GFX906_ARCHS` | `gfx906` | 视为"已实测"的架构名单 |
 
 ## 已知边界
 

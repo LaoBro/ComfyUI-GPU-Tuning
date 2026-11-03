@@ -50,6 +50,10 @@ WARPS = 4
 STAGES = 2
 DOT_BN = 32
 DOT_M = 16
+# The portable floor runs one (output block, row) per program: no tl.dot, so no
+# minimum K per step, and nothing beyond plain Triton.
+SUM_BN = 16
+SUM_BK = 256
 DECODE_BN = 2
 DECODE_BK = 1024
 DECODE_WARPS = 4
@@ -270,12 +274,14 @@ _REGISTRY = kreg.BackendRegistry(
         kreg.Candidate("asm", kind="asm", env="COMFY_GFX906_W4A8_ASM",
                        probe=_probe_asm, priority=50, requires=("v_dot4_i32_i8", "v_perm_b32")),
         kreg.Candidate("triton", kind="portable"),
+        # floor: any group size, no instruction the card may lack
+        kreg.Candidate("sum", kind="portable", priority=60),
     ]),
 )
 
 
 def backend_name():
-    """hip > asm (when it compiles) > portable per-group tl.dot."""
+    """hip > asm (when it compiles) > per-group tl.dot > tl.sum floor."""
     return _REGISTRY.resolve()
 
 
@@ -377,6 +383,113 @@ def _linear_dot(x, qdata, s_rel, s_channel, bias, out_dtype, group_size, convrot
     return out
 
 
+@triton.jit
+def sum_kernel(a_ptr, b_ptr, c_ptr, gmax_ptr, srel_ptr, sch_ptr, bias_ptr, cb_ptr,
+               n, k, ngroups, stride_bn, stride_bs, inv_level,
+               BN: tl.constexpr, BK: tl.constexpr, NG: tl.constexpr, GS: tl.constexpr,
+               HAS_BIAS: tl.constexpr, HAS_CB: tl.constexpr):
+    """One (output block, row) per program, reduced with tl.sum.
+
+    No tl.dot means no 16-wide K step, which is the only reason the portable
+    dot kernel cannot take a group size below 16. The weight is decoded one
+    nibble at a time and multiplied by its group scale, so the arithmetic is
+    the same as the other two paths up to summation order.
+    """
+    pid_n = tl.program_id(0)
+    row = tl.program_id(1)
+    offs_n = pid_n * BN + tl.arange(0, BN)
+    mask_n = offs_n < n
+
+    offs_g = tl.arange(0, NG)
+    gm = tl.load(gmax_ptr + row * ngroups + offs_g, mask=offs_g < ngroups, other=0.0)
+    a_scale = tl.maximum(tl.max(gm) / 127.0, 1e-30)
+    s_ch = tl.load(sch_ptr + offs_n, mask=mask_n, other=0.0)
+
+    acc = tl.zeros((BN,), dtype=tl.float32)
+    for k0 in range(0, k, BK):
+        idx = k0 + tl.arange(0, BK)
+        mask_k = idx < k
+        byte = tl.load(b_ptr + offs_n[:, None] * stride_bn + (idx // 2)[None, :],
+                       mask=mask_n[:, None] & mask_k[None, :], other=0)
+        code = tl.where(((idx % 2) == 0)[None, :], byte & 0x0F, (byte >> 4) & 0x0F)
+        if HAS_CB:
+            level = tl.load(cb_ptr + code, mask=mask_k[None, :], other=0.0)
+        else:
+            level = code.to(tl.float32) - 8.0
+        sg = tl.load(srel_ptr + offs_n[:, None] * stride_bs + (idx // GS)[None, :],
+                     mask=mask_n[:, None] & mask_k[None, :], other=0.0)
+        a = tl.load(a_ptr + row * k + idx, mask=mask_k, other=0.0)
+        q = tl.clamp(libdevice.rint(a / a_scale), -128.0, 127.0)
+        acc += tl.sum(level * sg * q[None, :], axis=1)
+
+    out = acc * (a_scale * s_ch * inv_level)
+    if HAS_BIAS:
+        out += tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)
+    tl.store(c_ptr + row * n + offs_n, out.to(c_ptr.dtype.element_ty), mask=mask_n)
+
+
+def _linear_sum(x, qdata, s_rel, s_channel, bias, out_dtype, group_size, convrot_groupsize,
+                levels=None, inv_level=1.0):
+    """Floor for a 4-bit checkpoint the tl.dot kernel cannot take.
+
+    group_size below 16 (or not a multiple of it) used to make the whole site
+    decline the shape, so the caller fell all the way back to int8 even on a
+    card where w4a8 would have won. This path only needs the packed nibbles, a
+    per-group scale and eight rows -- no dot, no gfx9 instruction.
+    """
+    rows, xk = x.shape
+    n, half = qdata.shape
+    if group_size < 1:
+        return None
+    k = s_rel.shape[1] * group_size
+    if rows < 1 or rows > MAX_M or xk != k or half * 2 != k:
+        return None
+    if qdata.stride(0) != half or not qdata.is_contiguous() or s_rel.stride(0) != s_rel.shape[1]:
+        return None
+    if s_channel.numel() != n or s_channel.dtype != torch.float32:
+        return None
+    if convrot_groupsize and k % convrot_groupsize:
+        return None
+    if levels is not None and levels.numel() != 4:
+        return None
+
+    if levels is not None:
+        # the packed words are the codebook on this layer's int8 grid; the
+        # sign lives in the byte, and inv_level brings it back to real units
+        packed = levels.view(torch.uint8).to(torch.float32)
+        table = (packed - 256.0 * (packed > 127.0)).contiguous()
+    else:
+        table = torch.zeros(1, device=qdata.device, dtype=torch.float32)
+
+    if convrot_groupsize:
+        x, gmax, ngroups = int8_gemv.rotate(x, convrot_groupsize)
+    else:
+        gmax, ngroups = x.abs().amax(dim=1, keepdim=True), 1
+
+    out = torch.empty((rows, n), device=qdata.device, dtype=out_dtype)
+    sum_kernel[(triton.cdiv(n, SUM_BN), rows)](
+        x, qdata, out, gmax, s_rel, s_channel,
+        bias if bias is not None else x,
+        table, n, k, ngroups, half, s_rel.stride(0), inv_level,
+        BN=SUM_BN, BK=SUM_BK, NG=triton.next_power_of_2(ngroups), GS=group_size,
+        HAS_BIAS=bias is not None, HAS_CB=levels is not None,
+        num_warps=WARPS, num_stages=STAGES)
+    return out
+
+
+_FLOOR_SEEN = False
+
+
+def _note_floor(group_size):
+    """Say once that this checkpoint is below what tl.dot can take."""
+    global _FLOOR_SEEN
+    if _FLOOR_SEEN:
+        return
+    _FLOOR_SEEN = True
+    kreg.logger.info("gfx906: w4a8 group %d is below the tl.dot floor of 16, using the tl.sum kernel",
+                     group_size)
+
+
 def linear(x, qdata, s_rel, s_channel, bias, out_dtype, group_size, convrot_groupsize,
            levels=None, inv_level=1.0):
     """x @ W.T for one to eight rows, or None when the shape is not a decode of that size.
@@ -388,25 +501,35 @@ def linear(x, qdata, s_rel, s_channel, bias, out_dtype, group_size, convrot_grou
     `code - 8` ramp with a table lookup and fold the level grid into the scale.
 
     Backend order: an optional w4a8_hip extension, the v_dot4 asm path when it
-    compiles here, then the portable per-group tl.dot kernel. Each step is the
-    site's registry list; a shape an implementation declines falls through to
-    the next one, and a measured entry for this (n, k, rows) wins over the order.
+    compiles here, the portable per-group tl.dot kernel, then the tl.sum floor.
+    Each step is the site's registry list; a shape an implementation declines
+    falls through to the next one, and a measured entry for this (n, k, rows)
+    wins over the order. The floor is what keeps a group size below 16 from
+    sending the whole call back to int8.
     """
     try:
         backend = _REGISTRY.choose(n=qdata.shape[0], k=s_rel.shape[1] * group_size, m=x.shape[0])
     except (AttributeError, IndexError):          # not a plain [n, k] pair
         backend = backend_name()
-    if backend == "hip":
-        out = _hip.linear(x, qdata, s_rel, s_channel, bias, out_dtype, group_size,
-                          convrot_groupsize, levels=levels, inv_level=inv_level)
+    args = (x, qdata, s_rel, s_channel, bias, out_dtype, group_size, convrot_groupsize)
+    while True:
+        if backend == "hip":
+            out = (_hip.linear(*args, levels=levels, inv_level=inv_level)
+                   if _hip is not None else None)
+        elif backend == "asm":
+            out = _linear_asm(*args, levels=levels, inv_level=inv_level)
+        elif backend == "sum":
+            out = _linear_sum(*args, levels=levels, inv_level=inv_level)
+        else:
+            out = _linear_dot(*args, levels=levels, inv_level=inv_level)
         if out is not None:
+            if backend == "sum":
+                _note_floor(group_size)
             return out
-        backend = _REGISTRY.next_after("hip")
-    if backend == "asm":
-        return _linear_asm(x, qdata, s_rel, s_channel, bias, out_dtype, group_size,
-                           convrot_groupsize, levels=levels, inv_level=inv_level)
-    return _linear_dot(x, qdata, s_rel, s_channel, bias, out_dtype, group_size,
-                       convrot_groupsize, levels=levels, inv_level=inv_level)
+        following = _REGISTRY.next_after(backend)
+        if following == backend:
+            return None
+        backend = following
 
 
 @triton.jit

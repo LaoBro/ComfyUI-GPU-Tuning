@@ -46,19 +46,13 @@ def node_dir():
 
 
 def current_arch():
-    """The gcn target this process should load kernels for, or None."""
+    """The device identity this process should load kernels for, or None."""
     override = os.getenv(ARCH_ENV, "").strip()
     if override:
         return override
-    try:
-        import torch
+    from .manifest import device_arch
 
-        if torch.version.hip is None or not torch.cuda.is_available():
-            return None
-        name = str(getattr(torch.cuda.get_device_properties(0), "gcnArchName", ""))
-        return name.split(":")[0] or None
-    except Exception:                                   # noqa: BLE001 - no torch, no arch
-        return None
+    return device_arch()
 
 
 def search_dirs(arch):

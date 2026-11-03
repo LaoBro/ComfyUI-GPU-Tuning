@@ -15,37 +15,36 @@ NVIDIA / CPU 上整个包会跳过（[gfx906_tuning.py](gfx906_tuning.py#L251)�
 - AMD 显卡，PyTorch 为 ROCm/HIP 构建；
 - `comfy-kitchen` 的 triton backend 可用（否则 int8/convrot/attention 补丁会跳过并只打日志）；
 - 可选：ComfyUI 0.39.0 + `core-patches` overlay（resident CUDA graph 用，非必须，版本不匹配时不要装）。
+## 2. 功能分级：常开 / 可选开关 / 测量门
 
-## 2. `tuned` 是什么
+所有功能按“答案是否随卡变”分三类，这是整个包的门控总纲：
 
-`tuned` 不是运行时自动调优，而是**静态的“这张卡我们实测过”判定**：
+| 类 | 判据 | 内容 |
+|---|---|---|
+| **A. 常开** | 行为不随卡变、无权衡 | prefix kv、kvdecode、llama、text gemv、TE int8、amax guard |
+| **B. 可选开关** | 代价不是速度，或内核质量有分层 | qkv（1.6 GB 常驻）、qwen35（等价类替换，env 默认开）、profiler、attention mode（int8 PV rel ~2e-2 vs hand 2.5e-4，质量取舍 → node/env 手动选） |
+| **C. 测量门** | 最优解随卡变，没数据就没有默认值 | int8 tile、w4a8、deltanet、vae、convrot（mode + 开关）、gemv（backend + 开关） |
 
-```python
-def target_archs():          # COMFY_GFX906_ARCHS，默认 "gfx906"
-    return os.getenv("COMFY_GFX906_ARCHS", "gfx906").replace(",", " ").split()
+第三类是关键设计：**没跑过测量就是关闭，跑一次 `bench.py --all --write` 后由数据决定开或关**。数据有两个来源，本地覆盖出厂：
 
-def arch_name():             # 显卡 0 的 gcnArchName，去掉 :sramecc+ 后缀
-    ...
+- **shipped 表**（`arch/<gcn>/manifest.toml`）：对已实测的架构（gfx906）随包分发，`grade = "measured"`、不带指纹，对这个架构的任何构建都生效——开箱即得；
+- **本地表**（`~/.config/comfy-gfx-tune/arch/<gcn>/manifest.toml`）：`tools/bench.py --all --write` 写的，带本机指纹，逐形状覆盖 shipped 表。换 torch/驱动后本地表过期被忽略，回落 shipped 表。
 
-def on_target_arch():        # tuned 的来源
-    return arch_name() in target_archs()
-```
-
-`apply()` 中：
-
-- `tuned=True`：直接替换 int8 tile、使用实测 attention tile，并安装 DeltaNet / Qwen3.5 / w4a8；
-- `tuned=False`：int8 tile 作为 autotune 候选、attention 首次调用现场扫参，DeltaNet/Qwen3.5/w4a8 **不安装**。
-
-后三项和 attention 现在是**逐项**判定的（`install_ready(item)`）：
+C 类的门和取值都走同一批查询：
 
 ```python
-def install_ready(item):          # item ∈ deltanet / qwen35 / w4a8 / attention
-    return _state["tuned"] or item in _state["forced_items"]
+def feature_on(item):         # env (on/off) > feature.<item> > off
+    raw = _state.get(item + "_env", "")
+    if raw in ("on", "off", ...): return raw == "on"
+    table = measured_table()
+    return table is not None and table.default_impl("feature." + item) == "on"
 ```
 
-`COMFY_GFX906_FORCE=deltanet,qwen35` 可以在**不加进 `ARCHS`** 的前提下，只启用其中一项——`ARCHS` 会顺带换掉 int8 tile 和 attention 内核，而这些是 gfx906 的常量，不该被一张新卡继承。强制启用时启动日志会有一条 WARNING，说明这些内核不是在当前卡上测的。
+`tools/bench.py --all --write` 写这些 feature 与取值：`feature.w4a8`（和 int8 基线比）、`feature.gemv`（和 stock int8 线性比）、`feature.vae`（和 torch conv3d 或 kitchen 的 `fp16_conv3d` 比）、`feature.convrot` / `convrot.mode`（和 kitchen 的 matmul 旋转比）。attention 不在其中——它的内核是质量分层（见 B 类），mode 由 node/env 手动选；`bench.py --attention` 只打印证据，不写任何记录。`deltanet` 是半例外：kitchen 没有 fused op 的卡上它结构性开启（那个事实不随测量过期），kitchen 有的卡上由 `feature.deltanet` 决定。bench 目前**不写** `feature.qwen35`（它的用例只覆盖 prefill，而收益主要在 decode 路径），所以 qwen35 留在 B 类。
 
-int8 tile 的强制替换仍然只看 `tuned` 或 `COMFY_GFX906_TILE_CONFIG`：那个 tile 是一组具体常量（128x256x32 / 4 warps / 2 stages），在没有当前卡数据的情况下强行指定它，正是我们想避免的“静默变慢”。
+`COMFY_GFX906_FORCE=deltanet,w4a8,...` 仍然是手动逃生口：跳过一切判定直接安装，启动日志会 WARNING 说明这些内核不是在当前卡上测的。
+
+安装判定只属于这一层，int8 GEMM 的**取值**同样来自表：`int8_gemm.tile` 记录大/小 tile（`COMFY_GFX906_TILE_CONFIG` 优先）。attention 的 tile 用内置常量（gfx906 实测值），mode 走 node/env。
 
 这里的“安装”是替换模块级符号或类，而不是设置一个关闭状态：
 
@@ -55,11 +54,26 @@ int8 tile 的强制替换仍然只看 `tuned` 或 `COMFY_GFX906_TILE_CONFIG`：�
 
 所以未安装时 `status()` 显示 `n/a`，不是 `off (installed)`；节点再选 `textgen=on` 也打不开。
 
-**注意：`COMFY_GFX906_ARCHS` 仍然是“全家桶”开关。** 把新卡加进去会同时强制 int8 tile、安装 DeltaNet/Qwen3.5/w4a8。只要 tile 时用 `COMFY_GFX906_TILE_CONFIG`；只要某个替换时用 `COMFY_GFX906_FORCE`；不想要全家桶就别改 `ARCHS`。
+### 2.1 门控只做 dispatch 管不到的事
+
+kitchen 的 dispatch 本身就回答了“内核跑谁的”：hip 注册成功时优先级被设为 `["hip", "cuda", "triton", "eager"]`（comfy_kitchen/__init__.py），而且 `get_capable_backend` 按**每次调用**校验 constraints——原生后端拒绝的形状（形状约束不满足）会落到 triton。据此分三类：
+
+**int8 tile 补丁在所有 AMD 上安装，不看 capability 表。** dispatch 决定它何时运行：原生覆盖的卡上它只是 constraints 兜底路径，没覆盖的卡上（gfx906）是主路径。无条件安装是安全的，因为 tile 取值由 manifest 指纹自守——没数据的卡拿到的就是 stock 候选列表。
+
+**dispatch 管不到的，归测量门或开关管（见 §2 的分级）：**
+
+- **vae / convrot**：改写发生在 ComfyUI 或 quantization 调用路径里，在 dispatch 之前，无从仲裁 → `feature.vae` / `feature.convrot`（bench 写）；`convrot.mode` 记录 fused/butterfly 的赢家。
+- **attention**：不是 kitchen op，替换的是 `comfy.attention.optimized_attention` 本身。所有 AMD 安装，mode 由 node/env 手动选；带 mask / GQA 的调用整段绕行到 core 的后端（内核没有 mask 参数）。**文本生成根本不经过它**：TE 用 `optimized_attention_for_device(small_input=True)` 解析（llama.py:971），拿到的是 core 的 attention_pytorch/basic 原始函数——所以测量门和 mode 只影响 DiT。NVIDIA 不装。
+- **qkv**：1.6 GB 常驻的纯权衡 → env/node opt-in，默认关。
+- 其余文本生成改写组（prefix kv / kvdecode / llama / text gemv / TE int8 / qwen35）与后端无关，全部安装；`deltanet` / `w4a8` 按 §2 判定。N 卡上 `deltanet` 的基线是 kitchen 的 CUDA fused op，大概率 `off`；`w4a8` 的 per-group `tl.dot` 走 tensor core，值得跑一次 bench。
+
+bench 的 tile 站点在 `native_covers("int8_linear")` 时跳过：覆盖的卡上记录只在 constraints 兜底时被读到，几乎不值得测（`--tile` 可以强制测）。
+
+两个实测发现的细节：**cuda 后端的 capability 集里没有 `int8_linear`**（只有 `w4a8_int8_linear`），所以 N 卡的 int8 线性本来就走 triton——但本包没在 N 卡测过 tile，补丁仍然不装，保持 stock autotune。manifest 的设备 key 已泛化：AMD 是 gcn target，NVIDIA 是 `sm<major><minor>`（`kernels.manifest.device_arch()`）。
 
 ## 3. 功能分级
 
-### A. 可直接使用（无需改代码）
+### A. 常开 + 可选开关（对应 §2 的 A/B 类）
 
 | 功能 | 说明 |
 |---|---|
@@ -75,37 +89,33 @@ int8 tile 的强制替换仍然只看 `tuned` 或 `COMFY_GFX906_TILE_CONFIG`：�
 
 这些功能默认开启后可直接跑；发现更慢时用对应开关关掉即可。
 
-### B. 能用，但建议先测量/调参
+### B. 测量门（对应 §2 的 C 类：没数据就是关，bench 决定开或关）
 
 | 功能 | 默认行为 | 需要做什么 |
 |---|---|---|
-| int8 linear tile | 未实测卡**只用 stock 6 个**候选；gfx906 的大/小 tile 只在 gfx906 上追加（别把 60 CU 的参数塞进不认识的卡，LDS/寄存器预算不同，可能编不过） | 用 `tools/tile_sweep.py` 测出 winner，设置 `COMFY_GFX906_TILE_CONFIG` / `SMALL_TILE_CONFIG`；列表只放单一配置，免 autotune |
+| int8 linear tile | 未实测卡**只用 stock 6 个**候选；gfx906 的大/小 tile 只在 gfx906 上追加（别把 60 CU 的参数塞进不认识的卡，LDS/寄存器预算不同，可能编不过） | `tools/bench.py --all --write` 会扫出 winner 并写进 `int8_gemm.tile`；也可以只用 `tools/tile_sweep.py` 测，再设 `COMFY_GFX906_TILE_CONFIG` / `SMALL_TILE_CONFIG` |
 | `small_batch` 窄 tile | 候选模式，由 autotune 决定 | 测 `m≤8`；更慢或不想付首次扫参成本时设 `small_batch=off` |
-| `gemv`（模型 int8 解码 GEMV） | 其它 AMD 也会安装并用于 m=1 | 数值等价；不同卡带宽/占用不同，建议 A/B |
-| 注意力入口（`attention`） | 未实测卡首次调用比较 int8/fp16 tile 与 SDPA | 可先测 head_dim/seq；`gemm` 是纯 torch，任意 head_dim 可试 |
-| `convrot` | fused/butterfly 可能比原 matmul 快，依赖 Triton 编译 | 在目标卡 A/B `fused` / `butterfly` / `off` |
-| `vae` | conv3d→conv2d 默认开 | 其它卡可能本来就有高效 conv3d；建议 A/B |
-| `linear8` | 未量化 fp16 Linear→int8 默认开 | 有强 fp16/矩阵核心的卡上可能变慢；建议 A/B |
-| `qkv` | 默认关 | 想用时测 1.5% 收益是否值得 1.6 GB 常驻 |
+| `gemv`（模型 int8 解码 GEMV） | 没有实测数据就不安装；text gemv 不受影响（它有自己的开关） | `bench.py --all` 在 `int8_gemv.m1` 站点加计 stock int8 线性基线，赢了写 `feature.gemv="on"`；backend 照旧按形状选 |
+| 注意力入口（`attention`） | B 类：mode 由 node/env 手动选（int8 / int8qk / hand / gemm / sdpa）；tile 用内置常量；带 mask / GQA 的调用绕行到 core 后端 | `bench.py --attention` 只打印各内核 vs SDPA 的证据，不写记录。TE 不经过这条路径（见 §2.1） |
+| `w4a8`（4-bit 权重 GEMV） | asm 内核用 gfx9 `v_dot4_i32_i8`；其它卡落到纯 Triton 的 per-group `tl.dot`，通常比 int8 慢，所以在没有实测数据的卡上不安装 | `bench.py --all` 会把它和 int8 基线（`decode_int8` + int8 GEMV/GEMM）同形状对比，赢了才写 `feature.w4a8="on"`。`group_size < 16` 时 `tl.dot` 不接受，会落到 `tl.sum` 保底内核（见 §5）；保底通常更慢，表里就会是 `off` |
+| DeltaNet Triton 内核 | 只在 kitchen 的 fused op 不可用时划算（gfx906 就是没有 code object） | `bench.py --all` 直接和 `comfy_kitchen.gated_delta_decode_fused` 对比输出、state 和耗时，赢了才写 `feature.deltanet="on"` |
+| `qwen35` 计算类替换 | **B 类（可选开关）**：`COMFY_GFX906_QWEN35` 默认开，它是逐方法对过 core 的等价改写 | `bench.py --qwen35` 只出证据不写 feature：合成小模型 fp32 A/B（1e-3 门槛）+ 计时；但用例只覆盖 prefill，而收益主要在 decode，测量覆盖不了决策面。未覆盖：recurrent 解码路径、真实 checkpoint 权重 |
+| `convrot` | 没有实测数据就不安装 | `bench.py --convrot` 计时 kitchen 的 matmul 旋转 vs 我们的 butterfly vs fused，写 `feature.convrot` 和 `convrot.mode`（赢家 mode，`COMFY_GFX906_CONVROT` 可覆盖） |
+| `vae` | 没有实测数据就不安装 | `bench.py --vae` 计时 depth-1 Conv3d：torch conv3d / conv2d squeeze / kitchen 的 `fp16_conv3d`（有原生后端的卡），写 `feature.vae` |
+| `qkv` | 默认关（1.6 GB 常驻，纯权衡，不归测量门） | 想用时设 `COMFY_GFX906_QKV=1` 或节点开关 |
 
-### C. 需要改代码/移植
+**易踩的坑**：`configure(w4a8="on")` 会在节点执行时调用 `load_w4a8_gemv()`，把模块装上；这条路径绕过了 `feature.w4a8` 的安装判定。非 gfx906 上开着 `w4a8` 时 asm 探测会自动失败、落到 per-group `tl.dot`；如果显式设 `COMFY_GFX906_W4A8_ASM=on`，探测被跳过，asm 会在实际调用时报编译错误。节点默认值是“沿用 env”，不想用就保持 `COMFY_GFX906_W4A8=0`。
 
-| 功能 | 现状与原因 | 修改入口 |
-|---|---|---|
-| `w4a8`（4-bit 权重 GEMV） | 只在 `tuned` 时加载（[gfx906_tuning.py](gfx906_tuning.py#L1772)）。asm 内核用 gfx9 inline asm `v_dot4_i32_i8`；**纯 Triton 的 per-group `tl.dot` 回退已实现**，由 `kernels` 注册表按 `hip > asm > triton` 选（见 §5 后端选择） | 只需去掉 `tuned` 门槛并验证；`group_size` 必须 ≥16 且是 16 的倍数，否则 `linear()` 返回 `None` 回退上游 int8 |
-| DeltaNet Triton 内核 | 默认只在 `tuned` 时安装（原因是 gfx906 上 kitchen HIP fused op 没有 code object） | 先试 `COMFY_GFX906_FORCE=deltanet` 单独放行并验证；确认目标卡的 kitchen HIP 路径本来可用时，这个替换反而可能更慢 |
-| Qwen3.5 计算类替换 | 默认只在 `tuned` 时安装 | 同上，`COMFY_GFX906_FORCE=qwen35` 单独放行 + 逐层等价性验证；主要收益是 RoPE slice、合并 a/b GEMV、conv tap |
-| 按架构静态 tile 表 | 目前只有 gfx906 默认常量；其它卡靠 env/autotune | 可选增强：把 `--emit` 的 `INT8_TILE_TABLE` 条目接进代码，同型号卡默认免 autotune |
-
-**易踩的坑**：`configure(w4a8="on")` 会在节点执行时调用 `load_w4a8_gemv()`，即使 `tuned=False` 也会把模块装上。非 gfx906 上开着 `w4a8` 时 asm 探测会自动失败、落到 per-group `tl.dot`；但如果显式设 `COMFY_GFX906_W4A8_ASM=on`，探测被跳过，asm 会在实际调用时报编译错误。因此文档默认建议保持 off。
-
-### D. 完全不能使用
+### D. 非目标设备
 
 | 场景 | 原因 |
 |---|---|
-| NVIDIA / CPU | `is_amd()` 返回 False，整个包不安装；要支持需改设备判断并重新验证内核 |
-| 非 gfx906 上开 `w4a8` 且 `group_size < 16` | asm 探测失败会落到 per-group `tl.dot`，但它要求 `group_size >= 16` 且为 16 的倍数；不满足时整条 w4a8 路径返回 `None`，退回 int8 / `F.linear`（是回退，不是崩溃） |
+| NVIDIA（有 GPU） | `is_amd()` 为假 → triton 内核补丁与 attention 都不装（cuda 的 capability 集没有 `int8_linear`，N 卡的 int8 线性走 triton，但本包没在 N 卡测过 tile）。**文本生成重写组生效**：prefix KV、KV decode 折叠、llama 缓存、TE GEMV、TE int8 常驻；`w4a8`/`deltanet` 由本机 bench 的 `feature.*` 决定（没跑过就是关）；qwen35 随 env 默认开（B 类等价改写）。manifest 的 key 是 `sm<major><minor>`。**未在 N 卡实测**，性能结论要由有卡的人跑出来 |
+| NVIDIA，无 core-patches | 解码仍会跑，但没有 per-block CUDA graph——那约是文本生成 37% 的时间（见 core-patches/README.md），且该 overlay 与 GPU 无关 |
+| CPU | `torch.cuda.is_available()` 为假，整包不安装 |
 | ComfyUI 不是 0.39.0 时使用 core overlay / resident CUDA graph | overlay 是版本固定的三个核心文件（[core-patches/README.md](core-patches/README.md#L43-L53)），换版本需重新生成；节点本身仍可不用 overlay 运行 |
+
+AMD 上“kitchen 已经有后端”的卡不再归到这里：它们走 §2.1，只装四个与后端无关的改写，没有需要按卡验证的内核。
 
 ## 4. 模型特定功能只是 no-op
 
@@ -129,9 +139,11 @@ python .../tools/tile_sweep.py \
   --candidate block_m=16,block_n=64,block_k=64,group_size_m=8,warps=4,stages=3 \
   --m 1,2,8,128,4032 --shapes 4096x4096,4096x12288
 
-# 打印可直接用的启动变量和上游表条目
+# 打印可直接用的启动变量
 python .../tools/tile_sweep.py --emit
 ```
+
+要**保存**结果而不只是打印，用 `tools/bench.py --all --write`：它调用同一套扫描，把赢家写进 `arch/<gcn>/manifest.toml` 的 `int8_gemm.tile`，之后这张卡启动就不再有 autotune。
 
 脚本不调用 `apply()`；它把 kitchen 的 `configs` 临时设成单个候选再调 `int8_linear`，所以每次只编译/运行这一个 tile，不触发 autotune 扫参。
 
@@ -155,9 +167,8 @@ python main.py
 
 - 设置 `COMFY_GFX906_TILE_CONFIG` 后，该卡视为“tile 已实测”：列表只放这一个配置，**不跑 autotune**；
 - 只设置 `COMFY_GFX906_SMALL_TILE_CONFIG` 不改变“已实测”判定，只替换小 tile 候选/强制值；
-- 两个变量都是启动期读取；节点 `int8_tile` / `small_batch` 的 `default` 会沿用它们。
-
-扫描结果也可以整理成 `INT8_TILE_TABLE` 条目提交上游，让同型号显卡默认免 autotune。
+- 两个变量都是启动期读取；节点 `int8_tile` / `small_batch` 的 `default` 会沿用它们；
+- manifest 里的 `int8_gemm.tile` 与 env 同权（env 优先），所以固化结果不需要改启动脚本。
 
 ## w4a8：能否用 `tl.dot` 替代 `v_dot4`
 
@@ -221,15 +232,17 @@ _REGISTRY = kreg.BackendRegistry(
         kreg.Candidate("hip", kind="extension", env="COMFY_GFX906_W4A8_HIP", loader=_load_hip),
         kreg.Candidate("asm", kind="asm", env="COMFY_GFX906_W4A8_ASM", probe=_probe_asm),
         kreg.Candidate("triton", kind="portable"),
+        kreg.Candidate("sum", kind="portable", priority=60),
     ],
 )
 ```
 
-`linear()` 不再写死 `hip > asm > triton`：它取 `backend_name()`，某个实现当场返回 `None` 时用 `_REGISTRY.next_after("hip")` 沿同一条链往下走。新增一个内核＝在列表里加一条：
+`linear()` 不再写死 `hip > asm > triton`：它取 `_REGISTRY.choose()`，某个实现当场返回 `None` 时用 `_REGISTRY.next_after(...)` 沿同一条链往下走，直到一个实现接住这个形状。新增一个内核＝在列表里加一条：
 
 1. **`w4a8_hip` 扩展**（`extension`）：有可导入的模块且提供 `linear()` 时优先；
 2. **asm**（`asm`）：首次判定时编译探测 `v_dot4_i32_i8`；
-3. **triton**（`portable`）：per-group `tl.dot`，必须是列表最后一项。
+3. **triton**（`portable`）：per-group `tl.dot`，要求 `group_size` ≥16 且是 16 的倍数；
+4. **sum**（`portable`）：`tl.sum` 保底，不要求任何指令、也不要求 16 宽的 K 步。它是链的最后一项，也是“这张卡至少能跑 w4a8”的保证。
 
 环境变量：
 
@@ -242,9 +255,11 @@ _REGISTRY = kreg.BackendRegistry(
 
 环境变量只读一次、判定结果在进程内缓存（含"探测失败"），与重构前一致；`_REGISTRY.reset()` 用于工具和测试。
 
-per-group `tl.dot` 需要 `group_size >= 16` 且是 16 的倍数；不满足时 `linear()` 返回 `None`，调用方会回退到 int8/`F.linear` 路径。
+per-group `tl.dot` 需要 `group_size >= 16` 且是 16 的倍数；不满足时降到 `sum` 保底（首次使用会打一行 INFO）。只有 `sum` 也拒绝的形状（m>8、K 与权重不匹配、convrot 不整除）才返回 `None`，那时调用方才回退到 int8/`F.linear`。
 
-`status()` 会显示 `w4a8 on: N calls, backend=hip/asm/triton`。
+保底比 `tl.dot` 慢（没有矩阵指令，靠 `tl.sum` 逐元素乘加），所以在没有 `v_dot4` 的卡上它就是“能跑但可能不如 int8”——这正是 `bench.py --w4a8-group <16` 要测的东西，测输就写 `feature.w4a8="off"`。
+
+`status()` 会显示 `w4a8 on: N calls, backend=hip/asm/triton`，这里的 backend 是链上首选的实现；真正接住某次调用的是哪一个，bench 的站点输出会逐个列出。
 
 改动后用 `tools/registry_selftest.py` 验证：它把重构前的 `backend_name()` 逻辑原样留作参考实现，逐组合对比 60 种（env × 扩展存在 × asm 可编译）情形，无需 GPU。真机上的选择 parity 与数值 A/B 用 `tools/verify_backends.py`。
 
@@ -269,9 +284,9 @@ def linear(x, qdata, s_rel, s_channel, bias, out_dtype,
 | int8 GEMM tile（kitchen `_int8_matmul_*`） | `tl.dot(int8, int8, int32)` + autotune | 技术上能手写 dot4 GEMM | `tl.dot` 已在合适 tile 上走整型 dot 指令，autotune 也在选 tile；手写 asm GEMM 维护成本高、难更快，**不建议** |
 | int8 attention QK/PV | `tl.dot` int8（[attention_kernel.py](attention_kernel.py#L157)、[attention_kernel.py](attention_kernel.py#L176)） | 同上 | 已经是 dot 指令路径，**不建议** |
 | `int8_gemv`（m=1 单行 GEMM） | 默认 asm（编译探测），否则 int32 `tl.sum` | **已接入** | 唯一值得试的候选 |
-| `w4a8_gemv` | hip > asm > per-group tl.dot | — | 已做 |
+| `w4a8_gemv` | hip > asm > per-group tl.dot > tl.sum 保底 | — | 已做 |
 | `decode_int8`、`quantize_k/v`、`convrot`、`rotate` | 解包/量化/旋转，不是 dot | 不适用 | asm 帮不上 |
-| `linear8`、QKV 融合 | 走 kitchen int8 GEMM | 同第一行 | 不建议 |
+| QKV 融合 | 走 kitchen int8 GEMM | 同第一行 | 不建议 |
 
 ### `int8_gemv` 后端与实测
 
@@ -332,7 +347,7 @@ _REGISTRY = kreg.BackendRegistry(
 
 三条约定：
 
-1. 列表最后一项必须是 `portable`，`resolve()` 才保证总能给出结果；
+1. 列表最后一项必须是 `portable`，`resolve()` 才保证总能给出结果；可以有多个 `portable`（w4a8 就是 `triton` + `sum`），它们按声明顺序排在 asm 之后，最后一个必须无条件接受所有合法形状；
 2. 实现遇到自己不支持的形状就返回 `None`，调用方用 `next_after(name)` 沿同一条链下降——实现之间不要互相 import；
 3. 判定结果在进程内缓存（含失败），与重构前一致；`reset()` 只给测试和工具用。
 
@@ -357,7 +372,7 @@ def linear(...): ...              # 站点的原始签名，`None` 表示这个�
 
 一个文件导入失败只记一行日志并跳过（只报一次），不会拦住启动——只有显卡不对的内核不该让 ComfyUI 起不来。`COMFY_GFX906_ARCH` 可强制指定目标目录（在没插卡时开发用），`COMFY_GFX906_ARCH_KERNELS` 可追加一个搜索目录（自检就是这么测的）。
 
-还没做（下一步）：`tuned` 仍然以 `COMFY_GFX906_ARCHS` 名单为默认值——**不改成纯 manifest 判定是刻意的**：仓库自带的 gfx906 表是 `derived`、指纹 `unmeasured`，按数据判定会让没跑过 bench 的新用户什么都拿不到；需要的是逐项放行（`COMFY_GFX906_FORCE`），已经做了。
+这个顾虑已经解决：shipped 的 gfx906 表重新烤成 `grade = "measured"`、不带指纹，对这张卡的任何构建生效——纯 manifest 判定不会让 gfx906 用户丢功能，而新架构在跑过 bench 前老实保持关闭。`COMFY_GFX906_ARCHS` 随之删除。
 
 ## 5.2 测量数据：`arch/<gcn>/manifest.toml`
 
@@ -383,7 +398,24 @@ default_grade = "derived"
 
 [sites."int8_gemv.m1".shapes]
 "4096x4096@m1" = { impl = "triton", ms = { asm = 0.0851, triton = 0.0833 }, rel = 0.0, grade = "measured", date = "2026-11-03" }
+
+# 不是 (N, K, m) 的量用固定的 key，值仍然放在 impl 里：
+[sites."int8_gemm.tile".shapes]
+"large" = { impl = "block_m=128,block_n=256,block_k=32,group_size_m=8,warps=4,stages=2", ms = { 128x256x32g8w4s2 = 1.24 }, grade = "measured" }
+"small" = { impl = "block_m=16,block_n=32,block_k=64,group_size_m=8,warps=4,stages=3", ms = { 16x32x64g8w4s3 = 0.31 }, grade = "measured" }
+
 ```
+
+站点共有这几种形态，都由 `tools/bench.py --all --write` 写：
+
+| 站点 | key | impl 是什么 | 谁读它 |
+|---|---|---|---|
+| `<op>.<形状类>` | `NxK@mM` | 实现名（asm/triton/hip） | 注册表按形状选后端 |
+| `int8_gemm.tile` | `large` / `small` | 与 `COMFY_GFX906_TILE_CONFIG` 相同的 tile 文本 | `_triton_config()` / `_small_tile_config()` |
+| `deltanet.decode` | `bBxhvHxdkDKxdvDVxsS` | `triton` / `kitchen` | 只作证据；开不开看 `feature.deltanet` |
+| `feature.<item>` | —（只有 `default`） | `on` / `off` | `install_ready()` |
+
+`feature.*` 目前由 bench 写四项：`attention`、`w4a8`、`deltanet`、`qwen35`。
 
 信任靠字段而不是靠约定：
 
@@ -431,13 +463,18 @@ backend = _REGISTRY.choose(n=..., k=..., m=...)
 | `absent` | 没有该架构的文件/数据 | 启动 **WARNING**（说明 tile 走 autotune、GEMV 走探测）；`status()` 不显示 manifest 行 |
 | `off` | `COMFY_GFX906_MEASURED=0` | INFO 一行 |
 
-未知架构上还额外收紧了一条：`_untuned_tile_configs()` 只在 `on_target_arch()` 成立时才把 gfx906 的两个 tile 追加进 autotune 候选——在没测过的卡上注入 60 CU 调出来的 tile 是在赌它能编译，而不是在帮它变快。想让新卡也用这两个 tile，用 `COMFY_GFX906_TILE_CONFIG` 显式指定。
+没实测数据的卡只会拿到 stock 候选列表——把 60 CU 调出来的 tile 注入不认识的卡是在赌它能编译，而不是在帮它变快。想让新卡用上 tile，用 `COMFY_GFX906_TILE_CONFIG` 显式指定，或让 bench 在本机测出它自己的（shipped 表只对对应的 gcn target 生效）。
+
+“文件匹配但没有 tile 记录”是新的降级态：fingerprint 对得上，于是不会报 stale，但 tile 仍然走 autotune。这种启动会有一条 WARNING，提示只跑过部分站点的 bench（例如 `--site w4a8.m1`），需要补 `--all`。
 
 ### 跑一次 bench
 
 ```bash
 # 只打印，不写文件
 .venv/bin/python custom_nodes/ComfyUI-gfx906-Tuning/tools/bench.py
+
+# 一张卡需要的一切：GEMV 后端 + int8 tile + 各 feature 的 on/off
+... --all --write
 
 # 只测一个站点 / 指定形状，写入本地覆盖
 ... --site w4a8.m1 --shapes 4096x4096@m1,4096x4096@m8 --write
@@ -455,6 +492,19 @@ backend = _REGISTRY.choose(n=..., k=..., m=...)
 若某站点所有实测形状的 winner 一致，`--write` 会顺带把站点 `default` 提升为 `measured`，让**未测**形状也走表；winner 不一致时不动 `default`，并打印一行说明。
 
 计时默认关掉 convrot（`group 0`）：旋转是两种实现共用的独立 kernel，去掉它比较的才是 GEMV 本身。bench 会自己分配权重，大形状下约 1 GB 显存，不要和出图同时跑。
+
+`--all` 追加六组测量：
+
+- **int8 tile**：复用 `tile_sweep` 的扫描，默认 3 个 NxK（DiT 的 qkv/ffn、TE 的）乘 `m=1,8,128`，`m≤8` 与 `m>8` 两桶各取所有格子耗时的中位数赢家。这一层不用 `--min-gain`：跨形状的中位数已经压掉了单次噪声，而“上一次选的是谁”在这张卡上没有意义。
+- **attention**：只出证据不写记录——mode 是质量取舍（int8/hand/int8qk/gemm 的 relL2 不同），由 node/env 手动选。默认 `d128` 长/短 self+cross 各一个形状、`d64` 一个 SDXL 形状；每个 config 先和 `tools/refs.py` 的 fp32 参考比数值，再计时，最后打印各内核相对 SDPA 的中位数比例。
+- **deltanet**：默认 `1x16x128x128x1` 与 `...xs4`（Qwen3.5-2B 的 16 个 value head、hidden 2048）。先和 `refs.delta_decode_reference` 比输出**和** `state`，再和 `comfy_kitchen.gated_delta_decode_fused` 同时计时；对端不可用（gfx906 就是没有 code object）时只记录我们自己的耗时，不写 `feature.deltanet`。
+- **vae**：depth-1 Conv3d 三方计时（torch conv3d / conv2d squeeze / kitchen 的 `fp16_conv3d`，后者只在原生后端有这个 op 时出现），写 `feature.vae`。padding 0 以便 kitchen 内核可比。
+- **convrot**：kitchen 的 matmul 旋转 + 量化 vs 我们的 butterfly 两步 vs fused 单内核，写 `feature.convrot` 和 `convrot.mode`。
+- **qwen35**：建一个合成 Qwen3.5（默认 4 层、hidden 2048、seq 16，≈240M 参数），同一套权重跑两遍——gate 关 = 逐字调用 core 的方法，gate 开 = 我们的类。fp32 下 1e-3 门槛是真正的等价性检查。**只出证据，不写 `feature.qwen35`**（用例只覆盖 prefill，收益主要在 decode）。不需要 checkpoint，也不联网。
+
+另外 `w4a8.m1` 这个站点现在还多计一条 `int8` 基线：把 4-bit 权重用 `decode_int8` 一次性解成 int8（计时循环外），再走 int8 GEMV（m=1）/ int8 GEMM（m>1）——那才是关掉 w4a8 时真正会跑的路径。默认用 16 级 codebook（随包分发的 checkpoint 就是这种），`--w4a8-uniform` 测均匀格点。`--w4a8-group` 默认 128；改成 8 就会跑 `tl.sum` 保底（`tl.dot` 会拒绝那个形状），用来确认“小 group 的 checkpoint 至少能跑，而且值不值得开”。
+
+各组的形状/尺寸都可以用 `--tile-shapes` / `--tile-m` / `--attention-shapes` / `--deltanet-shapes` / `--vae-shapes` / `--convrot-shapes` / `--qwen35-layers` / `--qwen35-hidden` / `--qwen35-seq` 覆盖。表里没有的形状仍然回落到 `default`，没有 `default` 就回到 autotune/探测——所以形状表要覆盖你实际在跑的模型。
 
 ## 5.3 启动鲁棒性：单点失败不炸节点
 
@@ -475,18 +525,25 @@ backend = _REGISTRY.choose(n=..., k=..., m=...)
 ## 7. 二次开发流程建议
 
 1. 确认：AMD + HIP、`comfy-kitchen`、triton 可用；overlay 仅 0.39.0 可选。
-2. **不要**先把新卡加进 `COMFY_GFX906_ARCHS`；先用节点默认值跑通。
-3. 跑 `tools/tile_sweep.py`，用 `--emit` 设置两个 tile 变量。
-4. 逐项 A/B：`vae`、`linear8`、`gemv`、`convrot`、`attention`、`qkv`。
-5. `w4a8` 保持 off，除非完成指令移植与验证。
-6. `textgen` 默认只会启用 `kvdecode` + `llama`；`deltanet`/`qwen35` 显示 `n/a` 是预期行为。
-7. 需要 resident CUDA graph 时再装 overlay；不装不影响正确性。
-8. 改动内核后跑 `tools/verify_backends.py`（选择 parity + 数值 A/B，需要 GPU；无设备时会直接退出并说明原因），再记录性能。
-9. 要固化实测结果就跑 `tools/bench.py --write`（默认写本地覆盖），让同型号的后续启动不必再探测。
+2. 先用节点默认值跑通——没跑过 bench 的卡上测量门功能是关的，这是预期行为，不是坏了。
+3. 跑一次 `tools/bench.py --all --write`：int8 tile、两个 GEMV 站点，以及 gemv / w4a8 / deltanet / vae / convrot 的 on/off（convrot 还有 mode）都写进本机 manifest，之后启动不再 autotune。attention mode 不在此列——节点里手动选。只想看数字就先不加 `--write`。
+4. 用 `tools/status.py` 确认 `measured ... in use`、`int8 tiles (measured tile)`、`gemv ... measured`，以及 `w4a8`/`textgen deltanet` 的 on/off；日志里不应再有 `no measured data`。
+5. 逐项 A/B：`vae`、`gemv`、`convrot`、`qkv`。这些还没有自动登记，默认值在多数卡上是赚的；`vae`/`convrot` 已经被 §2.1 在原生卡上关掉。
+6. `deltanet` 在 kitchen 的 fused op 不可用的卡上会是 `on`（bench 写），可用时大概率是 `off`——两种都是正确结果。`qwen35` 同理由 `--qwen35` 决定；它的计时是 4 层合成模型的代理，等价性检查才是主交付。
+7. `textgen` 默认只会启用 `kvdecode` + `llama`；`qwen35` 显示 `n/a` 是预期行为。
+8. 需要 resident CUDA graph 时再装 overlay；不装不影响正确性。
+9. 改动内核后跑 `tools/verify_backends.py`（选择 parity + 数值 A/B，需要 GPU；无设备时会直接退出并说明原因），再记录性能。
+10. 测量数据换了 torch/驱动就失效，重跑第 3 步即可；表写错时 `COMFY_GFX906_MEASURED=0` 整体关掉。
 
 ## 8. 已知边界
 
 - `kernel.configs` 是进程级共享；当前假设 ComfyUI 模型串行执行。并发执行时需要改成按调用传参。
 - 未实测卡走候选模式时，每个新 `(m,n,k)` 第一次调用会编译/实测 7–8 个候选，首个 shape 会慢；之后按 `(m,n,k)` 缓存稳定。
 - 静态 tile 表是“按卡型固化”的：驱动、编译器或实际 shape 变化后需要重新测。
+- attention 的 tile 用内置常量、mode 手动选：同一 head dim 在 prefill 和 decode 下的最优 tile 不同（d128 decode 时 32x16 比 64x16 快 ~14%），单一常量两头兼顾不了；好在这些调用全在 DiT 侧，TE 不经过。
+- `feature.<item>` 只有 `default`，没有 per-shape 记录，所以它们回答的是“这张卡上整体划不划算”，不是“这个形状划不划算”。`feature.w4a8` / `feature.deltanet` 的结论是各形状相对基线的中位数，所以 `--shapes` / `--deltanet-shapes` 要覆盖你实际在跑的尺寸。
+- deltanet 只比了单次调用（含 seq>1 的循环）后的输出和最终 state；`snapshots` 中间态没有逐个比对。
+- qwen35 的 A/B 只覆盖 prefill（`past_key_value=None`）：recurrent 解码路径要构造 `FixedKVBias` 缓存，还没有自动用例；权重是合成模型而不是 checkpoint。gate 关 = 逐字调用 core 的方法，所以这个对比是“我们的类 vs core 的类”，不是“对不对”。
+- `feature.w4a8` 取决于权重本身：`s_rel` 的分格决定 int8 基线是否可比（bench 用 1..15.5，和 `tools/requant_uniform4.py` 一致），`--w4a8-group` 默认 128，`group_size` 必须整除 K。
+- `group_size < 16` 时走 `tl.sum` 保底：它保证不崩、结果正确，但没有矩阵指令，通常比 int8 慢。表里 `feature.w4a8="on"` 只说明“在这张卡上按这次的形状测下来划算”，不代表保底一定快。
 - `COMFY_GFX906_TILE_CONFIG` 只影响 int8 tile，不会启用 DeltaNet/Qwen3.5/w4a8。

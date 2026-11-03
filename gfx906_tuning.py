@@ -116,7 +116,6 @@ _state = {
     "fp16_env": True,
     "contig_env": True,
     "convrot_env": "fused",
-    "linear8_env": True,
     "qkv_env": False,
     "te_env": "int8",
     "te_attn_env": "default",
@@ -124,7 +123,7 @@ _state = {
     "vae_env": True,
     "vae_enabled": True,
     "vae_patched": False,
-    "gemv_env": True,
+    "gemv_env": "",
     "gemv_module": None,
     "textgen_env": {},
     "textgen_ready": {},
@@ -146,7 +145,7 @@ _state = {
     "small_batch_env": True,
     "small_batch_enabled": True,
     "tile_measured": False,
-    "tuned": False,
+    "native": None,
 }
 
 
@@ -205,16 +204,17 @@ def _init_env_settings():
     _state["smooth_env"] = env_flag("COMFY_GFX906_SMOOTH")
     _state["fp16_env"] = env_flag("COMFY_GFX906_FP16")
     _state["contig_env"] = env_flag("COMFY_GFX906_CONTIG")
-    convrot = os.getenv("COMFY_GFX906_CONVROT", "fused").strip().lower()
-    _state["convrot_env"] = convrot if convrot in CONVROT_MODES else "fused"
-    _state["linear8_env"] = env_flag("COMFY_GFX906_LINEAR8")
+    # empty means "whatever the manifest resolves": feature.convrot + convrot.mode
+    convrot = os.getenv("COMFY_GFX906_CONVROT", "").strip().lower()
+    _state["convrot_env"] = convrot if convrot in CONVROT_MODES else ""
     _state["qkv_env"] = env_flag("COMFY_GFX906_QKV", "0")
     _state["te_env"] = os.getenv("COMFY_GFX906_TE", "int8").strip().lower()
     _state["te_attn_env"] = os.getenv("COMFY_GFX906_TE_ATTN", "default").strip().lower()
     _state["profile_env"] = os.getenv("COMFY_GFX906_PROFILE", "0").lower() in ("1", "on", "true", "yes")
-    _state["vae_env"] = env_flag("COMFY_GFX906_VAE")
-    _state["vae_enabled"] = _state["vae_env"]
-    _state["gemv_env"] = env_flag("COMFY_GFX906_GEMV")
+    # tier-3 features: empty means feature_on() decides from the manifest
+    _state["vae_env"] = os.getenv("COMFY_GFX906_VAE", "").strip().lower()
+    _state["vae_enabled"] = feature_on("vae")
+    _state["gemv_env"] = os.getenv("COMFY_GFX906_GEMV", "").strip().lower()
     _state["textgen_env"] = {
         "deltanet": env_flag("COMFY_GFX906_DELTANET"),
         "kvdecode": env_flag("COMFY_GFX906_KVDECODE"),
@@ -239,25 +239,54 @@ def _init_env_settings():
                               if item.strip()}
 
 
-def target_archs():
-    return os.getenv("COMFY_GFX906_ARCHS", "gfx906").replace(",", " ").split()
-
-
 def arch_name():
-    """The gfx target of device 0, or None on CUDA/CPU (props have no gcnArchName there)."""
-    if torch.version.hip is None or not torch.cuda.is_available():
+    """The device identity for this process: a gcn target on AMD, sm<major><minor>
+    elsewhere. Mirrors kernels.manifest.device_arch -- duplicated because the
+    kernels package is optional and the node must not depend on it for identity.
+    """
+    if not torch.cuda.is_available():
         return None
-    name = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
-    return name.split(":")[0] or None
+    props = torch.cuda.get_device_properties(0)
+    name = str(getattr(props, "gcnArchName", ""))
+    if name:
+        return name.split(":")[0] or None
+    return f"sm{props.major}{props.minor}" if props.major else None
 
 
 def is_amd():
     return torch.version.hip is not None and torch.cuda.is_available()
 
 
-def on_target_arch():
-    """True on the architecture the attention kernel was measured on."""
-    return arch_name() in target_archs()
+def native_backend():
+    """The comfy-kitchen backend that already covers this device, or None.
+
+    The pack exists because the HIP backend has no code object for gfx906. On a
+    card where kitchen registers its own backend, dispatch prefers it and our
+    triton kernel patches only serve the calls its constraints decline.
+    """
+    try:
+        from comfy_kitchen import registry
+    except ImportError:
+        return None
+    name = "hip" if torch.version.hip is not None else "cuda"
+    return name if registry.is_available(name) else None
+
+
+def native_covers(op):
+    """Whether the native backend serves the kitchen op `op`.
+
+    Only matters where a patch bypasses dispatch (the VAE rewrite intercepts
+    ComfyUI before kitchen is called) or where bench asks whether a site's
+    records would ever be read (the int8 tile). The triton kernel patches do
+    not gate on this: dispatch itself decides when they run.
+    """
+    backend = native_backend()
+    if backend is None:
+        return False
+    from comfy_kitchen import registry
+
+    caps = registry.list_backends().get(backend, {}).get("capabilities") or ()
+    return op in caps
 
 
 # The code paths that only exist because of what was measured on a gfx906.
@@ -265,29 +294,69 @@ def on_target_arch():
 # gfx906: installing the DeltaNet replacement on a card whose comfy-kitchen HIP
 # op works fine would replace a working fused kernel with our slower Triton one,
 # which is exactly the silent slowdown this pack is supposed to avoid.
-INSTALL_ITEMS = ("deltanet", "qwen35", "w4a8", "attention")
+def feature_on(item):
+    """The tier-3 gate: COMFY_GFX906_<ITEM> (on/off) > feature.<item> > off.
+
+    A feature whose fastest implementation differs per card has no default
+    without data: an unmeasured card keeps the stock path, and one bench run
+    turns on whatever won against the real fallback on this card.
+    """
+    raw = str(_state.get(item + "_env", "")).strip().lower()
+    if raw in ("1", "on", "true", "yes"):
+        return True
+    if raw in ("0", "off", "false", "no"):
+        return False
+    table = measured_table()
+    return table is not None and table.default_impl("feature." + item) == "on"
+
+
+def resolved_convrot_mode():
+    """env mode override > the manifest's convrot.mode > "fused"."""
+    raw = _state.get("convrot_env")
+    if raw in ("fused", "butterfly"):
+        return raw
+    table = measured_table()
+    mode = table.default_impl("convrot.mode") if table is not None else None
+    return mode if mode in CONVROT_MODES else "fused"
 
 
 def install_ready(item):
     """Whether an architecture-specific code path should be installed here.
 
-    Default is `on_target_arch()`: the card is one we have numbers for. The
-    `COMFY_GFX906_FORCE` list opts a single path in on another card, so testing
-    DeltaNet on gfx1100 does not require adding the whole card to ARCHS (which
-    would also swap the int8 tile and the attention kernel for gfx906's).
+    * `COMFY_GFX906_FORCE`: one path opted in by hand, no questions asked;
+    * deltanet also installs wherever comfy-kitchen has no fused gated-delta
+      op -- the replacement exists for exactly that case, and the structural
+      fact does not go stale the way a timing does;
+    * everything else needs `[sites."feature.<item>"] default = "on"`: the
+      shipped table for measured archs, or a local tools/bench.py run. No
+      data means off -- the stock path is the default.
     """
-    if _state.get("tuned"):
+    if item in _state.get("forced_items", set()):
         return True
-    return item in _state.get("forced_items", set())
+    if item == "qwen35":
+        # the bench case only covers prefill, so its timing cannot write this
+        # feature yet; the env switch is the decision. It is an equivalence
+        # rewrite (every method verified against core), hence default on.
+        return bool(_state.get("textgen_env", {}).get("qwen35"))
+    if item == "deltanet":
+        try:
+            import comfy_kitchen
+
+            if not comfy_kitchen.gated_delta_decode_is_available():
+                return True
+        except ImportError:
+            return True
+    table = measured_table()
+    return table is not None and table.default_impl(f"feature.{item}") == "on"
 
 
 def warn_forced_items():
     """Say that the items being installed here were not measured on this card."""
-    forced = sorted(item for item in _state.get("forced_items", set()) if not _state.get("tuned"))
+    forced = sorted(_state.get("forced_items", set()))
     if forced:
         logging.warning("gfx906: installing %s on %s because of COMFY_GFX906_FORCE; these kernels "
-                        "were measured on %s, expect the untested ones to be slower or wrong",
-                        ", ".join(forced), _state.get("arch"), " ".join(target_archs()))
+                        "were not measured on this card, expect the untested ones to be slower or wrong",
+                        ", ".join(forced), _state.get("arch"))
 
 
 def _triton_available(patch):
@@ -299,11 +368,8 @@ def _triton_available(patch):
     return True
 
 
-def _tile_spec(name):
-    """Parse e.g. COMFY_GFX906_TILE_CONFIG="block_m=128,block_n=256,block_k=32,..."."""
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        return None
+def _parse_tile_spec(raw):
+    """'block_m=128,block_n=256,block_k=32,...' -> (kwargs, warps, stages), or None."""
     try:
         values = {}
         for part in raw.split(","):
@@ -315,14 +381,26 @@ def _tile_spec(name):
         stages = values.get("stages", values.get("num_stages", 2))
         return spec, warps, stages
     except (KeyError, ValueError):
-        logging.warning("gfx906: %s=%r is not a tile spec, using the built-in tile", name, raw)
         return None
+
+
+def _tile_spec(name):
+    """Parse e.g. COMFY_GFX906_TILE_CONFIG="block_m=128,block_n=256,block_k=32,..."."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    spec = _parse_tile_spec(raw)
+    if spec is None:
+        logging.warning("gfx906: %s=%r is not a tile spec, using the built-in tile", name, raw)
+    return spec
 
 
 def _triton_config():
     import triton
 
     spec = _tile_spec("COMFY_GFX906_TILE_CONFIG")
+    if spec is None:
+        spec = measured_tile("large")
     if spec is not None:
         return triton.Config(dict(spec[0]), num_warps=spec[1], num_stages=spec[2])
     return triton.Config(dict(INT8_TILE), num_warps=INT8_WARPS, num_stages=INT8_STAGES)
@@ -341,6 +419,12 @@ def _small_tile_config():
     import triton
 
     spec = _tile_spec("COMFY_GFX906_SMALL_TILE_CONFIG")
+    if spec is None:
+        spec = measured_tile("small")
+    if spec is None and measured_tile("large") is not None:
+        # a table that measured only the large tile must not fall back to the
+        # narrow gfx906 constant, which was tuned for 60 CUs
+        return _triton_config()
     if spec is not None:
         return triton.Config(dict(spec[0]), num_warps=spec[1], num_stages=spec[2])
     return triton.Config(dict(INT8_TILE_SMALL), num_warps=INT8_SMALL_WARPS, num_stages=INT8_SMALL_STAGES)
@@ -459,6 +543,24 @@ def measured_table():
     return _state["manifest_data"]
 
 
+def measured_tile(bucket):
+    """The int8 tile measured on this card ("large" / "small"), or None.
+
+    Stored as the same "block_m=...,warps=...,stages=..." string the startup
+    variables take, so an entry can be pasted into COMFY_GFX906_TILE_CONFIG and
+    a card that has run tools/bench.py skips autotune without any env variable.
+    """
+    table = measured_table()
+    raw = table.config("int8_gemm.tile", bucket) if table is not None else None
+    if raw is None:
+        return None
+    spec = _parse_tile_spec(raw)
+    if spec is None:
+        logging.warning("gfx906: manifest int8_gemm.tile/%s=%r is not a tile spec, ignoring",
+                        bucket, raw)
+    return spec
+
+
 def measured_state():
     """How much of the table can be used here: measured / stale / absent / off.
 
@@ -488,6 +590,10 @@ def warn_measured_state():
     data = measured_table()
     arch = _state.get("arch")
     if state == "measured":
+        if not _state["native"] and not _state.get("tile_measured"):
+            logging.warning("gfx906: measured data for %s has no int8 tile, so the tile list "
+                            "still goes to autotune. Run tools/bench.py --all --write on this card.",
+                            arch)
         return
     if state == "off":
         logging.info("gfx906: measured table disabled by COMFY_GFX906_MEASURED, "
@@ -497,6 +603,10 @@ def warn_measured_state():
                         "ignoring it, so int8 tiles go to autotune and the GEMV backends to probes. "
                         "Re-run tools/bench.py --write to refresh it.",
                         arch, data.fingerprint if data else "?", data.runtime_fp if data else "?")
+    elif _state["native"]:
+        logging.warning("gfx906: no measured data for %s: the GEMV backends come from probes "
+                        "(the first call of each new shape pays the sweep). "
+                        "Run tools/bench.py --write once on this card to fix that.", arch)
     else:
         logging.warning("gfx906: no measured data for %s: int8 tiles come from the stock autotune list "
                         "and the GEMV backends from probes (the first call of each new shape pays the "
@@ -640,7 +750,7 @@ def select_int8_gemv(x, weight, weight_scale, bias, out_dtype, input_act, residu
     or tensorwise weight scale, no fused activation and no residual. Everything
     else keeps the GEMM, which is where prefill belongs anyway.
     """
-    gemv = _state.get("gemv")
+    gemv = _state.get("gemv_module")
     if gemv is None:
         return None
     if x.dim() != 2 or x.shape[0] != 1 or x.dtype is not torch.float32 or not x.is_contiguous():
@@ -667,7 +777,7 @@ def te_int8_gemv(module, x):
     single-row call goes straight to the GEMV. Multi-row (prefill) calls and
     anything the GEMV does not support return None and keep the dispatch path.
     """
-    if _state.get("gemv") is None or not _state.get("text_gemv_enabled", True):
+    if _state.get("gemv_module") is None or not _state.get("text_gemv_enabled", True):
         return None
     from comfy_kitchen.tensor import TensorWiseINT8Layout
 
@@ -813,15 +923,14 @@ def patch_int8_tile_switch():
     if getattr(previous, "_gfx906_tile_switch", False):
         return True
 
-    gemv_on = _state.get("gemv_env", True)
     _state["gemv_module"] = load_int8_gemv()
-    _state["gemv"] = _state["gemv_module"] if gemv_on else None
+    _state["gemv_model"] = feature_on("gemv")
 
     def int8_linear(x, weight, weight_scale, bias=None, out_dtype=torch.bfloat16, convrot=False,
                     convrot_groupsize=256, input_act=None, input_act_weight=None,
                     input_act_eps=0.0, residual=None, residual_scale=None):
         rows = x.reshape(-1, x.shape[-1]).shape[0]
-        if rows <= INT8_GEMV_MAX_M:
+        if rows <= INT8_GEMV_MAX_M and _state.get("gemv_model"):
             out = select_int8_gemv(x, weight, weight_scale, bias, out_dtype, input_act, residual,
                                    convrot_groupsize if convrot else 0)
             if out is not None:
@@ -836,39 +945,18 @@ def patch_int8_tile_switch():
     return True
 
 
-def _has_config(configs, ours):
-    return any(c.kwargs == ours.kwargs and c.num_warps == ours.num_warps
-               and c.num_stages == ours.num_stages for c in configs)
-
-
-def _untuned_tile_configs():
-    """Stock candidates, plus our tiles only on the arch they were measured on.
-
-    Injecting a 128x256x32 / 60-CU tile into an unknown card's autotune list is
-    a bet that it even compiles there: LDS and register budgets differ across
-    gcn targets. An unmeasured card gets the stock search, which is a fair one;
-    a card that wants our tile says so with COMFY_GFX906_TILE_CONFIG.
-    """
-    configs = list(_state.get("default_int8_configs") or [])
-    if not on_target_arch():
-        return configs
-    cards = [_triton_config()]
-    if _state.get("small_batch_enabled", True):
-        cards.append(_small_tile_config())
-    for cfg in cards:
-        if not _has_config(configs, cfg):
-            configs.append(cfg)
-    return configs
-
-
 def set_untuned_tiles():
-    """Refresh the candidate list after the small_batch switch changes."""
+    """Refresh the candidate list after the small_batch switch changes.
+
+    Without a measured tile the list is the stock search: an unmeasured card
+    never sees gfx906's tiles, and a measured one has a single config anyway.
+    """
     if _state.get("int8_tile_replaced") or not _state.get("int8_linear"):
         return
     if _state.get("default_int8_configs") is None:
         return
     for kernel in _int8_kernels():
-        kernel.configs = _untuned_tile_configs()
+        kernel.configs = list(_state["default_int8_configs"])
         kernel.cache.clear()
 
 
@@ -898,7 +986,7 @@ def patch_int8_linear(replace):
         if replace:
             kernel.configs = [ours]
         else:
-            kernel.configs = _untuned_tile_configs()
+            kernel.configs = list(_state["default_int8_configs"])
         kernel.cache.clear()
     _state["int8_tile_small"] = None
     _state["int8_tile_switch"] = patch_int8_tile_switch()
@@ -1014,7 +1102,7 @@ def _swap_optimized_attention(old, new):
                 setattr(module, name, new)
 
 
-def patch_attention(auto_tune=False):
+def patch_attention():
     """Run eligible attention calls on the gfx906 kernel, delegate the rest.
 
     Installed as optimized_attention, re-wrapped with ComfyUI's own wrap_attn so
@@ -1032,12 +1120,10 @@ def patch_attention(auto_tune=False):
         return False
     try:
         from .attention_kernel import (SUPPORTED_HEAD_DIMS, attention_fwd, attention_fwd_int8,
-                                       benchmark_tiles, benchmark_tiles_int8,
-                                       supported as kernel_supported, use_config, use_config_int8)
+                                       supported as kernel_supported)
     except ImportError:
         from attention_kernel import (SUPPORTED_HEAD_DIMS, attention_fwd, attention_fwd_int8,
-                                      benchmark_tiles, benchmark_tiles_int8,
-                                      supported as kernel_supported, use_config, use_config_int8)
+                                      supported as kernel_supported)
 
     fallback = attention.optimized_attention
     if fallback in (attention.attention_sage, attention.attention_comfy_kitchen_int8):
@@ -1045,52 +1131,21 @@ def patch_attention(auto_tune=False):
                      getattr(fallback, "__name__", "?"))
         return False
 
-    kernel = os.getenv("COMFY_GFX906_ATTN", "int8").strip().lower()
+    kernel = _state.get("attn_env") or "int8"
     _state["attn_kernel"] = kernel if kernel in ATTENTION_KERNELS or stock_backend(kernel) is not None else "int8"
     _state["attn_backend_fn"] = stock_backend(_state["attn_kernel"])
     _state["smooth"] = os.getenv("COMFY_GFX906_SMOOTH", "1").lower() not in ("0", "off", "false", "no")
-    _state["attn_tuned"] = set(SUPPORTED_HEAD_DIMS) if not auto_tune else set()
+    # the tile constants were hand-measured on gfx906; the mode is a quality
+    # choice (rel 2e-2 int8 vs 2.5e-4 hand), so it stays a manual node/env
+    # switch instead of a manifest verdict
+    _state["attn_tuned"] = set(SUPPORTED_HEAD_DIMS)
     _state["attn_fp16"] = os.getenv("COMFY_GFX906_FP16", "1").lower() not in ("0", "off", "false", "no")
     _state["attn_contiguous"] = os.getenv("COMFY_GFX906_CONTIG", "1").lower() not in ("0", "off", "false", "no")
     stats = _state["attn_cast"] = {"fp16": 0, "fp32": 0, "hand": 0, "int8": 0, "int8qk": 0,
                                    "gemm": 0, "sdpa": 0}
 
-    def pick_kernel(q, k, v, softmax_scale):
-        """On a head dim we have no numbers for: time the tiles and SDPA, keep the faster."""
-        head_dim = q.shape[-1]
-        _state["attn_tuned"].add(head_dim)
-        mode = _state["attn_kernel"]
-        config = kernel_ms = None
-
-        if mode in ("int8", "int8qk"):
-            config, kernel_ms = benchmark_tiles_int8(
-                q, k, v, softmax_scale, int8_pv=mode == "int8",
-                smooth=_state["smooth"] if mode == "int8qk" else False)
-            if config is not None:
-                use_config_int8(config, head_dim)
-
-        if config is None:
-            # int8 did not compile (no dp4a) or the caller asked for fp16
-            config, kernel_ms = benchmark_tiles(q, k, v, softmax_scale)
-            if config is not None:
-                use_config(config, head_dim)
-                _state["attn_kernel"] = "hand"
-
-        sdpa_ms = _bench(lambda: _sdpa(q, k, v, softmax_scale), iters=2, warmup=1)
-        if config is None or kernel_ms >= sdpa_ms:
-            # falling back to the stock backend would be far slower than this floor
-            _state["attn_kernel"] = "sdpa"
-            logging.info("gfx906: attention kernel %s ms vs SDPA %.1f ms, keeping SDPA",
-                         f"{kernel_ms:.1f}" if kernel_ms else "n/a", sdpa_ms)
-        else:
-            logging.info("gfx906: attention %s %.1f ms vs SDPA %.1f ms, using BLOCK_M=%d BLOCK_N=%d warps=%d stages=%d",
-                         _state["attn_kernel"], kernel_ms, sdpa_ms, *config)
-        _state["attn_backend_fn"] = None
-
     def run(q, k, v, softmax_scale):
         """[B, S, H, D] -> same, or None to delegate. fp16 unless the cast is off."""
-        if _state["attn_kernel"] not in ("sdpa", "gemm") and q.shape[-1] not in _state["attn_tuned"]:
-            pick_kernel(q, k, v, softmax_scale)
         mode = _state["attn_kernel"]
         if mode == "sdpa":
             stats["sdpa"] += 1
@@ -1233,8 +1288,7 @@ def patch_convrot():
     except ImportError:
         from convrot_kernel import QuantizedRotation, convrot_quantize, hadamard_rotate
 
-    mode = os.getenv("COMFY_GFX906_CONVROT", "fused").strip().lower()
-    _state["convrot_mode"] = mode if mode in CONVROT_MODES else "fused"
+    _state["convrot_mode"] = resolved_convrot_mode()
     if getattr(quantization, "_gfx906_convrot", False):
         return True
     original = getattr(quantization, "_rotate_activation", None)
@@ -1297,7 +1351,7 @@ def triton_backend_active():
 
 
 def configure(attention=None, smooth=None, convrot=None, profile=None, text_encoder=None,
-              fp16=None, text_attention=None, contiguous=None, linear8=None, qkv=None,
+              fp16=None, text_attention=None, contiguous=None, qkv=None,
               vae=None, gemv=None, textgen=None, prefix_kv=None, text_gemv=None, w4a8=None,
               amax_guard=None, int8_tile=None, small_batch=None):
     """Runtime settings, used by the GFX906 nodes.
@@ -1323,10 +1377,8 @@ def configure(attention=None, smooth=None, convrot=None, profile=None, text_enco
     if convrot is not None:
         wanted = str(convrot).strip().lower()
         if wanted in ("default", "auto"):
-            wanted = _state.get("convrot_env", "fused")
-        _state["convrot_mode"] = wanted if wanted in CONVROT_MODES else _state.get("convrot_env", "fused")
-    if linear8 is not None:
-        _state["linear8_enabled"] = resolve_flag(linear8, _state.get("linear8_env", True))
+            wanted = resolved_convrot_mode()
+        _state["convrot_mode"] = wanted if wanted in CONVROT_MODES else resolved_convrot_mode()
     if qkv is not None and _state.get("qkv_patched"):
         _state["qkv"] = resolve_flag(qkv, _state.get("qkv_env", False))
     if text_encoder is not None and _state["applied"]:
@@ -1342,14 +1394,14 @@ def configure(attention=None, smooth=None, convrot=None, profile=None, text_enco
         _state["te_attention"] = (wanted if wanted == "default"
                                   or stock_backend(wanted) is not None else "default")
     if vae is not None:
-        _state["vae_enabled"] = resolve_flag(vae, _state.get("vae_env", True))
+        _state["vae_enabled"] = resolve_flag(vae, feature_on("vae"))
     if gemv is not None:
         want = flag_value(gemv)
         if want is None:
-            want = _state.get("gemv_env", True)
+            want = feature_on("gemv")
         if want and _state.get("gemv_module") is None:
             _state["gemv_module"] = load_int8_gemv()
-        _state["gemv"] = _state.get("gemv_module") if want else None
+        _state["gemv_model"] = want
     if textgen is not None:
         _state["textgen_override"] = flag_value(textgen)
     if prefix_kv is not None:
@@ -1677,118 +1729,6 @@ def patch_qkv():
     return True
 
 
-def _int8_linear_forward(self, x):
-    """Runtime int8 GEMM for plain fp16 Linear weights (SDXL-class checkpoints).
-
-    The int8 weight is quantized once per module and device and cached, so the
-    hot path never touches cast_bias_weight: casting per call re-pins the vbar
-    pages of the fp16 weight every forward and aimdo spams a WARNING per page
-    per call (2700 per 20-step SDXL run). The cast that produced the cache uses
-    offloadable=True + uncast_bias_weight, so nothing stays pinned either.
-    Linear layers have no softmax to amplify quantization error, unlike
-    attention, so per-row int8 weights are safe here quality-wise.
-
-    Both sides get the 256-wide ConvRot Hadamard rotation (the weight at requant
-    time, the activation online inside int8_linear), which is what keeps SDXL's
-    activation outliers from dominating the per-row x quantization.
-    """
-    import comfy.quant_ops
-    from comfy_kitchen.backends.triton import quantization as ckq
-
-    if (not _state.get("linear8_enabled", True)
-            or comfy.model_management.in_training
-            or getattr(self, "weight_function", None)
-            or getattr(self, "bias_function", None)
-            or x.dtype not in (torch.float16, torch.bfloat16, torch.float32)):
-        return self._gfx906_linear_forward(x)
-    w8 = getattr(self, "_gfx906_w8", None)
-    if w8 is None or w8.device != x.device:
-        weight, bias, stream = comfy.ops.cast_bias_weight(self, x, offloadable=True)
-        try:
-            n, k = weight.shape
-            rot = k % 256 == 0
-            if rot:
-                h = ckq._build_hadamard(256, device=x.device, dtype=weight.dtype)
-                weight = ckq._rotate_activation(weight, h, 256)
-            scale = (weight.abs().amax(dim=1, keepdim=True) / 127.0).clamp_min(1e-8)
-            self._gfx906_w8 = (weight / scale).round().to(torch.int8)
-            self._gfx906_ws = scale
-            # the cast's offload stream reclaims the returned tensors; keep copies
-            self._gfx906_b = None if bias is None else bias.clone()
-            self._gfx906_rot = rot
-        finally:
-            comfy.ops.uncast_bias_weight(self, weight, bias, stream)
-    _state["linear8_calls"] = _state.get("linear8_calls", 0) + 1
-    return comfy.quant_ops.ck.int8_linear(x, self._gfx906_w8, self._gfx906_ws,
-                                          self._gfx906_b, x.dtype,
-                                          convrot=self._gfx906_rot, convrot_groupsize=256)
-
-
-def _walk_linear8(root):
-    """Swap eligible Linear forwards to the int8 path; returns how many."""
-    import torch.nn as nn
-    from comfy.quant_ops import QuantizedTensor
-
-    count = 0
-    for module in root.modules():
-        if (isinstance(module, nn.Linear) and module.in_features >= 1280
-                and not isinstance(module.weight, QuantizedTensor)
-                and not getattr(module, "_gfx906_l8", False)):
-            module._gfx906_l8 = True
-            module._gfx906_linear_forward = module.forward
-            module.forward = _int8_linear_forward.__get__(module)
-            count += 1
-    return count
-
-
-def patch_linear8():
-    """int8 GEMM for the fp16 Linear layers of non-quantized checkpoints.
-
-    SDXL spends 40-60% of its forward in rocBLAS fp16 GEMMs that none of the
-    int8 machinery reaches (the checkpoint has no QuantizedTensor weights).
-    Quantizing weights with in_features >= 1280 once and running int8_linear
-    instead wins on every such shape at the SDXL token counts (1.2-2.1x per
-    layer); the 640-wide layers at M=4096 lose and stay fp16. Layers grow LoRA
-    patches later than load time, so weight_function is re-checked on every
-    call. The node's linear8 switch gates the swapped forwards live: the walk
-    is installed regardless, so toggling needs no reload.
-    """
-    import comfy.sd
-
-    if getattr(comfy.sd, "_gfx906_l8", False):
-        return True
-    _state["linear8_enabled"] = os.getenv("COMFY_GFX906_LINEAR8", "1").lower() not in ("0", "off", "false", "no")
-
-    def wrap_loader(original):
-        import functools
-
-        @functools.wraps(original)
-        def wrapper(*args, **kwargs):
-            result = original(*args, **kwargs)
-            try:
-                patcher = result[0] if isinstance(result, tuple) else result
-                count = _walk_linear8(patcher.get_model_object("diffusion_model"))
-                if count:
-                    _state["linear8_modules"] = _state.get("linear8_modules", 0) + count
-                    logging.info("gfx906: %d Linear layers (in_features >= 1280) on the int8 path", count)
-            except Exception as exc:
-                logging.warning("gfx906: linear8 walk failed: %s", exc)
-            return result
-
-        wrapper._gfx906_l8 = True
-        return wrapper
-
-    for name in ("load_checkpoint_guess_config", "load_diffusion_model",
-                 "load_diffusion_model_state_dict"):
-        original = getattr(comfy.sd, name, None)
-        if original is not None and not getattr(original, "_gfx906_l8", False):
-            wrapped = wrap_loader(original)
-            setattr(comfy.sd, name, wrapped)
-    comfy.sd._gfx906_l8 = True
-    _state["linear8"] = True
-    return True
-
-
 def _prefix_merge(prefix, target, buffers, slot):
     """Copy prefix and target rows into one reused buffer, as torch.cat would.
 
@@ -1892,29 +1832,52 @@ def apply():
     if not enabled():
         _state["reason"] = "disabled by COMFY_GFX906_TUNING"
         return _state
-    if not is_amd():
-        _state["reason"] = "not an AMD device (torch.version.hip is None)"
+    if not torch.cuda.is_available():
+        _state["reason"] = "no CUDA device"
         logging.info("gfx906 tuning skipped: %s", _state["reason"])
         return _state
 
-    tuned = on_target_arch()
-    _state["tuned"] = tuned
-    # a hand-measured tile spec is enough to skip autotune on this card
-    _state["tile_measured"] = tuned or _tile_spec("COMFY_GFX906_TILE_CONFIG") is not None
+    _state["native"] = native_backend()
+    on_amd = is_amd()
+    if on_amd and _state["native"]:
+        logging.info("gfx906: comfy-kitchen %s serves this %s; the triton kernel patches "
+                     "below only run where its per-call constraints decline a shape",
+                     _state["native"], _state["arch"])
+    # a hand-measured tile spec, or one measured by tools/bench.py on this card
+    # (or shipped for its arch), replaces the autotune list with a single config
+    _state["tile_measured"] = (_tile_spec("COMFY_GFX906_TILE_CONFIG") is not None
+                               or measured_tile("large") is not None)
     # before anything is patched: a card running without its numbers says so in
     # the boot log, instead of looking identical to one that has them
     warn_measured_state()
     warn_forced_items()
-    _install("int8 tile", patch_int8_linear, replace=_state["tile_measured"])
-    if _state.get("int8_linear") and not _state.get("int8_tile_env", True):
-        _install("int8 tile reset", restore_int8_defaults)
-    _install("convrot", patch_convrot)
-    _install("vae", patch_vae)
+    # The triton kernel patches install on every AMD and let dispatch decide when
+    # they run: the native backend is preferred, so where kitchen serves an op
+    # these only serve the calls its per-call constraints decline, and where it
+    # does not (gfx906) they are the primary path. The gfx906-specific content
+    # inside them is guarded by the manifest fingerprint, not by this gate.
+    if on_amd:
+        _install("int8 tile", patch_int8_linear, replace=_state["tile_measured"])
+        if _state.get("int8_linear") and not _state.get("int8_tile_env", True):
+            _install("int8 tile reset", restore_int8_defaults)
+    # tier-3 features: on only where the manifest says so -- the shipped table
+    # for measured archs, or a local bench run. env overrides per value.
+    if feature_on("convrot"):
+        _install("convrot", patch_convrot)
+    if feature_on("vae"):
+        _install("vae", patch_vae)
     # opt-in: the fused GEMM is 1.5% faster but holds 1.6 GB of merged weights
     _state["qkv"] = _state["qkv_env"]
     _install("qkv", patch_qkv)
+    # the TE GEMV is not a kernel replacement: it skips the QuantizedTensor
+    # dispatch, which costs the same on every vendor. Needs int8_gemv loaded
+    # even where the tile patch above is skipped.
+    # the module backs two consumers: text_gemv (tier-1, its own switch) and
+    # the model int8 GEMV path (tier-3 -- on only where the manifest says so)
+    if (feature_on("gemv") or _state.get("text_gemv_enabled")) and _state.get("gemv_module") is None:
+        _state["gemv_module"] = _install("int8 gemv", load_int8_gemv)
+    _state["gemv_model"] = feature_on("gemv")
     _install("prefix kv", patch_prefix_kv)
-    _install("linear8", patch_linear8)
     # before any prompt runs: the queue thread binds execute_async when a prompt
     # starts, so a hook installed later would only report from the next one
     _install("prompt hook", _patch_prompt_end)
@@ -1960,20 +1923,20 @@ def apply():
         return hasattr(comfy.model_prefetch, "RESIDENT_GRAPH_MODULES")
 
     _state["resident_graph_patch"] = bool(_install("resident graph probe", _probe_resident))
-    if tuned and not _state["resident_graph_patch"]:
+    if not _state["resident_graph_patch"]:
         logging.info("gfx906: resident graph hooks absent, decode runs without per-block CUDA graphs "
                      "(see custom_nodes/ComfyUI-gfx906-Tuning/core-patches/README.md)")
-    if install_ready("attention"):
+    # attention kernels differ in quality (int8 PV rel ~2e-2 vs hand 2.5e-4), so
+    # the mode is a manual node/env choice, not a manifest verdict -- and the TE
+    # never routes here anyway (its resolver returns core's pytorch/basic). It
+    # installs on every AMD; NVIDIA keeps core's attention.
+    if on_amd:
         _install("attention", patch_attention)
-    else:
-        logging.info("gfx906: %s has no measured attention tiles; the first attention call will "
-                     "benchmark the candidates against SDPA and keep the faster", _state["arch"])
-        _install("attention (autotune)", patch_attention, auto_tune=True)
     logging.info(
         "gfx906 tuning active: int8 linear %s%s, convrot %s, vae %s, qkv %s, attention %s%s%s%s, "
         "text encoder %s + lm_head, encoder attention %s, textgen %s",
-        "tuned" if _state.get("int8_tile_replaced") else ("on (tile appended)" if _state["int8_linear"] else "off"),
-        " + decode gemv" if _state.get("gemv") else "",
+        "measured tile" if _state.get("int8_tile_replaced") else ("on (stock candidates)" if _state["int8_linear"] else "off"),
+        " + decode gemv" if _state.get("gemv_model") else "",
         _state["convrot_mode"] if _state["convrot"] else "off",
         "conv3d->conv2d" if _state.get("vae_patched") and _state.get("vae_enabled") else "off",
         "fused" if _state.get("qkv") else "off",
@@ -2011,11 +1974,7 @@ def report_lines():
             f" gemm {cast['gemm']}, sdpa {cast['sdpa']})")
     for k in cast:
         cast[k] = 0
-    lines = [line]
-    if _state.get("linear8_calls"):
-        lines.append(f"linear8 {_state['linear8_calls']} int8 linear calls")
-        _state["linear8_calls"] = 0
-    return lines
+    return [line]
 
 
 def _format_tile(config):
@@ -2024,7 +1983,7 @@ def _format_tile(config):
 
 
 def status():
-    tile_state = {True: "tuned", False: "config appended, autotune decides", None: "off"}
+    tile_state = {True: "measured tile", False: "stock candidates, autotune decides", None: "off"}
     if not _state["int8_linear"]:
         tile_line = "int8 linear off"
     elif _state.get("int8_tile_enabled", True):
@@ -2045,7 +2004,7 @@ def status():
     else:
         prefix_line = "prefix kv torch.cat (off, installed)"
     gemv_loaded = _state.get("gemv_module") is not None
-    if _state.get("gemv"):
+    if _state.get("gemv_model"):
         gemv_backend = getattr(_state.get("gemv_module"), "backend_name", None)
         parts = [f"backend={gemv_backend()}"] if gemv_backend is not None else []
         suffix = measured_suffix(_state.get("gemv_module"))
@@ -2086,8 +2045,6 @@ def status():
         + (f", {_state['qkv_calls']} fused / {_state.get('qkv_fallbacks', 0)} fallback"
            if _state.get("qkv_calls") or _state.get("qkv_fallbacks") else ""),
         prefix_line,
-        f"linear8 {'on' if _state.get('linear8_enabled', True) else 'off'}: "
-        f"{_state.get('linear8_modules', 0)} layers, {_state.get('linear8_calls', 0)} calls",
         gemv_line,
         text_gemv_line,
         w4a8_line,
@@ -2095,8 +2052,9 @@ def status():
         f"textgen {textgen_summary()}",
         f"attention {_state['attn_kernel'] if _state['attention'] else 'off'}"
         + (f", smoothing {'on' if _state['smooth'] else 'off'}" if _state["attn_kernel"] == "int8qk" else "")
-        + (", inputs cast to fp16" if _state["attn_fp16"] else ", inputs left in the model dtype")
-        + (f", amax guard {'on' if _state.get('amax_guard', True) else 'off'}")
+        + ((", inputs cast to fp16" if _state["attn_fp16"] else ", inputs left in the model dtype")
+           + f", amax guard {'on' if _state.get('amax_guard', True) else 'off'}"
+           if _state["attention"] else "")
         + (f", rest to {_state['replaced_backend']}" if _state.get("replaced_backend") else ""),
         f"text encoder {'int8' if _state['te_int8'] else 'default (dequantize per call)'}"
         + f", lm_head {'int8' if _state.get('logits_patched') and _state['te_int8'] else 'default'}"
@@ -2106,9 +2064,17 @@ def status():
     manifest_line = manifest_status_line()
     if manifest_line:
         lines.insert(1, manifest_line)
+    if _state.get("native") and _state.get("int8_linear"):
+        lines.insert(1, f"comfy-kitchen {_state['native']} backend present: "
+                        f"triton kernel patches are fallback-only here")
     if _state["int8_linear"] and _state.get("int8_tile_enabled", True):
         if _state.get("tile_measured"):
-            suffix = "env tile" if _tile_spec("COMFY_GFX906_TILE_CONFIG") is not None else "forced"
+            if _tile_spec("COMFY_GFX906_TILE_CONFIG") is not None:
+                suffix = "env tile"
+            elif measured_tile("large") is not None:
+                suffix = "measured tile"
+            else:
+                suffix = "forced"
         else:
             suffix = "autotune candidates"
         lines.append(f"int8 tiles ({suffix}): large {_format_tile(_triton_config())}; "
@@ -2125,6 +2091,6 @@ def status():
     if _state["reason"]:
         lines.append(_state["reason"])
     forced = sorted(_state.get("forced_items") or ())
-    if forced and not _state.get("tuned"):
+    if forced:
         lines.append(f"forced on an unmeasured arch: {', '.join(forced)} (COMFY_GFX906_FORCE)")
     return "\n".join(lines)

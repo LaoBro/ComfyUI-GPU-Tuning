@@ -67,11 +67,6 @@ class Gfx906ModelSettings(io.ComfyNode):
                 io.Combo.Input("convrot", options=["default"] + list(CONVROT_MODES), default="default",
                                tooltip="default keeps COMFY_GFX906_CONVROT. fused = rotation + int8 quantize in "
                                        "one kernel, butterfly = rotation only, off = the original matmul."),
-                io.Combo.Input("linear8", options=list(TRISTATE), default="default",
-                               tooltip="Quantize fp16 Linear weights (in_features >= 1280) to per-row int8 with "
-                                       "ConvRot rotation and run the comfy-kitchen int8 kernel: -17% step time on "
-                                       "SDXL (the 640-wide layers stay fp16). Off = full fp16 quality baseline, "
-                                       "no restart needed."),
                 io.Combo.Input("int8_tile", options=list(TRISTATE), default="default",
                                tooltip="Keep the gfx906 int8 tile (128x256x32, 4 warps, 2 stages) in the "
                                        "kitchen autotune list. default keeps COMFY_GFX906_INT8_TILE; off "
@@ -105,11 +100,11 @@ class Gfx906ModelSettings(io.ComfyNode):
 
     @classmethod
     def execute(cls, model, attention: str, contiguous: str, smooth: str, fp16: str, amax_guard: str,
-                convrot: str, linear8: str, int8_tile: str, small_batch: str, qkv: str, vae: str,
+                convrot: str, int8_tile: str, small_batch: str, qkv: str, vae: str,
                 gemv: str, prefix_kv: str, profile: str) -> io.NodeOutput:
         apply()
         configure(attention=attention, smooth=smooth, fp16=fp16, convrot=convrot,
-                  profile=profile, contiguous=contiguous, linear8=linear8, qkv=qkv,
+                  profile=profile, contiguous=contiguous, qkv=qkv,
                   vae=vae, gemv=gemv, prefix_kv=prefix_kv, amax_guard=amax_guard,
                   int8_tile=int8_tile, small_batch=small_batch)
         return io.NodeOutput(model)

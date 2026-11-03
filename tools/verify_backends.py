@@ -49,7 +49,7 @@ def rel(a, b):
 # -- reference implementations ------------------------------------------
 
 int8_reference = refs.int8_reference
-w4a8_uniform_weight = refs.w4a8_uniform_weight
+w4a8_weight = refs.w4a8_weight
 
 
 # -- checks --------------------------------------------------------------
@@ -59,7 +59,7 @@ def environment():
     import triton
 
     props = torch.cuda.get_device_properties(0)
-    arch = str(getattr(props, "gcnArchName", "")).split(":")[0]
+    arch = str(getattr(props, "gcnArchName", "")).split(":")[0] or f"sm{props.major}{props.minor}"
     print(f"torch {torch.__version__} | hip {torch.version.hip} | triton {triton.__version__}")
     print(f"device0 {props.name} | {arch} | {props.multi_processor_count} CU")
     return arch
@@ -127,21 +127,38 @@ def numeric_w4a8(w4a8):
     qdata = torch.randint(0, 256, (n, k // 2), device="cuda", dtype=torch.uint8)
     s_rel = torch.rand(n, k // gs, device="cuda", dtype=torch.float32) * 0.02 + 1e-4
     s_channel = torch.rand(n, device="cuda", dtype=torch.float32) * 0.5 + 0.5
-    weight = w4a8_uniform_weight(qdata, s_rel, s_channel, gs)
+    weight = w4a8_weight(qdata, s_rel, s_channel, gs)
 
     for m in (1, 8):
         x = torch.randn(m, k, device="cuda", dtype=torch.float32)
         out_asm = w4a8._linear_asm(x, qdata, s_rel, s_channel, None, torch.float32, gs, 0)
         out_tri = w4a8._linear_dot(x, qdata, s_rel, s_channel, None, torch.float32, gs, 0)
+        out_sum = w4a8._linear_sum(x, qdata, s_rel, s_channel, None, torch.float32, gs, 0)
         ref = x @ weight.T
-        if out_asm is None or out_tri is None:
+        if out_asm is None or out_tri is None or out_sum is None:
             FAILURES.append(f"w4a8: an implementation declined m={m}")
             print(f"FAIL w4a8 m={m}: implementation declined the shape")
             continue
-        d_ab, d_ref = rel(out_asm, out_tri), rel(out_asm, ref)
-        print(f"     w4a8 4096x4096 m={m}: asm vs triton {d_ab:.2e}, asm vs torch {d_ref:.2e}")
+        d_ab, d_ref, d_sum = rel(out_asm, out_tri), rel(out_asm, ref), rel(out_sum, ref)
+        print(f"     w4a8 4096x4096 m={m}: asm vs triton {d_ab:.2e}, asm vs torch {d_ref:.2e}, "
+              f"sum vs torch {d_sum:.2e}")
         check(f"w4a8 m={m} asm == triton", d_ab < 1e-5, True)
         check(f"w4a8 m={m} asm ~= torch (3%)", d_ref < 0.03, True)
+        check(f"w4a8 m={m} sum ~= torch (3%)", d_sum < 0.03, True)
+
+    # group 8: the tl.dot kernel cannot take it, the floor is what keeps the
+    # site from declining the shape and sending the call back to int8
+    gs8 = 8
+    s_rel8 = torch.rand(n, k // gs8, device="cuda", dtype=torch.float32) * 14.5 + 1.0
+    weight8 = w4a8_weight(qdata, s_rel8, s_channel, gs8)
+    x = torch.randn(1, k, device="cuda", dtype=torch.float32)
+    out_dot = w4a8._linear_dot(x, qdata, s_rel8, s_channel, None, torch.float32, gs8, 0)
+    out_sum = w4a8._linear_sum(x, qdata, s_rel8, s_channel, None, torch.float32, gs8, 0)
+    detail = "declined" if out_sum is None else f"rel {rel(out_sum, x @ weight8.T):.2e}"
+    print(f"     w4a8 group 8: dot {'declines' if out_dot is None else 'accepts'}, sum {detail}")
+    check("w4a8 group 8 declined by tl.dot", out_dot is None, True)
+    check("w4a8 group 8 floor ~= torch (3%)",
+          out_sum is not None and rel(out_sum, x @ weight8.T) < 0.03, True)
 
 
 def summary(w4a8, int8):

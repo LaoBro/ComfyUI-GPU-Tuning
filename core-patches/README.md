@@ -40,6 +40,11 @@ instead of replaying a captured graph: on the Qwen3.5 text encoder that is
 roughly 25 ms/token → 40 ms/token. Results are identical either way — this is a
 launch-overhead optimization, not a correctness feature.
 
+The three files are flow control and carry no gfx906 assumption: on an NVIDIA
+card the same per-layer launch overhead exists (and matters more, because the
+kernels themselves are faster there), so this overlay is likely the biggest
+single text-generation win this node ships for CUDA users.
+
 ## Upgrading ComfyUI
 
 ```bash

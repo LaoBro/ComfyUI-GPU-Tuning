@@ -225,6 +225,28 @@ def _launch(q, k, v, out, scale, config):
 CANDIDATES = ((64, 16, 4, 2), (64, 32, 4, 2), (32, 16, 4, 2), (64, 8, 4, 2))
 DEFAULT_CONFIG = (BLOCK_M, BLOCK_N, NUM_WARPS, NUM_STAGES)
 
+
+def config_text(config):
+    """(block_m, block_n, warps, stages) -> "64x16w4s2", the manifest's key."""
+    return f"{config[0]}x{config[1]}w{config[2]}s{config[3]}"
+
+
+def config_from_text(text):
+    """The inverse of config_text, or None when the text is not a usable tile.
+
+    Tiles come from a hand-editable TOML file, so a block of 0 has to be
+    rejected here rather than divided by in the grid.
+    """
+    try:
+        tile, _, tail = str(text).partition("w")
+        block_m, block_n = (int(value) for value in tile.split("x"))
+        warps, _, stages = tail.partition("s")
+        config = (block_m, block_n, int(warps), int(stages))
+    except (TypeError, ValueError):
+        return None
+    return config if min(config) > 0 else None
+
+
 _selected = {}
 _selected_int8 = {}
 # int8 keeps the same BLOCK_D grouping, so only the tile shape is free to move

@@ -49,8 +49,28 @@ def _loads(text):
     return tomllib.loads(text)
 
 
+def device_arch():
+    """The device identity manifests and arch kernels are keyed on.
+
+    `gcnArchName` on AMD; `sm<major><minor>` elsewhere, so an NVIDIA sm120 and
+    an sm89 do not share one table. None without a GPU.
+    """
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        props = torch.cuda.get_device_properties(0)
+        name = str(getattr(props, "gcnArchName", ""))
+        if name:
+            return name.split(":")[0] or None
+        return f"sm{props.major}{props.minor}" if props.major else None
+    except Exception:                               # noqa: BLE001 - no torch, no arch
+        return None
+
+
 def runtime_fingerprint(arch=None):
-    """What this process can trust: ROCm + Torch build + Triton + gcn target.
+    """What this process can trust: ROCM/CUDA + Torch build + Triton + target.
 
     The Torch build id is part of it because that wheel carries the compiler
     that produces the kernels: rebuilding torch against the same ROCm version
@@ -65,7 +85,7 @@ def runtime_fingerprint(arch=None):
         rocm = torch.version.hip or "cuda"
         torch_version = torch.__version__
         if arch is None and torch.cuda.is_available():
-            arch = str(getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")).split(":")[0] or None
+            arch = device_arch()
     except Exception:                               # noqa: BLE001 - diagnostics only
         pass
     try:
@@ -127,8 +147,16 @@ class Manifest:
 
     # -- trust ------------------------------------------------------------
     def matches(self, fingerprint=None):
-        """Only a file measured on exactly this ROCm/Triton/gcn triplet is trusted."""
-        return bool(self.fingerprint) and self.fingerprint == (fingerprint or self.runtime_fp)
+        """A file measured on exactly this ROCm/Triton/gcn triplet is trusted.
+
+        A file with no fingerprint is the shipped per-arch table: it was
+        measured for this arch and stamps no build, so it matches every build
+        of the arch. A local file always stamps one, and a stale one therefore
+        shadows the shipped records until it is refreshed or deleted.
+        """
+        if not self.fingerprint or self.fingerprint == UNMEASURED:
+            return True
+        return self.fingerprint == (fingerprint or self.runtime_fp)
 
     def records(self):
         return sum(len(site.shapes) for site in self.sites.values())
@@ -164,6 +192,24 @@ class Manifest:
             if record.trusted(min_grade) and record.impl != entry.default:
                 return None
         return entry.default
+
+    def config(self, site, key, min_grade=MIN_GRADE_DEFAULT):
+        """The `impl` recorded for a non-shape key, or None.
+
+        Tiles and kernel modes are not keyed by (N, K, m), so they store the
+        value that would otherwise be an implementation name: a tile spec, or
+        "int8"/"hand"/"off". Same trust rules as a shape -- a file from another
+        build answers None and the caller keeps its built-in default.
+        """
+        if not self.matches():
+            return None
+        entry = self.sites.get(site)
+        if entry is None:
+            return None
+        record = entry.shapes.get(key)
+        if record is None or not record.trusted(min_grade):
+            return None
+        return record.impl
 
     # -- reporting --------------------------------------------------------
     def status_line(self):

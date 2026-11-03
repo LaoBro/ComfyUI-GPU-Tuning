@@ -62,27 +62,29 @@ default = "asm"
 
 
 def shipped():
-    """The file in the repo must parse, and must not be trusted as-is."""
+    """The file in the repo must parse and be trusted on every build of the arch.
+
+    It carries grade = "measured" records and no fingerprint: the node reads its
+    tier-3 gates and tiles straight from here, so trust is the point. A local
+    bench file (with a real fingerprint) wins per shape on top of it.
+    """
     # read the shipped file alone: a local override on the test machine must not
     # change what this checks
     path = Path(NODE_DIR) / "arch" / "gfx906" / "manifest.toml"
     data = mf.load("gfx906", path=path)
     check("shipped: loads", data is not None, True)
-    check("shipped: records", data.records(), 8)
+    check("shipped: has records", data.records() > 0, True)
     check("shipped: fingerprint", data.fingerprint, mf.UNMEASURED)
-    check("shipped: not trusted", data.matches(), False)
-    check("shipped: lookup ignored", data.lookup("w4a8.m1", 4096, 4096, 1), None)
-    check("shipped: line says STALE", "STALE" in data.status_line(), True)
-    # the transcribed numbers are still readable for documentation purposes
-    fork = mf.load("gfx906", path=path, runtime=mf.UNMEASURED)
-    check("shipped: derived is not measured", fork.lookup("w4a8.m1", 4096, 4096, 1), None)
-    check("shipped: derived readable",
-          fork.lookup("w4a8.m1", 4096, 4096, 1, min_grade="derived"), "asm")
-    # the interesting one: int32 wins on the smallest shape
-    check("shipped: int8 4096 winner",
-          fork.lookup("int8_gemv.m1", 4096, 4096, 1, min_grade="derived"), "triton")
-    check("shipped: int8 12288 winner",
-          fork.lookup("int8_gemv.m1", 12288, 4096, 1, min_grade="derived"), "asm")
+    check("shipped: trusted on any build", data.matches(), True)
+    check("shipped: lookup live", data.lookup("w4a8.m1", 4096, 4096, 1), "asm")
+    check("shipped: line says measured", "measured" in data.status_line(), True)
+    # the tier-3 gates the node reads must all answer here
+    for site in ("feature.gemv", "feature.w4a8", "feature.vae", "feature.convrot",
+                 "convrot.mode"):
+        check(f"shipped: {site} default",
+              data.default_impl(site) in ("on", "off", "fused", "butterfly"), True)
+    check("shipped: int8 tile large",
+          data.config("int8_gemm.tile", "large") is not None, True)
 
 
 def trust_and_fallback():
@@ -197,9 +199,9 @@ def writer():
         path = Path(tmp) / "arch" / "gfx906" / "manifest.toml"
         mw.save(path, text)
         raw = path.read_text(encoding="utf-8")
-        check("writer: comment kept", "int8 decode GEMV" in raw, True)
+        check("writer: comment kept", "measurement manifest" in raw, True)
         check("writer: other site untouched", '"12288x4096@m8"' in raw, True)
-        check("writer: replaced not duplicated", raw.count('"4096x4096@m1" = { impl = "asm"'), 1)
+        check("writer: replaced not duplicated", raw.count("asm = 0.07"), 1)
 
         data = mf.load("gfx906", path=path, runtime=fp)
         check("writer: loads", data is not None, True)
@@ -207,8 +209,9 @@ def writer():
         check("writer: trusted", data.matches(), True)
         check("writer: replaced record wins", data.lookup("int8_gemv.m1", 4096, 4096, 1), "asm")
         check("writer: new record wins", data.lookup("int8_gemv.m1", 8192, 8192, 1), "asm")
-        check("writer: derived still untrusted", data.lookup("w4a8.m1", 4096, 4096, 1), None)
-        check("writer: record count", data.records(), 9)          # 4 w4a8 + 5 int8
+        check("writer: shipped measured record trusted", data.lookup("w4a8.m1", 4096, 4096, 1), "asm")
+        source_records = mf.load("gfx906", path=Path(NODE_DIR) / "arch" / "gfx906" / "manifest.toml").records()
+        check("writer: record count", data.records(), source_records + 1)   # + the new shape
 
         bare = mw.set_arch_identity("schema = 1\n", "gfx906", fp)
         check("writer: arch block created", "[arch]" in bare, True)
