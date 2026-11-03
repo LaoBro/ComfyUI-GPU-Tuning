@@ -43,13 +43,13 @@ class Gfx906ModelSettings(io.ComfyNode):
             description=(
                 "Runtime settings for the gfx906 tuning pack. Values take effect on the next execution, "
                 "no restart needed. Wire it between the model loader and the sampler. Every switch is "
-                "three-state: default keeps the COMFY_GFX906_* startup value, on/off overrides it."
+                "three-state: default keeps the built-in default, on/off overrides it."
             ),
             inputs=[
                 io.Model.Input("model"),
                 io.Combo.Input("attention", options=["default"] + list(ATTENTION_KERNELS) + backend_options(),
                                default="default",
-                               tooltip="default keeps COMFY_GFX906_ATTN. int8 is the fast default; int8qk keeps PV "
+                               tooltip="default keeps the built-in int8 kernel; int8qk keeps PV "
                                        "in fp16 (slower, 4-7x more accurate); gemm is fp16 built from rocBLAS bmm + "
                                        "softmax + bmm, ~1.45x faster than hand at DiT shapes and the fastest fp16 "
                                        "path on gfx906; hand is the fp16 Triton kernel. basic, pytorch, sub_quad, "
@@ -69,19 +69,19 @@ class Gfx906ModelSettings(io.ComfyNode):
                 io.Combo.Input("amax_guard", options=list(TRISTATE), default="default",
                                tooltip="Skip the fp16 cast when the attention input's abs-max would overflow "
                                        "fp16 (>= 60000) and leave it in the model dtype instead. default keeps "
-                                       "COMFY_GFX906_AMAX_GUARD; off casts unconditionally."),
+                                       "the built-in on state; off casts unconditionally."),
                 io.Combo.Input("convrot", options=["default"] + list(CONVROT_MODES), default="default",
-                               tooltip="default keeps COMFY_GFX906_CONVROT. fused = rotation + int8 quantize in "
+                               tooltip="default keeps the built-in mode. fused = rotation + int8 quantize in "
                                        "one kernel, butterfly = rotation only, off = the original matmul."),
                 io.Combo.Input("int8_tile", options=list(TRISTATE), default="default",
                                tooltip="Keep the gfx906 int8 tile (128x256x32, 4 warps, 2 stages) in the "
-                                       "kitchen autotune list. default keeps COMFY_GFX906_INT8_TILE; off "
+                                       "kitchen autotune list. default keeps the injected tiles; off "
                                        "restores the stock list. The m<=8 narrow tile has its own switch."),
                 io.Combo.Input("small_batch", options=list(TRISTATE), default="default",
                                tooltip="gfx906: switch the int8 kernel to the 16x32x64 narrow tile when m<=8 "
                                        "(text decode / MTP verify), and back to 128x256x32 for larger batches. "
                                        "Other AMD: add the narrow tile as an autotune candidate and let that "
-                                       "card decide. default keeps COMFY_GFX906_SMALL_BATCH; needs int8_tile on. "
+                                       "card decide. default keeps the built-in split; needs int8_tile on. "
                                        "GEMV has its own switch."),
                 io.Combo.Input("qkv", options=list(TRISTATE), default="default",
                                tooltip="One int8 GEMM for q/k/v instead of three (Qwen-Image 2.1): -81 ms "
@@ -90,13 +90,13 @@ class Gfx906ModelSettings(io.ComfyNode):
                                        "needed; turning it off also drops the merged copy."),
                 io.Combo.Input("vae", options=list(TRISTATE), default="default",
                                tooltip="Run depth-1 Conv3d as Conv2d in the video VAE. default keeps "
-                                       "COMFY_GFX906_VAE; off restores the shipped conv3d path."),
+                                       "the manifest verdict; off restores the shipped conv3d path."),
                 io.Combo.Input("gemv", options=list(TRISTATE), default="default",
                                tooltip="Single-token int8 decode GEMV for the model's int8 linears. default "
-                                       "keeps COMFY_GFX906_GEMV; off returns every call to the tiled GEMM."),
+                                       "the manifest verdict; off returns every call to the tiled GEMM."),
                 io.Combo.Input("prefix_kv", options=list(TRISTATE), default="default",
                                tooltip="Merge the prefix cache K/V into a reused buffer with copy_ instead of "
-                                       "torch.cat (Qwen-Image 2.1). default keeps COMFY_GFX906_PREFIXKV; off "
+                                       "torch.cat (Qwen-Image 2.1). default keeps it on; off "
                                        "restores the shipped torch.cat path."),
                 io.Combo.Input("profile", options=list(TRISTATE), default="default",
                                tooltip="Print the tuning status once and per-call timings when each prompt finishes."),
@@ -125,33 +125,35 @@ class Gfx906ClipSettings(io.ComfyNode):
             category="advanced/debug",
             description=(
                 "Text-encoder settings for the gfx906 tuning pack. Sits in the CLIP chain, between the "
-                "loader and the text encode; applies to every text encoder in the process. Every switch is "
-                "three-state: default keeps the COMFY_GFX906_* startup value, on/off overrides it."
+                "loader and the text encode; applies to every text encoder in the process. The on/off "
+                "switches are three-state: default keeps the built-in default; text_encoder "
+                "and text_attention use default as an explicit choice instead."
             ),
             inputs=[
                 io.Clip.Input("clip"),
-                io.Combo.Input("text_encoder", options=["auto", "int8", "default"], default="auto",
-                               tooltip="auto keeps COMFY_GFX906_TE. int8 keeps the text-encoder weights "
-                                       "quantized (2.4x faster encode, 1.5x faster token generation, embeddings "
-                                       "shift ~6%); default dequantizes them on every call, including the "
-                                       "lm_head per token."),
-                io.Combo.Input("text_attention", options=["auto", "default"] + backend_options(), default="auto",
-                               tooltip="auto keeps COMFY_GFX906_TE_ATTN. default keeps what core picks for "
+                io.Combo.Input("text_encoder", options=["int8", "default"], default="default",
+                               tooltip="int8 keeps the text-encoder weights quantized with int8 "
+                                       "activations (fastest on 4-bit checkpoints, embeddings shift ~6%); "
+                                       "default keeps fp16 activations and dequantizes in registers on "
+                                       "the fly (best quality, same speed on 8-bit checkpoints)."),
+                io.Combo.Input("text_attention", options=["default"] + backend_options(), default="default",
+                               tooltip="default keeps what core picks for "
                                        "small inputs; the rest route to that backend, no restart needed. The "
                                        "custom int8/hand kernels are not listed: they reject masked calls."),
                 io.Combo.Input("text_gemv", options=list(TRISTATE), default="default",
                                tooltip="Single-row text-encoder GEMV: the direct int8 kernel call and the "
                                        "torch.mv path for the unquantized gate projections. default keeps "
-                                       "COMFY_GFX906_TE_GEMV; off sends both back to the dispatched linear."),
+                                       "the built-in on state; off sends both back to the dispatched linear."),
                 io.Combo.Input("w4a8", options=list(TRISTATE), default="default",
                                tooltip="4-bit packed text-encoder weights: decode rows go to the w4a8 GEMV, "
-                                       "prefill unpacks one layer to int8. default keeps COMFY_GFX906_W4A8; "
+                                       "prefill unpacks one layer to int8. default keeps it on; "
                                        "off dequantizes through the shipped layout. status shows the call count "
                                        "so a swapped checkpoint can be confirmed."),
                 io.Combo.Input("textgen", options=list(TRISTATE), default="default",
                                tooltip="Text-generation patches: DeltaNet decode kernels, folded KV decode, "
                                        "llama RMSNorm/RoPE caching and the Qwen3.5 compute classes. default "
-                                       "keeps COMFY_GFX906_DELTANET/KVDECODE/LLAMA/QWEN35 individually; on/off "
+                                       "the four COMFY_GFX906_DELTANET/KVDECODE/LLAMA/QWEN35 knobs "
+                                       "individually; on/off "
                                        "switches all four together without a reload."),
             ],
             outputs=[io.Clip.Output(display_name="clip")],

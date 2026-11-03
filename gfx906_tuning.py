@@ -53,7 +53,8 @@ FP16_SAFE_AMAX = 60000.0
 CONVROT_GROUP = 256
 # Largest K the fused rotate+quantize kernel keeps in registers (8192 = 32 groups).
 FUSED_MAX_GROUPS = 32
-# COMFY_GFX906_CONVROT: fused (butterfly + quantize in one kernel), butterfly (two passes), off.
+# convrot modes exposed in the node: fused (butterfly + quantize in one kernel),
+# butterfly (two passes), off.
 CONVROT_MODES = ("fused", "butterfly", "off")
 # Own kernels (exposed in the node). "sdpa" also exists as an internal value:
 # the auto-tune fallback when a tile loses to SDPA on an untested card.
@@ -111,38 +112,21 @@ _state = {
     "qkv": False,
     "prefix_kv": False,
     "reason": "",
-    "attn_env": "int8",
-    "smooth_env": True,
-    "fp16_env": True,
-    "contig_env": True,
-    "convrot_env": "fused",
-    "qkv_env": False,
-    "te_env": "int8",
-    "te_attn_env": "default",
-    "profile_env": False,
-    "vae_env": True,
     "vae_enabled": True,
     "vae_patched": False,
-    "gemv_env": "",
     "gemv_module": None,
     "textgen_env": {},
     "textgen_ready": {},
     "textgen_override": None,
-    "prefix_kv_env": True,
     "prefix_kv_enabled": True,
     "prefix_kv_patched": False,
-    "text_gemv_env": True,
     "text_gemv_enabled": True,
     "te_gemv_calls": 0,
     "te_plain_calls": 0,
-    "w4a8_env": True,
     "w4a8_module": None,
     "w4a8_calls": 0,
-    "amax_env": True,
     "amax_guard": True,
-    "int8_tile_env": True,
     "int8_tile_enabled": True,
-    "small_batch_env": True,
     "small_batch_enabled": True,
     "tile_measured": False,
     "native": None,
@@ -162,7 +146,7 @@ def flag_value(value):
     if value is None or isinstance(value, bool):
         return value
     text = str(value).strip().lower()
-    if text in ("default", "auto", ""):
+    if text in ("default", ""):
         return None
     if text in ("on", "1", "true", "yes"):
         return True
@@ -195,26 +179,12 @@ def textgen_summary():
 
 
 def _init_env_settings():
-    """Startup defaults from the environment, read once by apply().
+    """Diagnostics that have no node switch, read once by apply().
 
-    Node switches override these per execution; "default" falls back here, so
-    an unset node parameter never clobbers an env value.
+    Everything a node can set lives in the widget; only the benchmark knobs
+    (per-item textgen pieces), the manifest force list, and the register-
+    dequant gate override stay here.
     """
-    _state["attn_env"] = os.getenv("COMFY_GFX906_ATTN", "int8").strip().lower()
-    _state["smooth_env"] = env_flag("COMFY_GFX906_SMOOTH")
-    _state["fp16_env"] = env_flag("COMFY_GFX906_FP16")
-    _state["contig_env"] = env_flag("COMFY_GFX906_CONTIG")
-    # empty means "whatever the manifest resolves": feature.convrot + convrot.mode
-    convrot = os.getenv("COMFY_GFX906_CONVROT", "").strip().lower()
-    _state["convrot_env"] = convrot if convrot in CONVROT_MODES else ""
-    _state["qkv_env"] = env_flag("COMFY_GFX906_QKV", "0")
-    _state["te_env"] = os.getenv("COMFY_GFX906_TE", "int8").strip().lower()
-    _state["te_attn_env"] = os.getenv("COMFY_GFX906_TE_ATTN", "default").strip().lower()
-    _state["profile_env"] = os.getenv("COMFY_GFX906_PROFILE", "0").lower() in ("1", "on", "true", "yes")
-    # tier-3 features: empty means feature_on() decides from the manifest
-    _state["vae_env"] = os.getenv("COMFY_GFX906_VAE", "").strip().lower()
-    _state["vae_enabled"] = feature_on("vae")
-    _state["gemv_env"] = os.getenv("COMFY_GFX906_GEMV", "").strip().lower()
     _state["textgen_env"] = {
         "deltanet": env_flag("COMFY_GFX906_DELTANET"),
         "kvdecode": env_flag("COMFY_GFX906_KVDECODE"),
@@ -223,18 +193,6 @@ def _init_env_settings():
     }
     _state["textgen_ready"] = {name: False for name in TEXTGEN_ITEMS}
     _state["textgen_override"] = None
-    _state["prefix_kv_env"] = env_flag("COMFY_GFX906_PREFIXKV")
-    _state["prefix_kv_enabled"] = _state["prefix_kv_env"]
-    _state["text_gemv_env"] = env_flag("COMFY_GFX906_TE_GEMV")
-    _state["text_gemv_enabled"] = _state["text_gemv_env"]
-    _state["te_graphs_env"] = env_flag("COMFY_GFX906_TE_GRAPHS", "1")
-    _state["w4a8_env"] = env_flag("COMFY_GFX906_W4A8")
-    _state["amax_env"] = env_flag("COMFY_GFX906_AMAX_GUARD")
-    _state["amax_guard"] = _state["amax_env"]
-    _state["int8_tile_env"] = env_flag("COMFY_GFX906_INT8_TILE")
-    _state["int8_tile_enabled"] = _state["int8_tile_env"]
-    _state["small_batch_env"] = env_flag("COMFY_GFX906_SMALL_BATCH")
-    _state["small_batch_enabled"] = _state["small_batch_env"]
     _state["forced_items"] = {item.strip().lower()
                               for item in os.getenv("COMFY_GFX906_FORCE", "").replace(",", " ").split()
                               if item.strip()}
@@ -297,26 +255,18 @@ def native_covers(op):
 # op works fine would replace a working fused kernel with our slower Triton one,
 # which is exactly the silent slowdown this pack is supposed to avoid.
 def feature_on(item):
-    """The tier-3 gate: COMFY_GFX906_<ITEM> (on/off) > feature.<item> > off.
+    """The tier-3 gate: feature.<item> in the arch manifest, off without data.
 
     A feature whose fastest implementation differs per card has no default
     without data: an unmeasured card keeps the stock path, and one bench run
     turns on whatever won against the real fallback on this card.
     """
-    raw = str(_state.get(item + "_env", "")).strip().lower()
-    if raw in ("1", "on", "true", "yes"):
-        return True
-    if raw in ("0", "off", "false", "no"):
-        return False
     table = measured_table()
     return table is not None and table.default_impl("feature." + item) == "on"
 
 
 def resolved_convrot_mode():
-    """env mode override > the manifest's convrot.mode > "fused"."""
-    raw = _state.get("convrot_env")
-    if raw in ("fused", "butterfly"):
-        return raw
+    """The manifest's convrot.mode > "fused"."""
     table = measured_table()
     mode = table.default_impl("convrot.mode") if table is not None else None
     return mode if mode in CONVROT_MODES else "fused"
@@ -1133,16 +1083,16 @@ def patch_attention():
                      getattr(fallback, "__name__", "?"))
         return False
 
-    kernel = _state.get("attn_env") or "int8"
+    kernel = "int8"
     _state["attn_kernel"] = kernel if kernel in ATTENTION_KERNELS or stock_backend(kernel) is not None else "int8"
     _state["attn_backend_fn"] = stock_backend(_state["attn_kernel"])
-    _state["smooth"] = os.getenv("COMFY_GFX906_SMOOTH", "1").lower() not in ("0", "off", "false", "no")
+    _state["smooth"] = True
     # the tile constants were hand-measured on gfx906; the mode is a quality
-    # choice (rel 2e-2 int8 vs 2.5e-4 hand), so it stays a manual node/env
+    # choice (rel 2e-2 int8 vs 2.5e-4 hand), so it stays a manual node
     # switch instead of a manifest verdict
     _state["attn_tuned"] = set(SUPPORTED_HEAD_DIMS)
-    _state["attn_fp16"] = os.getenv("COMFY_GFX906_FP16", "1").lower() not in ("0", "off", "false", "no")
-    _state["attn_contiguous"] = os.getenv("COMFY_GFX906_CONTIG", "1").lower() not in ("0", "off", "false", "no")
+    _state["attn_fp16"] = True
+    _state["attn_contiguous"] = True
     stats = _state["attn_cast"] = {"fp16": 0, "fp32": 0, "hand": 0, "int8": 0, "int8qk": 0,
                                    "gemm": 0, "sdpa": 0}
 
@@ -1358,40 +1308,35 @@ def configure(attention=None, smooth=None, convrot=None, profile=None, text_enco
               amax_guard=None, int8_tile=None, small_batch=None):
     """Runtime settings, used by the GFX906 nodes.
 
-    Every argument is three-state: None/"default" keeps the startup/env value,
-    True/"on"/"off" is an explicit override. Node parameters therefore win over
-    COMFY_GFX906_*, which win over the built-in defaults.
+    Every argument is three-state: None/"default" keeps the built-in default
+    (the manifest verdict where one exists), other values are explicit
+    overrides. Node parameters therefore always win.
     """
     if attention is not None:
         wanted = str(attention).strip().lower()
-        if wanted in ("default", "auto"):
-            wanted = _state.get("attn_env", "int8")
+        if wanted == "default":
+            wanted = "int8"
         # combo values are untrusted: stale workflows may still carry removed names
         _state["attn_kernel"] = (wanted if wanted in ATTENTION_KERNELS
                                  or stock_backend(wanted) is not None else "int8")
         _state["attn_backend_fn"] = stock_backend(_state["attn_kernel"])
     if contiguous is not None:
-        _state["attn_contiguous"] = resolve_flag(contiguous, _state.get("contig_env", True))
+        _state["attn_contiguous"] = resolve_flag(contiguous, True)
     if smooth is not None:
-        _state["smooth"] = resolve_flag(smooth, _state.get("smooth_env", True))
+        _state["smooth"] = resolve_flag(smooth, True)
     if fp16 is not None:
-        _state["attn_fp16"] = resolve_flag(fp16, _state.get("fp16_env", True))
+        _state["attn_fp16"] = resolve_flag(fp16, True)
     if convrot is not None:
         wanted = str(convrot).strip().lower()
-        if wanted in ("default", "auto"):
+        if wanted == "default":
             wanted = resolved_convrot_mode()
         _state["convrot_mode"] = wanted if wanted in CONVROT_MODES else resolved_convrot_mode()
     if qkv is not None and _state.get("qkv_patched"):
-        _state["qkv"] = resolve_flag(qkv, _state.get("qkv_env", False))
+        _state["qkv"] = resolve_flag(qkv, False)
     if text_encoder is not None and _state["applied"]:
-        wanted = str(text_encoder).strip().lower()
-        if wanted == "auto":
-            wanted = _state.get("te_env", "int8")
-        _state["te_int8"] = wanted == "int8" and _state["te_patched"]
+        _state["te_int8"] = str(text_encoder).strip().lower() == "int8" and _state["te_patched"]
     if text_attention is not None:
         wanted = str(text_attention).strip().lower()
-        if wanted == "auto":
-            wanted = _state.get("te_attn_env", "default")
         # an unknown combo value leaves whatever the previous selection was
         _state["te_attention"] = (wanted if wanted == "default"
                                   or stock_backend(wanted) is not None else "default")
@@ -1407,25 +1352,25 @@ def configure(attention=None, smooth=None, convrot=None, profile=None, text_enco
     if textgen is not None:
         _state["textgen_override"] = flag_value(textgen)
     if prefix_kv is not None:
-        _state["prefix_kv_enabled"] = resolve_flag(prefix_kv, _state.get("prefix_kv_env", True))
+        _state["prefix_kv_enabled"] = resolve_flag(prefix_kv, True)
     if text_gemv is not None:
-        _state["text_gemv_enabled"] = resolve_flag(text_gemv, _state.get("text_gemv_env", True))
+        _state["text_gemv_enabled"] = resolve_flag(text_gemv, True)
     if w4a8 is not None:
         want = flag_value(w4a8)
         if want is None:
-            want = _state.get("w4a8_env", True)
+            want = True
         if want and _state.get("w4a8_module") is None:
             _state["w4a8_module"] = load_w4a8_gemv()
         _state["w4a8"] = _state.get("w4a8_module") if want else None
     if amax_guard is not None:
-        _state["amax_guard"] = resolve_flag(amax_guard, _state.get("amax_env", True))
+        _state["amax_guard"] = resolve_flag(amax_guard, True)
     if int8_tile is not None:
-        want = resolve_flag(int8_tile, _state.get("int8_tile_env", True))
+        want = resolve_flag(int8_tile, True)
         if want != _state.get("int8_tile_enabled"):
             set_int8_tile(want)
         _state["int8_tile_enabled"] = want
     if small_batch is not None:
-        want = resolve_flag(small_batch, _state.get("small_batch_env", True))
+        want = resolve_flag(small_batch, True)
         if want != _state.get("small_batch_enabled"):
             _state["small_batch_enabled"] = want
             set_untuned_tiles()
@@ -1434,7 +1379,7 @@ def configure(attention=None, smooth=None, convrot=None, profile=None, text_enco
     # its first int8 matmul
     _state["triton_backend"] = enable_triton_backend()
     if profile is not None and _state["applied"]:
-        want = resolve_flag(profile, _state.get("profile_env", False))
+        want = resolve_flag(profile, False)
         was = _profiler_enabled()
         _set_profiler(want)
         if want and not was:
@@ -1658,8 +1603,9 @@ def patch_generate_te_default():
     * graph capture stays on for the register-dequant path: there are no
     dequantize kernels to pin (~10.5 GB resident, same as int8), and the
     capture absorbs ~800 eager launches per step (34.6 vs 22.0 it/s on
-    Qwen3.5-9B). COMFY_GFX906_TE_GRAPHS=0 opts out -- with the graph off the
-    decode degrades over long generations (22.0 it/s at 300+ tokens).
+    Qwen3.5-9B). With the stock dequantize-per-call fallback (unmeasured
+    arch, gate off) the graphs are turned off instead, since capture would
+    pin the fp16 copies in private pools (~21 GB) and OOM a 32 GB card.
     """
     import comfy.text_encoders.llama as llama
 
@@ -1671,11 +1617,13 @@ def patch_generate_te_default():
         graphs = None
         if not _state["te_int8"]:
             kwargs.setdefault("execution_dtype", torch.float16)
-            # graphs stay on: the register-dequant path has no dequantize
-            # kernels to pin, so pools stay at int8 size and the capture
-            # absorbs ~800 eager launches per step (34.6 vs 22.0 it/s on
-            # Qwen3.5-9B). COMFY_GFX906_TE_GRAPHS=0 opts out.
-            if not _state.get("te_graphs_env", True):
+            # graphs stay on only while the register-dequant path is active:
+            # it has no dequantize kernels to pin, so pools stay at int8 size
+            # and the capture absorbs ~800 eager launches per step (34.6 vs
+            # 22.0 it/s on Qwen3.5-9B). With the stock dequantize-per-call
+            # fallback (unmeasured arch, gate off) capture would pin the fp16
+            # copies in private pools (~21 GB) and OOM a 32 GB card.
+            if not _te_dequant_enabled():
                 graphs = getattr(self.model, "graph_dynamic_vbar_blocks", None)
                 if graphs:
                     self.model.graph_dynamic_vbar_blocks = False
@@ -1999,7 +1947,7 @@ def apply():
     # inside them is guarded by the manifest fingerprint, not by this gate.
     if on_amd:
         _install("int8 tile", patch_int8_linear, replace=_state["tile_measured"])
-        if _state.get("int8_linear") and not _state.get("int8_tile_env", True):
+        if _state.get("int8_linear") and not _state.get("int8_tile_enabled", True):
             _install("int8 tile reset", restore_int8_defaults)
     # tier-3 features: on only where the manifest says so -- the shipped table
     # for measured archs, or a local bench run. env overrides per value.
@@ -2008,7 +1956,7 @@ def apply():
     if feature_on("vae"):
         _install("vae", patch_vae)
     # opt-in: the fused GEMM is 1.5% faster but holds 1.6 GB of merged weights
-    _state["qkv"] = _state["qkv_env"]
+    _state["qkv"] = False
     _install("qkv", patch_qkv)
     # the TE GEMV is not a kernel replacement: it skips the QuantizedTensor
     # dispatch, which costs the same on every vendor. Needs int8_gemv loaded
@@ -2027,9 +1975,6 @@ def apply():
     # the triton backend again when --enable-triton-backend was not passed
     _state["triton_backend"] = _install("triton backend", enable_triton_backend)
     _state["te_patched"] = te_ready
-    _state["te_int8"] = _state["te_env"] != "default" and te_ready
-    _state["te_attention"] = (_state["te_attn_env"] if _state["te_attn_env"] == "default"
-                              or stock_backend(_state["te_attn_env"]) is not None else "default")
     _state["logits_patched"] = _install("lm_head", patch_logits)
     _install("generate default", patch_generate_te_default)
     _install("encoder attention", patch_te_attention)
@@ -2057,7 +2002,7 @@ def apply():
     # 4-bit weights: register-unpacked GEMV for decode, int8 decode for prefill
     _state["w4a8_module"] = (_install("w4a8 module", load_w4a8_gemv)
                              if install_ready("w4a8") else None)
-    _state["w4a8"] = _state["w4a8_module"] if _state.get("w4a8_env", True) else None
+    _state["w4a8"] = _state["w4a8_module"]
     # the per-block graph hooks live in core on purpose; say so when they are absent
     def _probe_resident():
         import comfy.model_prefetch

@@ -1,13 +1,12 @@
 """Per-call GPU timers for the hot ComfyUI entry points.
 
-Opt-in: COMFY_GFX906_PROFILE=1 or the model node's profile switch. Each
-instrumented call records a CUDA event pair, and the report is printed when a
-prompt finishes; there is no profiler node. Because the model node runs before
-the sampler in a normal graph, its one-shot status covers the next prompt.
+Opt-in via the model node's profile switch. Each instrumented call records a
+CUDA event pair, and the report is printed when a prompt finishes; there is
+no profiler node. Because the model node runs before the sampler in a normal
+graph, its one-shot status covers the next prompt.
 """
 
 import logging
-import os
 import sys
 
 import torch
@@ -35,7 +34,7 @@ _enabled = None
 def enabled():
     if _enabled is not None:
         return _enabled
-    return os.getenv("COMFY_GFX906_PROFILE", "0").lower() in ("1", "on", "true", "yes")
+    return False
 
 
 def set_enabled(flag):
@@ -164,7 +163,7 @@ def patch_prompt_end():
 
 def summary(clock_before=None, clock_after=None):
     if not _installed:
-        return "profiler not installed, start ComfyUI with COMFY_GFX906_PROFILE=1"
+        return "profiler not installed, enable the profile switch on the model settings node"
     if not _records:
         return ""
 

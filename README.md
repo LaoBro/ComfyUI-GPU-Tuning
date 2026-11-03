@@ -38,7 +38,7 @@ KV cache 容量级拷贝、launch 开销，这些在别的卡上一样存在。�
 4. **文本编码器 int8**：权重保持量化（每次调用不再反量化）。
 5. **QKV 三合一**：q/k/v 三个投影合成一次 int8 GEMM（逐行 scale 拼接，bit-exact）。
    只省 1.5%（5.24 s 步里 -81 ms），却常驻 1.6 GB 合并权重，所以**默认关**，
-   Model Settings 节点的 `qkv` 开关或 `COMFY_GFX906_QKV=1` 打开。
+   Model Settings 节点的 `qkv` 开关打开。
 6. **VAE conv3d → conv2d**：图像模型带的视频 VAE 有 76 个 depth=1 的 Conv3d，
    gfx906 没有 conv3d 内核，torch 会降级成 im2col + bmm（占解码时间 47%）。
 7. **lm_head 保持量化**：逐 token 生成时 ComfyUI 的 `BaseGenerate.logits` 会先走
@@ -204,7 +204,7 @@ GPU 37 ms 已经和 CPU 打平，剩下的开销是每步约 7000 个零碎算�
 
 再往下只剩 CUDA graph：它把整步录成一张图，回放一次就是一次提交，理论上限就是 37 ms/token。
 三个已知前置障碍：KV 位置在 python 侧、prefetch 每层一次 CPU→CUDA 拷贝、delta-rule 首个
-decode step 会在 CPU 上开内存。`COMFY_GFX906_GEMV=0` 可关掉 GEMV 与直调做对比。
+decode step 会在 CPU 上开内存。CLIP Settings 节点的 `text_gemv=off` 可关掉 GEMV 与直调做对比。
 
 ## 两个节点
 
@@ -219,7 +219,8 @@ decode step 会在 CPU 上开内存。`COMFY_GFX906_GEMV=0` 可关掉 GEMV 与�
 
 - `default`：沿用该功能的 `COMFY_GFX906_*` 启动值（完全不改变现有默认行为）；
 - `on` / `off`：显式覆盖 env；
-- `text_encoder` / `text_attention` 用 `auto` 表示“跟随 env”，因为这两个参数里的 `default` 已有既定含义。
+- 例外：`text_encoder` / `text_attention` 里的 `default` 是显式选择（fp16 路径 / 核心注意力），
+  不跟随 env。
 
 优先级：**节点显式 on/off > 环境变量 > 内置默认**。以前“节点默认值会覆盖 env”的问题已修掉。
 
@@ -278,56 +279,39 @@ CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`text
 
 ## 开关
 
-环境变量在 `apply()`（进程启动）时读一次，作为**启动默认值**；节点里显式选 `on/off` 时覆盖它，`default/auto` 时回落到它。所以：
+开关都在节点里（GFX906 Model Settings / GFX906 CLIP Settings），`default` 用内置默认值，
+`on/off` 显式覆盖，下一次执行生效，不回落任何环境变量。
 
-**节点显式 on/off > 环境变量 > 内置默认**
-
-`COMFY_GFX906_TUNING` 是唯一无法被节点替代的开关：补丁在节点执行前就已安装，且没有卸载路径；不接节点的用户也靠它关闭整包。`COMFY_GFX906_PROFILE` 保留为无节点/headless 启动时的入口。
+环境变量只剩两类：节点执行前的总闸，以及没有节点入口的诊断/基准旋钮。
 
 | 变量 | 默认 | 作用 |
 |---|---|---|
-| `COMFY_GFX906_TUNING` | `1` | `off` 整包关闭 |
-| `COMFY_GFX906_ATTN` | `int8` | 注意力模式（int8 / int8qk / hand / gemm / sdpa）：内核质量不同（int8 PV rel ~2% vs hand ~0.03%），是手动质量取舍，不进测量门 |
-| `COMFY_GFX906_FP16` | `1` | 注意力输入转 fp16 |
-| `COMFY_GFX906_CONTIG` | `1` | 后端调用前转连续布局 |
-| `COMFY_GFX906_SMOOTH` | `1` | int8qk 的均值中心化 |
-| `COMFY_GFX906_AMAX_GUARD` | `1` | 输入 abs-max ≥ 60000 时跳过 fp16 转换 |
-| `COMFY_GFX906_CONVROT | 空 | `fused` / `butterfly` / `off`；空表示用 manifest 的 `convrot.mode`，且 `feature.convrot` 决定装不装 |
-| `COMFY_GFX906_INT8_TILE` | `1` | 注入 gfx906 的 `128×256×32` int8 tile |
-| `COMFY_GFX906_SMALL_BATCH` | `1` | `m≤8` 切 `16×32×64` 窄 tile（其它 AMD 作为候选） |
+| `COMFY_GFX906_TUNING` | `1` | `off` 整包关闭；补丁在节点执行前安装，这是唯一总闸 |
+| `COMFY_GFX906_FORCE` | 空 | 逗号分隔，在非目标架构上单独放行 `deltanet` / `qwen35` / `w4a8` / `attention`（启动会 WARNING：这些内核不是在当前卡上测的） |
+| `COMFY_GFX906_TE_DEQUANT` | 空 | te=default 的寄存器内反量化门：`on`/`off` 覆盖 manifest 的 `feature.te_dequant`；关闭时 te=default 回到逐调用反量化，并自动关掉 TE 图捕获（反量化副本会被图钉 ~21 GB） |
 | `COMFY_GFX906_TILE_CONFIG` | 空 | 手工实测的大 tile，设置后该卡视为已实测（跳过 autotune）；不设时用 manifest 的 `int8_gemm.tile/large` |
 | `COMFY_GFX906_SMALL_TILE_CONFIG` | 空 | 手工实测的窄 tile，替换候选/强制值 |
-| `COMFY_GFX906_TE` | `int8` | 文本编码器 int8（含生成时的 lm_head） |
-| `COMFY_GFX906_TE_ATTN` | `default` | 文本编码器注意力后端 |
-| `COMFY_GFX906_TE_GEMV` | `1` | TE 单行直调 GEMV + 未量化小投影 `torch.mv` |
-| `COMFY_GFX906_GEMV` | 空 | 模型 int8 linear 的单 token 解码 GEMV；空表示用 manifest 的 `feature.gemv` |
 | `COMFY_GFX906_INT8_GEMV_ASM` | `auto` | int8 解码 GEMV 后端：`auto` 编译探测 / `on` 强制 asm / `off` 强制 int32 tl.sum |
-| `COMFY_GFX906_W4A8` | `1` | 4-bit 权重：单 token 走 GEMV（uniform 或 16 级 codebook），prefill 现解 int8；安装判定见 `feature.w4a8`，`FORCE` 可强开 |
 | `COMFY_GFX906_W4A8_ASM` | `auto` | 4-bit GEMV 后端：`auto` 编译探测 / `on` 强制 asm / `off` 跳过 asm（还有 HIP 扩展时仍用 HIP，见下一行） |
 | `COMFY_GFX906_W4A8_HIP` | `auto` | 节点目录下的 `w4a8_hip` 扩展：`auto` 有就用 / `off` 忽略它，让 `W4A8_ASM` 的 off 真正落到 per-group tl.dot |
 | `COMFY_GFX906_MEASURED` | `1` | 用 `arch/<gcn>/manifest.toml` 的实测记录按形状选后端；`0` 关掉这一层，回到纯探测 |
-| `COMFY_GFX906_FORCE` | 空 | 逗号分隔，在非目标架构上单独放行 `deltanet` / `qwen35` / `w4a8` / `attention`（启动会 WARNING：这些内核不是在当前卡上测的） |
-| `COMFY_GFX906_DELTANET` | `1` | DeltaNet 解码 Triton 内核 |
-| `COMFY_GFX906_KVDECODE` | `1` | 折叠 GQA 的 KV decode |
-| `COMFY_GFX906_LLAMA` | `1` | llama RMSNorm 预计算 + RoPE 频率表 |
-| `COMFY_GFX906_QWEN35` | `1` | Qwen3.5 计算类替换（等价改写，逐方法对过 core） |
-| `COMFY_GFX906_VAE` | 空 | VAE conv3d → conv2d；空表示用 manifest 的 `feature.vae` |
-| `COMFY_GFX906_QKV` | `0` | QKV 三合一（打开需 1.6 GB 常驻） |
-| `COMFY_GFX906_PREFIXKV` | `1` | prefix cache 的 K/V 合并用复用 buffer + `copy_` 代替 `torch.cat` |
-| `COMFY_GFX906_PROFILE` | `0` | 每次 prompt 结束打印耗时分解 |
+| `COMFY_GFX906_DELTANET` | `1` | textgen 分项基准旋钮：DeltaNet 解码 Triton 内核 |
+| `COMFY_GFX906_KVDECODE` | `1` | 同上：折叠 GQA 的 KV decode |
+| `COMFY_GFX906_LLAMA` | `1` | 同上：llama RMSNorm 预计算 + RoPE 频率表 |
+| `COMFY_GFX906_QWEN35` | `1` | 同上：Qwen3.5 计算类替换（等价改写，逐方法对过 core） |
 
 ## 已知边界
 
 - **QKV 三合一额外占 1.6 GB 显存**（50 MB × 32 层）且只快 1.5%，因此默认关；
-  显存富余时再用节点开关（或 `COMFY_GFX906_QKV=1`）打开。
+  显存富余时再用节点开关）打开。
 - **int8 注意力在 D=128/长 K 上不再是首选**（77.7 ms vs gemm 57 ms），只在 D=64 的 SDXL 形状占优。
 - **不要试图用 fp16 模拟 int8 linear**：实测慢 1.16–1.85 倍（形状越大差得越少）。int8 只赢
   1.3–1.8 倍而不是规格上的 2 倍，因为瓶颈是每线程的独立累加链数，不是精度格式；换 fp16 一样
   填不满发射槽，还多占一倍显存。社区对 `torch._int_mm` 的回退补丁是 fp32 精确回退，定位是
   正确性而非性能。
 - **注意力占 37%、int8 linear 占 57%**，两者都已接近该形状的硬件上限；剩余可动空间在 0.5% 量级。
-- 文本编码器 int8 会让 embedding 有约 6% 的偏移，肉眼无差别，但追求完全一致时关掉
-  （`COMFY_GFX906_TE=default` 同时关掉 lm_head 的 int8，回到逐 token 反量化的慢路径）。
+- 文本编码器 int8 会让 embedding 有约 6% 的偏移，肉眼无差别，但追求完全一致时在节点里选
+  `text_encoder=default`（fp16 激活、寄存器内反量化；同时关掉 lm_head 的 int8）。
 - **文本生成已经不是 GPU 受限**（权重常驻时）：decode 的 GPU 只要 37 ms/step，墙钟 56 ms，
   差额是 python 侧的调用开销（201 次 linear + 约 7000 个算子）。换更快的 kernel 没有意义，
   下一步只能是 CUDA graph 或合并算子。默认启动时另有一层动态显存分块把 GPU 抬到 ~135 ms，
