@@ -1,0 +1,44 @@
+# gfx906 (MI50 / MI60 / Radeon VII) measurement manifest.
+#
+# The numbers below are transcribed from PORTING.md, i.e. they were measured by
+# the author on a different machine/ROCm build than the one reading this file.
+# So every record is grade = "derived" and the arch fingerprint is left as
+# "unmeasured": the dispatcher ignores all of it until tools/bench.py --write
+# stamps a real fingerprint here. What the file does today is document the
+# format and give the bench tool a table to merge into.
+#
+# Regenerate with:
+#   python tools/bench.py --site int8_gemv.m1 --site w4a8.m1 --write
+
+schema = 1
+
+[arch]
+gcn = "gfx906"
+fingerprint = "unmeasured"
+capabilities = ["v_dot4_i32_i8", "v_perm_b32"]
+note = "60 CU, wave64; transcribed from PORTING.md, not re-measured here"
+
+# 4-bit weight GEMV, one to eight rows. `ms` keeps every implementation that was
+# timed, so a later run can show what changed instead of a single winner.
+[sites."w4a8.m1"]
+default = "asm"
+default_grade = "derived"
+
+[sites."w4a8.m1".shapes]
+"4096x4096@m1"  = { impl = "asm", ms = { asm = 0.104, triton = 0.263 }, rel = 3e-4, grade = "derived", date = "unknown" }
+"4096x4096@m8"  = { impl = "asm", ms = { asm = 0.175, triton = 0.282 }, rel = 3e-4, grade = "derived", date = "unknown" }
+"12288x4096@m1" = { impl = "asm", ms = { asm = 0.110, triton = 0.775 }, rel = 3e-4, grade = "derived", date = "unknown" }
+"12288x4096@m8" = { impl = "asm", ms = { asm = 0.381, triton = 0.833 }, rel = 3e-4, grade = "derived", date = "unknown" }
+
+# int8 decode GEMV. 4096x4096 is the one shape where the int32 tl.sum kernel
+# beats the dot4 asm (83.3 us against 85.1 us): at that size the GEMV is pure
+# bandwidth and the instruction count no longer matters.
+[sites."int8_gemv.m1"]
+default = "asm"
+default_grade = "derived"
+
+[sites."int8_gemv.m1".shapes]
+"4096x4096@m1"      = { impl = "triton", ms = { asm = 0.0851, triton = 0.0833 }, rel = 0.0, grade = "derived", date = "unknown" }
+"4096x12288@m1"     = { impl = "asm",    ms = { asm = 0.1015, triton = 0.1276 }, rel = 0.0, grade = "derived", date = "unknown" }
+"12288x4096@m1"     = { impl = "asm",    ms = { asm = 0.0930, triton = 0.1179 }, rel = 0.0, grade = "derived", date = "unknown" }
+"152064x4096@m1"    = { impl = "asm",    ms = { asm = 0.823,  triton = 0.924  }, rel = 0.0, grade = "derived", date = "unknown" }

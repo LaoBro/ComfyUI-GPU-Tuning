@@ -234,6 +234,9 @@ def _init_env_settings():
     _state["int8_tile_enabled"] = _state["int8_tile_env"]
     _state["small_batch_env"] = env_flag("COMFY_GFX906_SMALL_BATCH")
     _state["small_batch_enabled"] = _state["small_batch_env"]
+    _state["forced_items"] = {item.strip().lower()
+                              for item in os.getenv("COMFY_GFX906_FORCE", "").replace(",", " ").split()
+                              if item.strip()}
 
 
 def target_archs():
@@ -255,6 +258,36 @@ def is_amd():
 def on_target_arch():
     """True on the architecture the attention kernel was measured on."""
     return arch_name() in target_archs()
+
+
+# The code paths that only exist because of what was measured on a gfx906.
+# Splitting them lets a card opt into one of them without claiming to be a
+# gfx906: installing the DeltaNet replacement on a card whose comfy-kitchen HIP
+# op works fine would replace a working fused kernel with our slower Triton one,
+# which is exactly the silent slowdown this pack is supposed to avoid.
+INSTALL_ITEMS = ("deltanet", "qwen35", "w4a8", "attention")
+
+
+def install_ready(item):
+    """Whether an architecture-specific code path should be installed here.
+
+    Default is `on_target_arch()`: the card is one we have numbers for. The
+    `COMFY_GFX906_FORCE` list opts a single path in on another card, so testing
+    DeltaNet on gfx1100 does not require adding the whole card to ARCHS (which
+    would also swap the int8 tile and the attention kernel for gfx906's).
+    """
+    if _state.get("tuned"):
+        return True
+    return item in _state.get("forced_items", set())
+
+
+def warn_forced_items():
+    """Say that the items being installed here were not measured on this card."""
+    forced = sorted(item for item in _state.get("forced_items", set()) if not _state.get("tuned"))
+    if forced:
+        logging.warning("gfx906: installing %s on %s because of COMFY_GFX906_FORCE; these kernels "
+                        "were measured on %s, expect the untested ones to be slower or wrong",
+                        ", ".join(forced), _state.get("arch"), " ".join(target_archs()))
 
 
 def _triton_available(patch):
@@ -360,6 +393,142 @@ def load_w4a8_gemv():
         return w4a8_gemv
     except ImportError:
         return None
+
+
+def load_manifest():
+    """The measurement-manifest module, or None when the package is incomplete."""
+    try:
+        from .kernels import manifest
+        return manifest
+    except ImportError:
+        pass
+    try:
+        import sys
+
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from kernels import manifest
+        return manifest
+    except ImportError:
+        return None
+
+
+def load_registry():
+    """The kernel-registry module, or None when the package is incomplete."""
+    try:
+        from .kernels import registry
+        return registry
+    except ImportError:
+        pass
+    try:
+        import sys
+
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from kernels import registry
+        return registry
+    except ImportError:
+        return None
+
+
+def _install(label, fn, *args, **kwargs):
+    """Run one patch; a device-level failure is logged and remembered, not fatal.
+
+    A kernel that cannot build on this card must not stop ComfyUI from starting,
+    but it must not vanish either: the label lands in `_state["install_failures"]`
+    and `status()` prints it. Anything that is not a device/build error (a typo,
+    a wrong call) still raises -- swallowing those would turn this pack into a
+    machine for hiding regressions.
+    """
+    registry = load_registry()
+    if registry is None:                       # kernels package missing: run unguarded
+        return fn(*args, **kwargs)
+    result = registry.safe_install(label, fn, *args, **kwargs)
+    if result is registry.FAILED:
+        failures = _state.setdefault("install_failures", [])
+        if label not in failures:
+            failures.append(label)
+        return None
+    return result
+
+
+def measured_table():
+    """The measurement manifest for this arch, or None. Loaded once."""
+    if "manifest_data" not in _state:
+        module = load_manifest()
+        arch = _state.get("arch") or ""
+        _state["manifest_data"] = module.load(arch) if (module is not None and arch) else None
+    return _state["manifest_data"]
+
+
+def measured_state():
+    """How much of the table can be used here: measured / stale / absent / off.
+
+    stale is the one that matters: a file exists and looks authoritative, but it
+    was measured under a different ROCm/Torch/Triton build, so every number in
+    it is being ignored without anyone noticing unless we say so.
+    """
+    if "measured_state" not in _state:
+        if not env_flag("COMFY_GFX906_MEASURED"):
+            _state["measured_state"] = "off"
+        else:
+            data = measured_table()
+            if data is None:
+                _state["measured_state"] = "absent"
+            else:
+                _state["measured_state"] = "measured" if data.matches() else "stale"
+    return _state["measured_state"]
+
+
+def warn_measured_state():
+    """Say out loud when the measured layer is not in use.
+
+    Silence here is the failure mode this is about: a card that quietly runs
+    probes and autotune looks exactly like a card that is using its numbers.
+    """
+    state = measured_state()
+    data = measured_table()
+    arch = _state.get("arch")
+    if state == "measured":
+        return
+    if state == "off":
+        logging.info("gfx906: measured table disabled by COMFY_GFX906_MEASURED, "
+                     "int8 tiles and GEMV backends fall back to autotune/probes")
+    elif state == "stale":
+        logging.warning("gfx906: the measured data for %s was taken under %s but this process runs %s: "
+                        "ignoring it, so int8 tiles go to autotune and the GEMV backends to probes. "
+                        "Re-run tools/bench.py --write to refresh it.",
+                        arch, data.fingerprint if data else "?", data.runtime_fp if data else "?")
+    else:
+        logging.warning("gfx906: no measured data for %s: int8 tiles come from the stock autotune list "
+                        "and the GEMV backends from probes (the first call of each new shape pays the "
+                        "sweep). Run tools/bench.py --write once on this card to fix that.", arch)
+
+
+def manifest_status_line():
+    """One line about arch/<gcn>/manifest.toml, or "" when there is none.
+
+    Loaded once per process: the file is read from disk and its fingerprint
+    compared, which is not something to repeat on every settings refresh.
+    """
+    if not _state.get("arch"):
+        return ""
+    if "manifest_line" not in _state:
+        data = measured_table()
+        line = data.status_line() if data is not None else ""
+        if line and measured_state() == "off":
+            line = line.replace(", in use", ", layer off (COMFY_GFX906_MEASURED)")
+        _state["manifest_line"] = line
+    return _state["manifest_line"]
+
+
+def measured_suffix(module):
+    """How many calls were served from the table, e.g. "measured 12/14"."""
+    registry = getattr(module, "_REGISTRY", None)
+    hits = getattr(registry, "hits", None) or {}
+    measured = hits.get("measured", 0)
+    if not measured:
+        return ""
+    total = measured + hits.get("probe", 0)
+    return f"measured {measured}/{total}"
 
 
 def patch_kv_decode(gate=None):
@@ -673,8 +842,16 @@ def _has_config(configs, ours):
 
 
 def _untuned_tile_configs():
-    """Stock candidates plus the gfx906 tiles, for cards without measured tiles."""
+    """Stock candidates, plus our tiles only on the arch they were measured on.
+
+    Injecting a 128x256x32 / 60-CU tile into an unknown card's autotune list is
+    a bet that it even compiles there: LDS and register budgets differ across
+    gcn targets. An unmeasured card gets the stock search, which is a fair one;
+    a card that wants our tile says so with COMFY_GFX906_TILE_CONFIG.
+    """
     configs = list(_state.get("default_int8_configs") or [])
+    if not on_target_arch():
+        return configs
     cards = [_triton_config()]
     if _state.get("small_batch_enabled", True):
         cards.append(_small_tile_config())
@@ -1724,65 +1901,74 @@ def apply():
     _state["tuned"] = tuned
     # a hand-measured tile spec is enough to skip autotune on this card
     _state["tile_measured"] = tuned or _tile_spec("COMFY_GFX906_TILE_CONFIG") is not None
-    patch_int8_linear(replace=_state["tile_measured"])
+    # before anything is patched: a card running without its numbers says so in
+    # the boot log, instead of looking identical to one that has them
+    warn_measured_state()
+    warn_forced_items()
+    _install("int8 tile", patch_int8_linear, replace=_state["tile_measured"])
     if _state.get("int8_linear") and not _state.get("int8_tile_env", True):
-        restore_int8_defaults()
-    patch_convrot()
-    patch_vae()
+        _install("int8 tile reset", restore_int8_defaults)
+    _install("convrot", patch_convrot)
+    _install("vae", patch_vae)
     # opt-in: the fused GEMM is 1.5% faster but holds 1.6 GB of merged weights
     _state["qkv"] = _state["qkv_env"]
-    patch_qkv()
-    patch_prefix_kv()
-    patch_linear8()
+    _install("qkv", patch_qkv)
+    _install("prefix kv", patch_prefix_kv)
+    _install("linear8", patch_linear8)
     # before any prompt runs: the queue thread binds execute_async when a prompt
     # starts, so a hook installed later would only report from the next one
-    _patch_prompt_end()
-    te_ready = patch_text_encoder()
+    _install("prompt hook", _patch_prompt_end)
+    te_ready = _install("text encoder", patch_text_encoder)
     # last: importing comfy.ops above pulls in comfy.quant_ops, which disables
     # the triton backend again when --enable-triton-backend was not passed
-    _state["triton_backend"] = enable_triton_backend()
+    _state["triton_backend"] = _install("triton backend", enable_triton_backend)
     _state["te_patched"] = te_ready
     _state["te_int8"] = _state["te_env"] != "default" and te_ready
     _state["te_attention"] = (_state["te_attn_env"] if _state["te_attn_env"] == "default"
                               or stock_backend(_state["te_attn_env"]) is not None else "default")
-    _state["logits_patched"] = patch_logits()
-    patch_te_attention()
+    _state["logits_patched"] = _install("lm_head", patch_logits)
+    _install("encoder attention", patch_te_attention)
     # text-generation group: installed once with a live gate, so the CLIP node
     # can turn it off without a reload. Modules are loaded on the measured arch
     # even when the env default is off, otherwise the node could not turn them on.
-    if tuned:
-        deltanet_kernels = load_deltanet()
+    if install_ready("deltanet"):
+        deltanet_kernels = _install("deltanet loader", load_deltanet)
         if deltanet_kernels:
             _state["textgen_ready"]["deltanet"] = bool(
-                deltanet_kernels.install(lambda: textgen_active("deltanet")))
+                _install("deltanet", deltanet_kernels.install, lambda: textgen_active("deltanet")))
     _state["textgen_ready"]["kvdecode"] = bool(
-        patch_kv_decode(lambda: textgen_active("kvdecode")))
-    llama_patches = load_llama_patches()
+        _install("kv decode", patch_kv_decode, lambda: textgen_active("kvdecode")))
+    llama_patches = _install("llama loader", load_llama_patches)
     if llama_patches:
         _state["textgen_ready"]["llama"] = bool(
-            llama_patches.install(lambda: textgen_active("llama")))
-    if tuned:
-        qwen35_model = load_qwen35_model()
+            _install("llama", llama_patches.install, lambda: textgen_active("llama")))
+    if install_ready("qwen35"):
+        qwen35_model = _install("qwen35 loader", load_qwen35_model)
         if qwen35_model:
             # the freqs table belongs to the llama item, not the qwen35 class swap
             _state["textgen_ready"]["qwen35"] = bool(
-                qwen35_model.install(lambda: textgen_active("qwen35"),
-                                     lambda: textgen_active("llama")))
+                _install("qwen35", qwen35_model.install, lambda: textgen_active("qwen35"),
+                         lambda: textgen_active("llama")))
     # 4-bit weights: register-unpacked GEMV for decode, int8 decode for prefill
-    _state["w4a8_module"] = load_w4a8_gemv() if tuned else None
+    _state["w4a8_module"] = (_install("w4a8 module", load_w4a8_gemv)
+                             if install_ready("w4a8") else None)
     _state["w4a8"] = _state["w4a8_module"] if _state.get("w4a8_env", True) else None
     # the per-block graph hooks live in core on purpose; say so when they are absent
-    import comfy.model_prefetch
-    _state["resident_graph_patch"] = hasattr(comfy.model_prefetch, "RESIDENT_GRAPH_MODULES")
+    def _probe_resident():
+        import comfy.model_prefetch
+
+        return hasattr(comfy.model_prefetch, "RESIDENT_GRAPH_MODULES")
+
+    _state["resident_graph_patch"] = bool(_install("resident graph probe", _probe_resident))
     if tuned and not _state["resident_graph_patch"]:
         logging.info("gfx906: resident graph hooks absent, decode runs without per-block CUDA graphs "
                      "(see custom_nodes/ComfyUI-gfx906-Tuning/core-patches/README.md)")
-    if tuned:
-        patch_attention()
+    if install_ready("attention"):
+        _install("attention", patch_attention)
     else:
         logging.info("gfx906: %s has no measured attention tiles; the first attention call will "
                      "benchmark the candidates against SDPA and keep the faster", _state["arch"])
-        patch_attention(auto_tune=True)
+        _install("attention (autotune)", patch_attention, auto_tune=True)
     logging.info(
         "gfx906 tuning active: int8 linear %s%s, convrot %s, vae %s, qkv %s, attention %s%s%s%s, "
         "text encoder %s + lm_head, encoder attention %s, textgen %s",
@@ -1861,7 +2047,11 @@ def status():
     gemv_loaded = _state.get("gemv_module") is not None
     if _state.get("gemv"):
         gemv_backend = getattr(_state.get("gemv_module"), "backend_name", None)
-        gemv_line = "gemv on" + (f" (backend={gemv_backend()})" if gemv_backend is not None else "")
+        parts = [f"backend={gemv_backend()}"] if gemv_backend is not None else []
+        suffix = measured_suffix(_state.get("gemv_module"))
+        if suffix:
+            parts.append(suffix)
+        gemv_line = "gemv on" + (f" ({', '.join(parts)})" if parts else "")
     else:
         gemv_line = "gemv off (installed)" if gemv_loaded else "gemv n/a"
     if _state.get("text_gemv_enabled", True):
@@ -1875,10 +2065,12 @@ def status():
         calls = _state.get("w4a8_calls", 0)
         backend = getattr(_state["w4a8"], "backend_name", None)
         backend_name = backend() if backend is not None else "?"
+        measured = measured_suffix(_state["w4a8"])
         if not _state.get("te_int8"):
             w4a8_line = f"w4a8 on: backend={backend_name} (needs text encoder int8)"
         else:
             w4a8_line = (f"w4a8 on: {calls} calls, backend={backend_name}"
+                         + (f", {measured}" if measured else "")
                          + (" (no 4-bit weights seen yet)" if not calls else ""))
     elif w4a8_loaded:
         w4a8_line = "w4a8 off (installed)"
@@ -1911,6 +2103,9 @@ def status():
         + f", encoder attention {_state['te_attention']}",
         f"resident graph hooks {'present' if _state.get('resident_graph_patch') else 'absent'}",
     ]
+    manifest_line = manifest_status_line()
+    if manifest_line:
+        lines.insert(1, manifest_line)
     if _state["int8_linear"] and _state.get("int8_tile_enabled", True):
         if _state.get("tile_measured"):
             suffix = "env tile" if _tile_spec("COMFY_GFX906_TILE_CONFIG") is not None else "forced"
@@ -1924,6 +2119,12 @@ def status():
         lines.append(f"attention calls: fp16-ok {cast['fp16']}, amax overflow {cast['fp32']}"
                      f" (own kernel: hand {cast['hand']}, int8 {cast['int8']}, int8qk {cast['int8qk']},"
                      f" gemm {cast['gemm']}, sdpa {cast['sdpa']})")
+    failures = _state.get("install_failures") or []
+    if failures:
+        lines.append(f"patches skipped on this device: {', '.join(failures)} (see the boot log)")
     if _state["reason"]:
         lines.append(_state["reason"])
+    forced = sorted(_state.get("forced_items") or ())
+    if forced and not _state.get("tuned"):
+        lines.append(f"forced on an unmeasured arch: {', '.join(forced)} (COMFY_GFX906_FORCE)")
     return "\n".join(lines)

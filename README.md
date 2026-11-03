@@ -297,7 +297,10 @@ CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`text
 | `COMFY_GFX906_GEMV` | `1` | 模型 int8 linear 的单 token 解码 GEMV |
 | `COMFY_GFX906_INT8_GEMV_ASM` | `auto` | int8 解码 GEMV 后端：`auto` 编译探测 / `on` 强制 asm / `off` 强制 int32 tl.sum |
 | `COMFY_GFX906_W4A8` | `1` | 4-bit 权重：单 token 走 GEMV，prefill 现解 int8（仅无 codebook 的 uniform 权重） |
-| `COMFY_GFX906_W4A8_ASM` | `auto` | 4-bit GEMV 后端：`auto` 编译探测 / `on` 强制 asm / `off` 强制 per-group tl.dot |
+| `COMFY_GFX906_W4A8_ASM` | `auto` | 4-bit GEMV 后端：`auto` 编译探测 / `on` 强制 asm / `off` 跳过 asm（还有 HIP 扩展时仍用 HIP，见下一行） |
+| `COMFY_GFX906_W4A8_HIP` | `auto` | 节点目录下的 `w4a8_hip` 扩展：`auto` 有就用 / `off` 忽略它，让 `W4A8_ASM` 的 off 真正落到 per-group tl.dot |
+| `COMFY_GFX906_MEASURED` | `1` | 用 `arch/<gcn>/manifest.toml` 的实测记录按形状选后端；`0` 关掉这一层，回到纯探测 |
+| `COMFY_GFX906_FORCE` | 空 | 逗号分隔，在非目标架构上单独放行 `deltanet` / `qwen35` / `w4a8` / `attention`（启动会 WARNING：这些内核不是在当前卡上测的） |
 | `COMFY_GFX906_DELTANET` | `1` | DeltaNet 解码 Triton 内核 |
 | `COMFY_GFX906_KVDECODE` | `1` | 折叠 GQA 的 KV decode |
 | `COMFY_GFX906_LLAMA` | `1` | llama RMSNorm 预计算 + RoPE 频率表 |
