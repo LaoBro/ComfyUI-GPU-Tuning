@@ -136,6 +136,10 @@ def gated_delta_decode_fused(mixed_qkv, x, w_a, w_b, dt_bias, g_decay, state,
     x = x.contiguous()
     w_a = w_a.float()
     w_b = w_b.float()
+    # scalar-gate inputs arrive in the execution dtype (fp16 when the TE runs it)
+    dt_bias = dt_bias.float()
+    g_decay = g_decay.float()
+    z = z.float()
 
     beta = torch.empty((batch, seq, heads), dtype=torch.float32, device=state.device)
     g = torch.empty_like(beta)

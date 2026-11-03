@@ -71,3 +71,7 @@ default_grade = "measured"
 [sites."feature.convrot"]
 default = "on"
 default_grade = "measured"
+
+[sites."feature.te_dequant"]
+default = "on"
+default_grade = "measured"

@@ -227,6 +227,7 @@ def _init_env_settings():
     _state["prefix_kv_enabled"] = _state["prefix_kv_env"]
     _state["text_gemv_env"] = env_flag("COMFY_GFX906_TE_GEMV")
     _state["text_gemv_enabled"] = _state["text_gemv_env"]
+    _state["te_graphs_env"] = env_flag("COMFY_GFX906_TE_GRAPHS", "0")
     _state["w4a8_env"] = env_flag("COMFY_GFX906_W4A8")
     _state["amax_env"] = env_flag("COMFY_GFX906_AMAX_GUARD")
     _state["amax_guard"] = _state["amax_env"]
@@ -237,6 +238,7 @@ def _init_env_settings():
     _state["forced_items"] = {item.strip().lower()
                               for item in os.getenv("COMFY_GFX906_FORCE", "").replace(",", " ").split()
                               if item.strip()}
+    _state["te_dequant_env"] = os.getenv("COMFY_GFX906_TE_DEQUANT", "").strip().lower()
 
 
 def arch_name():
@@ -1460,6 +1462,93 @@ def _te_linear_ready(module, x):
     )
 
 
+def _te_dequant_enabled():
+    """Per-arch enablement for the register-dequantizing decode GEMV.
+
+    COMFY_GFX906_TE_DEQUANT (on/off) and COMFY_GFX906_FORCE=te_dequant outrank
+    the manifest; everything else needs [sites."feature.te_dequant"] default
+    = "on" in the arch table (a tools/bench.py run records it). No data means
+    off -- the stock dequantize-per-call path is the default, exactly like the
+    other tier-3 features.
+    """
+    if "te_dequant" in _state.get("forced_items", set()):
+        return True
+    raw = str(_state.get("te_dequant_env", "")).strip().lower()
+    if raw in ("1", "on", "true", "yes"):
+        return True
+    if raw in ("0", "off", "false", "no"):
+        return False
+    table = measured_table()
+    return table is not None and table.default_impl("feature.te_dequant") == "on"
+
+
+def _te_default_ready(module, x):
+    """True when the quantized weight can feed the register-dequantizing decode GEMV."""
+    if not _te_dequant_enabled():
+        return False
+    from comfy_kitchen.tensor import QuantizedTensor
+
+    weight = module.weight
+    return (
+        x.is_cuda
+        and 1 <= x.reshape(-1, x.shape[-1]).shape[0] <= 8
+        and isinstance(weight, QuantizedTensor)
+        and weight._layout_cls in ("TensorWiseINT8Layout", "AsymW4A8Int8Layout")
+        and not getattr(weight._params, "transposed", False)
+        and weight.device == x.device
+        and (module.bias is None or module.bias.device == x.device)
+        and not module.weight_function
+        and not module.bias_function
+    )
+
+
+def te_default_gemv(module, x):
+    """Register-dequantizing GEMV for the te=default decode path.
+
+    Reads the quantized weight directly and converts in registers with fp32
+    accumulation, so no fp16 copy of the model is kept in memory and no
+    per-call dequantize runs. Dispatches on the layout: TensorWiseINT8 goes to
+    int8_gemv.linear_dequant, AsymW4A8Int8 to w4a8_gemv.linear_dequant (W4A16:
+    fp16 activations, no activation quant). Single-row up to MTP/spec-verify
+    row counts; prefill and anything the kernels refuse fall through to the
+    stock dequantize-per-call path.
+    """
+    from comfy_kitchen.tensor.w4a8_int8 import AsymW4A8Int8Layout
+
+    weight = module.weight
+    rows = x.reshape(-1, x.shape[-1])
+    params = weight._params
+    if weight._layout_cls == "TensorWiseINT8Layout":
+        from comfy_kitchen.tensor import TensorWiseINT8Layout
+
+        mod = _state.get("gemv_module")
+        if mod is None:
+            mod = load_int8_gemv()
+            if mod is None:
+                return None
+            _state["gemv_module"] = mod
+        qdata, scale = TensorWiseINT8Layout.get_plain_tensors(weight)
+        groupsize = getattr(params, "convrot_groupsize", 256) if getattr(params, "convrot", False) else 0
+        out = mod.linear_dequant(rows, qdata, scale, module.bias, x.dtype, groupsize)
+    elif weight._layout_cls == "AsymW4A8Int8Layout":
+        mod = _state.get("w4a8_module")
+        if mod is None:
+            mod = load_w4a8_gemv()
+            if mod is None:
+                return None
+            _state["w4a8_module"] = mod
+        qdata, s_rel, s_channel, correction, codebook = AsymW4A8Int8Layout.get_plain_tensors(weight)
+        if correction is not None or qdata.shape[1] * 2 != rows.shape[1]:
+            return None
+        out = mod.linear_dequant(rows, qdata, s_rel, s_channel, module.bias, x.dtype,
+                                 params.group_size, params.convrot_groupsize, codebook)
+    else:
+        return None
+    if out is None:
+        return None
+    return out.view(*x.shape[:-1], out.shape[-1])
+
+
 def patch_text_encoder():
     """Keep int8 text-encoder weights quantized instead of dequantizing per call.
 
@@ -1503,6 +1592,10 @@ def patch_text_encoder():
                 if out is not None:
                     return out
                 return _same_dtype(torch.nn.functional.linear(input, self.weight, self.bias), input)
+            if _te_default_ready(self, input):
+                out = te_default_gemv(self, input)
+                if out is not None:
+                    return _same_dtype(out, input)
             out = te_plain_gemv(self, input, compute_dtype, want_requant, weight_only_quant)
             if out is not None:
                 return out
@@ -1535,17 +1628,72 @@ def patch_logits():
         return True
 
     def logits(self, x):
+        last = x[:, -1:]
+        module = self.model.lm_head if hasattr(self.model, "lm_head") else self.model.embed_tokens
+        weight = module.weight
         if _state["te_int8"]:
-            last = x[:, -1:]
-            module = self.model.lm_head if hasattr(self.model, "lm_head") else self.model.embed_tokens
-            weight = module.weight
             if (isinstance(weight, QuantizedTensor) and weight.device == last.device
                     and not module.weight_function and not module.bias_function):
                 return torch.nn.functional.linear(last, weight, None)
+        else:
+            if _te_default_ready(module, last):
+                out = te_default_gemv(module, last)
+                if out is not None:
+                    return out
         return original(self, x)
 
     logits._gfx906_logits = True
     llama.BaseGenerate.logits = logits
+    return True
+
+
+def patch_generate_te_default():
+    """Bracket a generate() call with the te=default execution fixes.
+
+    Two live changes while the call runs, both restored on exit:
+
+    * execution_dtype fp16: llama.py's should_use_bf16() fallback pins the TE
+    to fp32 on gfx906; fp16 is the card's fast path and matches the register-
+    dequantizing decode GEMV, so no per-call weight cast remains.
+    * graph_dynamic_vbar_blocks off: graph replay re-runs the dequantize
+    kernels every step, so graphs give te=default no speed -- they only pin
+    the fp16 copies in private pools (~21 GB on Qwen3.5-9B), which OOMs a
+    32 GB card. The decode runs eager instead.
+    """
+    import comfy.text_encoders.llama as llama
+
+    original = llama.BaseGenerate.generate
+    if getattr(original, "_gfx906_gen_te_default", False):
+        return True
+
+    def generate(self, *args, **kwargs):
+        graphs = None
+        if not _state["te_int8"]:
+            kwargs.setdefault("execution_dtype", torch.float16)
+            # graphs stay off unless explicitly re-tested: with the dequant-per-
+            # call fallback they pin fp16 copies in private pools, and the
+            # register-dequant path has not shown a pool problem yet but the
+            # win is unproven too (COMFY_GFX906_TE_GRAPHS=1)
+            if not _state.get("te_graphs_env", False):
+                graphs = getattr(self.model, "graph_dynamic_vbar_blocks", None)
+                if graphs:
+                    self.model.graph_dynamic_vbar_blocks = False
+        try:
+            return original(self, *args, **kwargs)
+        finally:
+            if graphs:
+                self.model.graph_dynamic_vbar_blocks = graphs
+
+    generate._gfx906_gen_te_default = True
+    llama.BaseGenerate.generate = generate
+    return True
+
+    generate._gfx906_gen_cache = True
+    llama.BaseGenerate.generate = generate
+    return True
+
+    generate._gfx906_gen_cache = True
+    llama.BaseGenerate.generate = generate
     return True
 
 
@@ -1890,6 +2038,7 @@ def apply():
     _state["te_attention"] = (_state["te_attn_env"] if _state["te_attn_env"] == "default"
                               or stock_backend(_state["te_attn_env"]) is not None else "default")
     _state["logits_patched"] = _install("lm_head", patch_logits)
+    _install("generate default", patch_generate_te_default)
     _install("encoder attention", patch_te_attention)
     # text-generation group: installed once with a live gate, so the CLIP node
     # can turn it off without a reload. Modules are loaded on the measured arch

@@ -308,6 +308,95 @@ def codebook_words(codebook):
         words.append(v - (1 << 32) if v >= (1 << 31) else v)
     return torch.tensor(words, dtype=torch.int32, device=codebook.device), 1.0 / scale
 
+@triton.jit
+def dequant_w4a16_kernel(a_ptr, b_ptr, c_ptr, srel_ptr, sch_ptr, bias_ptr, lut_ptr,
+                         n, k, m, stride_bw, stride_bs,
+                         BN: tl.constexpr, BK: tl.constexpr, M: tl.constexpr,
+                         GS: tl.constexpr, BSCALE_VEC: tl.constexpr,
+                         HAS_BIAS: tl.constexpr, HAS_LUT: tl.constexpr):
+    # out[m, n] = s_ch[n] * sum_g s_rel[n, g] * sum_{k in g} w[n, k] * x[m, k]
+    # w 的 nibble 在寄存器里解包到 k 序并转 fp32;fp8 s_rel 位操作软解码
+    pid = tl.program_id(0)
+    offs_n = pid * BN + tl.arange(0, BN)
+    mask_n = offs_n < n
+    offs_m = tl.arange(0, M)
+    mask_m = offs_m < m
+    t = tl.arange(0, 8)
+    shift = (8 * (t // 2) + 4 * (t % 2))[None, None, :]
+    NGPC: tl.constexpr = BK // GS
+    acc = tl.zeros((M, BN), dtype=tl.float32)
+    for kk in range(0, k, BK):
+        w = tl.load(b_ptr + offs_n[:, None] * stride_bw + kk // 8 + tl.arange(0, BK // 8)[None, :],
+                    mask=mask_n[:, None], other=0)
+        c = ((w[:, :, None] >> shift) & 0xF).to(tl.int32)
+        c = tl.reshape(c, (BN, NGPC, GS))
+        grp = kk // GS + tl.arange(0, NGPC)
+        u8 = tl.load(srel_ptr + offs_n[:, None] * stride_bs + grp[None, :],
+                     mask=mask_n[:, None], other=0).to(tl.int32)
+        exp = (u8 >> 3) & 0xF
+        man = (u8 & 7).to(tl.float32) * 0.125
+        sg = tl.where(exp > 0, tl.exp2((exp - 7).to(tl.float32)) * (1.0 + man),
+                      man * tl.exp2(-6.0))
+        if HAS_LUT:
+            dv = tl.load(lut_ptr + c)
+        else:
+            dv = (c - 8).to(tl.float32)
+        dv = dv * sg[:, :, None]
+        for mi in tl.static_range(M):
+            a = tl.load(a_ptr + mi * k + kk + tl.arange(0, BK),
+                        mask=(mi < m), other=0.0).to(tl.float32)
+            a3 = tl.reshape(a, (NGPC, GS))
+            part = tl.sum(dv * a3[None, :, :], axis=2)
+            acc += tl.where((offs_m == mi)[:, None], tl.sum(part, axis=1)[None, :], 0.0)
+    if BSCALE_VEC:
+        s_ch = tl.load(sch_ptr + offs_n, mask=mask_n, other=0.0)
+    else:
+        s_ch = tl.load(sch_ptr)
+    acc = acc * s_ch[None, :]
+    if HAS_BIAS:
+        acc += tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)[None, :]
+    tl.store(c_ptr + offs_m[:, None] * n + offs_n[None, :], acc.to(c_ptr.dtype.element_ty),
+             mask=mask_m[:, None] & mask_n[None, :])
+
+
+def linear_dequant(x, qdata, s_rel, s_channel, bias, out_dtype, group_size,
+                   convrot_groupsize, codebook):
+    """C = x @ dequant(weight).T for up to 8 rows: int4 weights dequantized in
+    registers, fp32 accumulate, fp16/fp32 activations (no activation quant).
+
+    The te=default path for w4a8 checkpoints -- the W4A16 counterpart of
+    int8_gemv.linear_dequant. Both encodings resolve in-kernel: the uniform
+    grid as (nibble - 8) * s_rel, a codebook as one gather into the 16 float
+    levels per nibble. fp8 s_rel decodes via bit manipulation (gfx906 has no
+    fp8 ALU). Returns None for shapes it does not cover.
+    """
+    n, half = qdata.shape
+    m, k = x.shape
+    if (m > MAX_M or k % group_size or group_size < 4
+            or (16 % group_size != 0 and group_size % 16 != 0)
+            or half * 2 != k
+            or half % 4
+            or qdata.stride(0) != half or not qdata.is_contiguous()
+            or s_rel.stride(0) != s_rel.shape[1]
+            or s_channel.numel() != n or s_channel.dtype != torch.float32
+            or s_rel.dtype != torch.float8_e4m3fn):
+        return None
+    if convrot_groupsize:
+        xr, _, _ = int8_gemv.rotate(x.float(), convrot_groupsize)
+    else:
+        xr = x.float()
+    rows = _row_block(m)
+    bk = min(4 * group_size, 256)
+    lut = codebook.float().reshape(-1).contiguous() if codebook is not None else xr
+    out = torch.empty((m, n), device=x.device, dtype=out_dtype)
+    dequant_w4a16_kernel[(triton.cdiv(n, BN),)](
+        xr, qdata.view(torch.int32), out, s_rel.view(torch.uint8), s_channel,
+        bias if bias is not None else xr, lut,
+        n, k, m, qdata.view(torch.int32).stride(0), s_rel.stride(0),
+        BN=BN, BK=bk, M=rows, GS=group_size,
+        BSCALE_VEC=s_channel.numel() > 1, HAS_BIAS=bias is not None,
+        HAS_LUT=codebook is not None, num_warps=WARPS, num_stages=STAGES)
+    return out
 
 def _linear_asm(x, qdata, s_rel, s_channel, bias, out_dtype, group_size, convrot_groupsize,
                 levels=None, inv_level=1.0):

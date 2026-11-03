@@ -160,6 +160,75 @@ def asm_kernel(a_ptr, b_ptr, c_ptr, gmax_ptr, b_scale_ptr, bias_ptr,
     tl.store(c_ptr + offs_n, out.to(c_ptr.dtype.element_ty), mask=mask_n)
 
 
+
+def _row_block(rows):
+    """Next power of two up to 8, the only width tl.arange accepts."""
+    return 1 if rows <= 1 else 2 if rows <= 2 else 4 if rows <= 4 else 8
+
+
+@triton.jit
+def dequant_gemv_kernel(a_ptr, b_ptr, c_ptr, b_scale_ptr, n, k, m, stride_bn,
+                        BN: tl.constexpr, BK: tl.constexpr, M: tl.constexpr,
+                        BSCALE_VEC: tl.constexpr, HAS_BIAS: tl.constexpr):
+    # out[m, n] = scale[n] * sum_k rot_x[m, k] * q[n,k];q 在寄存器里转 fp32,
+    # fp32 累加;每个 K 块的权重读取由 M 行摊薄
+    pid = tl.program_id(0)
+    offs_n = pid * BN + tl.arange(0, BN)
+    mask_n = offs_n < n
+    offs_m = tl.arange(0, M)
+    mask_m = offs_m < m
+    acc = tl.zeros((M, BN), dtype=tl.float32)
+    for kk in range(0, k, BK):
+        offs_k = kk + tl.arange(0, BK)
+        mask_k = offs_k < k
+        b = tl.load(b_ptr + offs_n[:, None] * stride_bn + offs_k[None, :],
+                    mask=mask_k[None, :] & mask_n[:, None], other=0).to(tl.float32)
+        for mi in tl.static_range(M):
+            a = tl.load(a_ptr + mi * k + offs_k, mask=mask_k & (mi < m), other=0.0)
+            part = tl.sum(b * a[None, :], axis=1)
+            acc += tl.where((offs_m == mi)[:, None], part[None, :], 0.0)
+    if BSCALE_VEC:
+        b_scale = tl.load(b_scale_ptr + offs_n, mask=mask_n, other=0.0)
+    else:
+        b_scale = tl.load(b_scale_ptr)
+    acc = acc * b_scale[None, :]
+    if HAS_BIAS:
+        acc += tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)[None, :]
+    tl.store(c_ptr + offs_m[:, None] * n + offs_n[None, :], acc.to(c_ptr.dtype.element_ty),
+             mask=mask_m[:, None] & mask_n[None, :])
+
+
+def linear_dequant(x, weight, weight_scale, bias, out_dtype, groupsize):
+    """C = x @ dequant(weight).T for up to 8 rows, fp32 accumulate, no act quant.
+
+    The te=default decode path: reads the int8 weight directly and dequantizes
+    in registers, so no fp16 copy of the model is ever materialized and no
+    per-call dequantize runs. The activation is rotated with the checkpoint's
+    convrot H first, upcast to fp32 so the fp16 execution path still rotates in
+    fp32. Covers the MTP/spec-verify row counts (m <= 8, padded to a power of
+    two); larger M belongs to a GEMM, which would re-read the weight per chunk.
+    Returns None for shapes it does not cover; the caller keeps its dispatch
+    fallback.
+    """
+    m, k = x.shape
+    if m > 8 or not weight.is_contiguous():
+        return None
+    n = weight.shape[0]
+    if groupsize:
+        xr, _, _ = rotate(x.float(), groupsize)
+    else:
+        xr = x.float()
+    rows = _row_block(m)
+    bk = 2048 if rows == 1 else 1024 if rows <= 4 else 512
+    out = torch.empty((m, n), device=x.device, dtype=out_dtype)
+    b_scale = weight_scale.reshape(-1)
+    dequant_gemv_kernel[(triton.cdiv(n, BLOCK_N),)](
+        xr, weight, out, b_scale, n, k, m, weight.stride(0),
+        BN=BLOCK_N, BK=bk, M=rows, BSCALE_VEC=b_scale.numel() > 1,
+        HAS_BIAS=bias is not None, num_warps=WARPS, num_stages=STAGES)
+    return out
+
+
 @triton.jit
 def _probe_dot4(a, b, c):
     x = tl.load(a + tl.arange(0, 1))
