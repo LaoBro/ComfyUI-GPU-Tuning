@@ -56,9 +56,6 @@ DECODE_WARPS = 4
 CB_BLOCK_K = 1024
 
 _hip = None
-_hip_checked = False
-_asm_ok = None
-_backend = None
 
 
 def _block_k(m):
@@ -224,12 +221,20 @@ def _probe_dot4(a, b, c):
     tl.store(c + tl.arange(0, 1), _dot4_asm(x, y))
 
 
+try:
+    from .kernels import registry as kreg
+except ImportError:                                   # imported as a top-level module
+    import sys
+
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from kernels import registry as kreg
+
+
 def _load_hip():
     """Optional pure-HIP extension next to this file."""
-    global _hip, _hip_checked
-    if _hip_checked:
+    global _hip
+    if _hip is not None:
         return _hip
-    _hip_checked = True
     try:
         from . import w4a8_hip as hip
     except ImportError:
@@ -243,41 +248,40 @@ def _load_hip():
     return hip
 
 
-def _asm_supported():
+def _probe_asm():
     """Whether the v_dot4 inline asm compiles on this device."""
-    global _asm_ok
-    if _asm_ok is not None:
-        return _asm_ok
-    mode = os.getenv("COMFY_GFX906_W4A8_ASM", "auto").strip().lower()
-    if mode in ("off", "triton", "0", "false", "no"):
-        _asm_ok = False
-        return False
-    if mode in ("on", "asm", "1", "true", "yes"):
-        _asm_ok = True
-        return True
-    try:
-        a = torch.zeros(1, device="cuda", dtype=torch.int32)
-        b = torch.zeros(1, device="cuda", dtype=torch.int32)
-        c = torch.zeros(1, device="cuda", dtype=torch.int32)
-        _probe_dot4[(1,)](a, b, c)
-        _asm_ok = True
-    except Exception:
-        _asm_ok = False
-    return _asm_ok
+    a = torch.zeros(1, device="cuda", dtype=torch.int32)
+    b = torch.zeros(1, device="cuda", dtype=torch.int32)
+    c = torch.zeros(1, device="cuda", dtype=torch.int32)
+    _probe_dot4[(1,)](a, b, c)
+    return True
+
+
+# The site's implementation list, in preference order. Adding a kernel means
+# adding one entry here -- a HIP module as an "extension", a new asm kernel as
+# an "asm" -- plus the module itself, or dropping a file into
+# arch/<gcn>/kernels/ so it only exists for that target. The portable Triton
+# kernel is the floor and must stay last.
+_REGISTRY = kreg.BackendRegistry(
+    "w4a8.m1",
+    kreg.site_candidates("w4a8.m1", [
+        kreg.Candidate("hip", kind="extension", env="COMFY_GFX906_W4A8_HIP",
+                       loader=_load_hip, priority=10, requires=("hip extension",)),
+        kreg.Candidate("asm", kind="asm", env="COMFY_GFX906_W4A8_ASM",
+                       probe=_probe_asm, priority=50, requires=("v_dot4_i32_i8", "v_perm_b32")),
+        kreg.Candidate("triton", kind="portable"),
+    ]),
+)
 
 
 def backend_name():
-    """hip > asm (when it compiles) > portable tl.dot."""
-    global _backend
-    if _backend is not None:
-        return _backend
-    if _load_hip() is not None:
-        _backend = "hip"
-    elif _asm_supported():
-        _backend = "asm"
-    else:
-        _backend = "triton"
-    return _backend
+    """hip > asm (when it compiles) > portable per-group tl.dot."""
+    return _REGISTRY.resolve()
+
+
+def _asm_supported():
+    """Whether the asm candidate can run here; kept for existing callers."""
+    return _REGISTRY.supported("asm")
 
 
 def codebook_words(codebook):
@@ -384,15 +388,20 @@ def linear(x, qdata, s_rel, s_channel, bias, out_dtype, group_size, convrot_grou
     `code - 8` ramp with a table lookup and fold the level grid into the scale.
 
     Backend order: an optional w4a8_hip extension, the v_dot4 asm path when it
-    compiles here, then the portable per-group tl.dot kernel.
+    compiles here, then the portable per-group tl.dot kernel. Each step is the
+    site's registry list; a shape an implementation declines falls through to
+    the next one, and a measured entry for this (n, k, rows) wins over the order.
     """
-    backend = backend_name()
+    try:
+        backend = _REGISTRY.choose(n=qdata.shape[0], k=s_rel.shape[1] * group_size, m=x.shape[0])
+    except (AttributeError, IndexError):          # not a plain [n, k] pair
+        backend = backend_name()
     if backend == "hip":
         out = _hip.linear(x, qdata, s_rel, s_channel, bias, out_dtype, group_size,
                           convrot_groupsize, levels=levels, inv_level=inv_level)
         if out is not None:
             return out
-        backend = "asm" if _asm_supported() else "triton"
+        backend = _REGISTRY.next_after("hip")
     if backend == "asm":
         return _linear_asm(x, qdata, s_rel, s_channel, bias, out_dtype, group_size,
                            convrot_groupsize, levels=levels, inv_level=inv_level)

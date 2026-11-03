@@ -34,8 +34,13 @@ ROTATE_WARPS = 4
 ASM_BLOCK_N = 16
 ASM_BLOCK_K = 2048
 
-_asm_ok = None
-_backend = None
+try:
+    from .kernels import registry as kreg
+except ImportError:                                   # imported as a top-level module
+    import sys
+
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from kernels import registry as kreg
 
 
 @triton.jit
@@ -162,34 +167,36 @@ def _probe_dot4(a, b, c):
     tl.store(c + tl.arange(0, 1), _dot4_asm(x, y))
 
 
-def _asm_supported():
-    global _asm_ok
-    if _asm_ok is not None:
-        return _asm_ok
-    mode = os.getenv("COMFY_GFX906_INT8_GEMV_ASM", "auto").strip().lower()
-    if mode in ("off", "triton", "0", "false", "no"):
-        _asm_ok = False
-        return False
-    if mode in ("on", "asm", "1", "true", "yes"):
-        _asm_ok = True
-        return True
-    try:
-        a = torch.zeros(1, device="cuda", dtype=torch.int32)
-        b = torch.zeros(1, device="cuda", dtype=torch.int32)
-        c = torch.zeros(1, device="cuda", dtype=torch.int32)
-        _probe_dot4[(1,)](a, b, c)
-        _asm_ok = True
-    except Exception:
-        _asm_ok = False
-    return _asm_ok
+def _probe_asm():
+    """Whether the v_dot4 inline asm compiles on this device."""
+    a = torch.zeros(1, device="cuda", dtype=torch.int32)
+    b = torch.zeros(1, device="cuda", dtype=torch.int32)
+    c = torch.zeros(1, device="cuda", dtype=torch.int32)
+    _probe_dot4[(1,)](a, b, c)
+    return True
+
+
+# One site, two implementations: the asm GEMV when v_dot4 compiles here, the
+# int32 tl.sum kernel otherwise. A third one (HIP, or a kernel written for
+# another gcn target) is either a new entry here or a file in
+# arch/<gcn>/kernels/ that declares SITE = "int8_gemv.m1".
+_REGISTRY = kreg.BackendRegistry(
+    "int8_gemv.m1",
+    kreg.site_candidates("int8_gemv.m1", [
+        kreg.Candidate("asm", kind="asm", env="COMFY_GFX906_INT8_GEMV_ASM",
+                       probe=_probe_asm, priority=50, requires=("v_dot4_i32_i8",)),
+        kreg.Candidate("triton", kind="portable"),
+    ]),
+)
 
 
 def backend_name():
-    global _backend
-    if _backend is not None:
-        return _backend
-    _backend = "asm" if _asm_supported() else "triton"
-    return _backend
+    return _REGISTRY.resolve()
+
+
+def _asm_supported():
+    """Whether the asm candidate can run here; kept for existing callers."""
+    return _REGISTRY.supported("asm")
 
 
 def _linear_asm(x, weight, weight_scale, bias, out_dtype, groupsize):
@@ -238,9 +245,14 @@ def linear(x, weight, weight_scale, bias, out_dtype, groupsize):
     rotation and uses the row max of the raw activation.
 
     Backend: v_dot4 asm when it compiles here, otherwise the int32 tl.sum kernel.
-    COMFY_GFX906_INT8_GEMV_ASM=auto/on/off selects it.
+    COMFY_GFX906_INT8_GEMV_ASM=auto/on/off selects it; a measurement for this
+    shape in arch/<gcn>/manifest.toml overrides the probe order.
     """
-    if backend_name() == "asm":
+    try:
+        backend = _REGISTRY.choose(n=weight.shape[0], k=weight.shape[1], m=x.shape[0])
+    except (AttributeError, IndexError):          # not a plain [n, k] pair
+        backend = backend_name()
+    if backend == "asm":
         out = _linear_asm(x, weight, weight_scale, bias, out_dtype, groupsize)
         if out is not None:
             return out
