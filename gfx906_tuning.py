@@ -227,7 +227,7 @@ def _init_env_settings():
     _state["prefix_kv_enabled"] = _state["prefix_kv_env"]
     _state["text_gemv_env"] = env_flag("COMFY_GFX906_TE_GEMV")
     _state["text_gemv_enabled"] = _state["text_gemv_env"]
-    _state["te_graphs_env"] = env_flag("COMFY_GFX906_TE_GRAPHS", "0")
+    _state["te_graphs_env"] = env_flag("COMFY_GFX906_TE_GRAPHS", "1")
     _state["w4a8_env"] = env_flag("COMFY_GFX906_W4A8")
     _state["amax_env"] = env_flag("COMFY_GFX906_AMAX_GUARD")
     _state["amax_guard"] = _state["amax_env"]
@@ -1655,10 +1655,11 @@ def patch_generate_te_default():
     * execution_dtype fp16: llama.py's should_use_bf16() fallback pins the TE
     to fp32 on gfx906; fp16 is the card's fast path and matches the register-
     dequantizing decode GEMV, so no per-call weight cast remains.
-    * graph_dynamic_vbar_blocks off: graph replay re-runs the dequantize
-    kernels every step, so graphs give te=default no speed -- they only pin
-    the fp16 copies in private pools (~21 GB on Qwen3.5-9B), which OOMs a
-    32 GB card. The decode runs eager instead.
+    * graph capture stays on for the register-dequant path: there are no
+    dequantize kernels to pin (~10.5 GB resident, same as int8), and the
+    capture absorbs ~800 eager launches per step (34.6 vs 22.0 it/s on
+    Qwen3.5-9B). COMFY_GFX906_TE_GRAPHS=0 opts out -- with the graph off the
+    decode degrades over long generations (22.0 it/s at 300+ tokens).
     """
     import comfy.text_encoders.llama as llama
 
@@ -1670,11 +1671,11 @@ def patch_generate_te_default():
         graphs = None
         if not _state["te_int8"]:
             kwargs.setdefault("execution_dtype", torch.float16)
-            # graphs stay off unless explicitly re-tested: with the dequant-per-
-            # call fallback they pin fp16 copies in private pools, and the
-            # register-dequant path has not shown a pool problem yet but the
-            # win is unproven too (COMFY_GFX906_TE_GRAPHS=1)
-            if not _state.get("te_graphs_env", False):
+            # graphs stay on: the register-dequant path has no dequantize
+            # kernels to pin, so pools stay at int8 size and the capture
+            # absorbs ~800 eager launches per step (34.6 vs 22.0 it/s on
+            # Qwen3.5-9B). COMFY_GFX906_TE_GRAPHS=0 opts out.
+            if not _state.get("te_graphs_env", True):
                 graphs = getattr(self.model, "graph_dynamic_vbar_blocks", None)
                 if graphs:
                     self.model.graph_dynamic_vbar_blocks = False
@@ -1685,14 +1686,6 @@ def patch_generate_te_default():
                 self.model.graph_dynamic_vbar_blocks = graphs
 
     generate._gfx906_gen_te_default = True
-    llama.BaseGenerate.generate = generate
-    return True
-
-    generate._gfx906_gen_cache = True
-    llama.BaseGenerate.generate = generate
-    return True
-
-    generate._gfx906_gen_cache = True
     llama.BaseGenerate.generate = generate
     return True
 
