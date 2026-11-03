@@ -8,6 +8,12 @@ applied and prints per-prompt timings.
 """
 
 import logging
+import os
+
+# Triton 3.9 warns once per process when this knob is unset, and 3.10 flips the
+# default to disabled. Every measurement in gfx906fix assumed fusion enabled,
+# so pin it before the first kernel compiles; an explicit env still wins.
+os.environ.setdefault("TRITON_DEFAULT_FP_FUSION", "1")
 
 from typing_extensions import override
 
