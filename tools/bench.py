@@ -492,7 +492,8 @@ def run_tile_site(args, today):
         shapes.append((int(n), int(k)))
     widths = [int(value) for value in args.tile_m.split(",")]
     print(f"\ntile site ({len(candidates)} candidates, {len(shapes)} shapes, m={widths})")
-    results = tile_sweep.sweep(kernels, shapes, widths, candidates, args.iters, args.warmup)
+    results = tile_sweep.sweep(kernels, shapes, widths, candidates, args.iters, args.warmup,
+                               repeat=REPEATS)
     by_text = {tile_sweep.spec_text(spec): spec for spec in candidates}
 
     records = {}
@@ -561,7 +562,9 @@ def run_attention_site(args, today):
             if error > args.attention_max_rel:
                 print(f"    {mode:<5} {label:<10} REJECTED: rel {error:.2e} > {args.attention_max_rel:.0%}")
                 continue
-            samples[(index, mode, label)] = attn._time_call(run, runs=args.iters)
+            # same election as bench_ms: the fastest round is the undisturbed one
+            samples[(index, mode, label)] = min(attn._time_call(run, runs=args.iters)
+                                                 for _ in range(REPEATS))
             print(f"    {mode:<5} {label:<10} {samples[(index, mode, label)] * 1000:8.1f} us  "
                   f"rel {error:.1e}")
         del q, k, v, reference, out

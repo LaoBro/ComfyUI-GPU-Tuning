@@ -70,6 +70,9 @@ def parse_args():
     parser.add_argument("--iters", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--top", type=int, default=3)
+    parser.add_argument("--repeats", type=int, default=1,
+                        help="timed rounds per tile, fastest kept (bench.py uses 2; each round "
+                             "re-runs the tile, so this multiplies the sweep time)")
     parser.add_argument("--emit", action="store_true", help="print env variables and a table entry")
     return parser.parse_args()
 
@@ -89,22 +92,31 @@ def default_candidates(kernels):
     return unique
 
 
-def bench(fn, iters, warmup):
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-    samples = []
-    for _ in range(iters):
-        start, end = torch.cuda.Event(True), torch.cuda.Event(True)
-        start.record()
-        fn()
-        end.record()
+def bench(fn, iters, warmup, repeat=1):
+    """The fastest of `repeat` rounds, each round the median of `iters` calls.
+
+    A single round is not trustworthy on this card: about a quarter of fresh
+    processes slow one bandwidth-bound kernel by 30-50% while a 4096^3 matmul and
+    a 256 MB copy stay flat. The disturbed round is the one to drop, not average.
+    """
+    rounds = []
+    for _ in range(repeat):
+        for _ in range(warmup):
+            fn()
         torch.cuda.synchronize()
-        samples.append(start.elapsed_time(end))
-    return statistics.median(samples)
+        samples = []
+        for _ in range(iters):
+            start, end = torch.cuda.Event(True), torch.cuda.Event(True)
+            start.record()
+            fn()
+            end.record()
+            torch.cuda.synchronize()
+            samples.append(start.elapsed_time(end))
+        rounds.append(statistics.median(samples))
+    return min(rounds)
 
 
-def sweep(kernels, shapes, batch_widths, candidates, iters=3, warmup=2, top=3):
+def sweep(kernels, shapes, batch_widths, candidates, iters=3, warmup=2, top=3, repeat=1):
     """Time every candidate tile on every (shape, batch width).
 
     Each candidate is installed alone in the config list, so comfy-kitchen's
@@ -129,7 +141,7 @@ def sweep(kernels, shapes, batch_widths, candidates, iters=3, warmup=2, top=3):
                         kernel.cache.clear()
                     run = lambda: quantization.int8_linear(x, weight, scale, None, out_dtype=torch.float32, convrot=True)
                     try:
-                        elapsed = bench(run, iters, warmup)
+                        elapsed = bench(run, iters, warmup, repeat)
                         results[(n, k, m, spec_text(spec))] = elapsed
                         rows.append((elapsed, spec))
                     except Exception as exc:
@@ -187,7 +199,8 @@ def main():
     print(f"arch {arch} | {len(candidates)} candidates | {len(shapes)} shapes | m={ms}")
     print("each candidate is compiled once per (m,n,k); the first run can take seconds")
 
-    results = sweep(kernels, shapes, ms, candidates, args.iters, args.warmup, args.top)
+    results = sweep(kernels, shapes, ms, candidates, args.iters, args.warmup, args.top,
+                    args.repeats)
 
     large_key, large_ms = winner(results, False)
     small_key, small_ms = winner(results, True)
