@@ -247,7 +247,7 @@ CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`imag
 
 **[PORTING.md — 其它显卡移植与二次开发指南](PORTING.md)**
 
-最短路径：先用节点默认值跑通（没跑过 bench 的卡上测量门功能是关的），再运行一次 `python custom_nodes/ComfyUI-gfx906-Tuning/tools/bench.py --all --write`。它测出这张卡的 int8 tile，以及 GEMV / w4a8 / deltanet（含 prefill）/ vae / convrot / vision 的开或关，写进 `~/.config/comfy-gfx-tune/arch/<gcn>/manifest.toml`，之后启动不再 autotune。attention 只打印证据不写记录——mode 是质量取舍，在节点里手选。
+最短路径：先用节点默认值跑通（没跑过 bench 的卡上测量门功能是关的），再运行一次 `python custom_nodes/ComfyUI-gfx906-Tuning/tools/bench.py --all --write`。它测出这张卡的 int8 tile，以及 GEMV / w4a8 / deltanet（含 prefill）/ vae / convrot / vision 的开或关，写进 `~/.config/comfy-gfx-tune/arch/<gcn>/manifest.toml`，之后启动不再 autotune。attention 只打印证据不写记录——mode 是质量取舍，在节点里手选。想知道时间落在哪一段（而不是哪个内核快）用 `tools/chain_profile.py`，见 [PORTING.md §5.4](PORTING.md)。
 
 ### 注意力模式怎么选
 
@@ -320,7 +320,11 @@ CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`imag
 
 ## 验证与细节
 
-所有数字都来自本机实测，复现脚本和逐项推导在仓库外的 `gfx906fix/` 目录：
+所有数字都来自本机实测。测量工具随包分发，逐项推导在仓库外的 `gfx906fix/` 目录：
+
+- `tools/bench.py` — 站点微基准（数值门先于计时），`--all --write` 写本机 manifest
+- `tools/chain_profile.py` — **生文链路归因**：一次 TextGenerate 的嵌套 CUDA event 分解（图像塔 / block / MLP / lm_head / prefill vs 每步），按结构发现归因点，跨架构可用，见 [PORTING.md §5.4](PORTING.md)
+- `tools/status.py` / `tools/verify_backends.py` — 不开 ComfyUI 看当前判定 / 改内核后的选择 parity 与数值 A/B
 
 - `gfx906fix/textgen-tuning.md` — **文本生成调优记录**：现状、时间分解、五个坑、后续方向
 - `gfx906fix/qwen-image21-remaining-ops.md` — 各补丁的收益与测量方法

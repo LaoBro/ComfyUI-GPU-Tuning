@@ -527,6 +527,52 @@ backend = _REGISTRY.choose(n=..., k=..., m=...)
 
 `kernels.safe_install()` 是这套策略的库版本（返回 `FAILED` 哨兵，用来区分"失败"和"patch 本来就返回 None"），`_install` 只是给它补上状态记录。
 
+## 5.4 链路归因（`tools/chain_profile.py`）
+
+站点微基准回答"这段里哪个实现快"，不回答"时间到底落在哪一段"。DiT 侧有 `profiler.py`（节点的 profile 开关）；**文本编码器它看不见**：TE 走 CLIP 链而不是 `BaseModel.apply_model`，而它的 attention 由 `optimized_attention_for_device(small_input=True)` 解析成 core 的 `attention_pytorch`/`attention_basic`（`comfy/text_encoders/llama.py:971`、`comfy/ldm/modules/attention.py:941-946`），profiler 包的是模块级 `optimized_attention`，两个 hook 都落空。`chain_profile.py` 补这一段：跑一次真实的 TextGenerate，用嵌套 CUDA event 归因。
+
+```bash
+cd /home/liu/ComfyUI-0.39.0
+.venv/bin/python custom_nodes/ComfyUI-gfx906-Tuning/tools/chain_profile.py \
+    --clip <text encoder 文件名> --set text_encoder=int8 --image <图> --max-length 32
+
+... --pack off                     # 同一条链路只跑 core
+... --set image_tower=off          # 任何 configure() 项，可重复
+... --list-classes                 # 模块类普查，用来挑 --wrap 的名字
+... --kitchen                      # 顺带装 profiler 的 hook，看 kitchen 层
+... --disable-cuda-graphs          # 透传给 ComfyUI 的旗标
+```
+
+归因点是**结构性发现**的，不写死类名，所以换模型/换架构不用改工具：cond stage model、最宽 `ModuleList` 的 owner（它的 forward 每步一次，用来分 prefill 与 decode）、活的 generate 对象（每个 TE 都覆写 `generate()`，包基类会一次都记不到）、以及每一个 block；再各加一层直接子模块，图像塔这种兄弟子树才有自己的行。`comfy.ops` / `torch.nn` 的叶子层默认不包：包一个 `Linear` 等于包住全部 359 个实例，会把上面每个区域的 self 抽成 0；叶子视图用 `--kitchen`（profiler 的 `int8_linear`）或显式 `--wrap Linear`。
+
+表里的 `self s` 是总时间减去直接嵌套在它里面的区域，所以整表相加等于链路时间而不是重复计数；`of run` 按 self 算。gfx906 上今天这两次运行：
+
+| | pack on（图开、te=int8、32 token）+ 1160x679 图 | pack off（图关、te=default、16 token）无图 |
+|---|---|---|
+| 图像塔 | **34.9%**（1.56 s，一次） | — |
+| GatedDeltaNet | 19.9% | 20.6% |
+| MLP | 12.6% | **51.9%** |
+| 每步 forward 自身 | 16.3% | 6.1% |
+| `logits`（lm_head） | 1.28 ms/次 | **89.3 ms/次** |
+| prefill / 每步 / tok/s | 1511 ms / 25.8 ms / 38.7 | 2208 ms / 670 ms / 1.49 |
+
+两列之间差了**两个**变量（pack 与 CUDA graph），所以这不是 pack 的净收益。lm_head 那 89 ms 也不能记在 `text_gemv` 头上：`--pack off` 时 `--set text_encoder=int8` 根本不生效（工具会打印一行说明），那一列跑的是 te=default 的逐调用反量化。固定单一变量才有结论，例如 `text_gemv`（两边都 te=int8、图关、同 seed、同 prompt）：
+
+| | `text_gemv=on` | `text_gemv=off` |
+|---|---|---|
+| 每步（sampling / greedy） | 48.2 / 49.8 ms | 62.6 / 64.4 ms |
+| MLP 中位 | 0.45 ms | 0.64 ms |
+| `logits` 中位 | 1.45 ms | 1.42 ms（不变：lm_head 的 1.4 ms 来自 TE int8 常驻，不是 text_gemv） |
+| tok/s | 20.8 | 16.0 |
+
+读数时注意三件事：
+
+- **`graphed` 列**：捕获进 CUDA graph 的调用不能带 event，只计数不计时；而且**回放根本不进 python**，所以图开着时 block 以下的行只包含 prefill 和捕获那一遍。要看每步归因就加 `--disable-cuda-graphs`，但那次运行不能和图开着的比——图正是用来消掉每 block 的 dispatch 成本的（约文本生成的 37%，见 [core-patches/README.md](core-patches/README.md)）。
+- **`unattributed`**：墙钟减去所有根区域的总时间，即 tokenize、python、launch gap 和没被包住的东西。它大就说明瓶颈不在 GPU 内核上，先别去调内核。
+- **`md5`**：输出文本的哈希，是"变了没有"的探测器，不是正确性判据。上面那组 `text_gemv` A/B 在 `--sampling off` 下两边 md5 完全相同（数值等价），而 sampling 开着时同样的微小差异会逐 token 放大成完全不同的文本——比等价性就加 `--sampling off`。反例是上一版 prefill 变换：更快，但生文从第一个 token 就退化。
+
+旗标透传靠 `comfy.options.enable_args_parsing(True)`：库模式下 `comfy/cli_args.py` 走 `parse_args([])`，不设这一句 `--disable-cuda-graphs` 之类会被**静默忽略**（工具自己在 import comfy 之前设好了）。四个 textgen 子项没有 `configure()` 入口，A/B 用 env：`COMFY_GFX906_DELTANET` / `_KVDECODE` / `_LLAMA` / `_QWEN35`。
+
 ## 6. 开关优先级
 
 **节点显式 on/off > `COMFY_GFX906_*` > 内置默认**。节点里的 `default` / `auto` 表示沿用 env，不会用硬编码值覆盖它。完整开关列表见 [README.md](README.md#L223-L240)。
@@ -537,12 +583,13 @@ backend = _REGISTRY.choose(n=..., k=..., m=...)
 2. 先用节点默认值跑通——没跑过 bench 的卡上测量门功能是关的，这是预期行为，不是坏了。
 3. 跑一次 `tools/bench.py --all --write`：int8 tile、两个 GEMV 站点，以及 gemv / w4a8 / deltanet / deltanet prefill / vae / convrot / vision 的 on/off（convrot 还有 mode）都写进本机 manifest，之后启动不再 autotune。attention mode 不在此列——节点里手动选。只想看数字就先不加 `--write`。
 4. 用 `tools/status.py` 确认 `measured ... in use`、`int8 tiles (measured tile)`、`gemv ... measured`，以及 `w4a8`/`textgen deltanet` 的 on/off；日志里不应再有 `no measured data`。
-5. 逐项 A/B：`vae`、`gemv`、`convrot`、`qkv`。这些还没有自动登记，默认值在多数卡上是赚的；`vae`/`convrot` 已经被 §2.1 在原生卡上关掉。
-6. `deltanet` 在 kitchen 的 fused op 不可用的卡上**结构性开启**——此时 bench 没有基线可比，不写 `feature.deltanet`（[gfx906_tuning.py:296-303](gfx906_tuning.py#L296-L303)）；kitchen 可用时由 bench 决定，大概率 `off`。两种都是正确结果。prefill 的基线是 core 自己的循环，所以 `feature.deltanet_prefill` 在任何卡上都能测出来。`qwen35` 不由 bench 写，决定权在 `COMFY_GFX906_QWEN35`；`--qwen35` 的计时是 4 层合成模型的代理，等价性检查才是主交付。
-7. `textgen` 默认只会启用 `kvdecode` + `llama`；`qwen35` 显示 `n/a` 是预期行为。
-8. 需要 resident CUDA graph 时再装 overlay；不装不影响正确性。
-9. 改动内核后跑 `tools/verify_backends.py`（选择 parity + 数值 A/B，需要 GPU；无设备时会直接退出并说明原因），再记录性能。
-10. 测量数据换了 torch/驱动就失效，重跑第 3 步即可；表写错时 `COMFY_GFX906_MEASURED=0` 整体关掉。
+5. 归因，别猜：生文链路用 `tools/chain_profile.py`（§5.4），DiT 侧用节点的 profile 开关。归因出的热点如果在 bench 里没有对应站点，**先加站点再优化**——`vision.patch_embed` 和 `deltanet.prefill` 都是这么来的。
+6. 逐项 A/B：`vae`、`gemv`、`convrot`、`qkv`、`text_gemv`。一次只动一个变量，否则结论没有归属（§5.4 里那张 pack on/off 表就是反例：它同时动了 pack 和 CUDA graph）。
+7. `deltanet` 在 kitchen 的 fused op 不可用的卡上**结构性开启**——此时 bench 没有基线可比，不写 `feature.deltanet`（[gfx906_tuning.py:296-303](gfx906_tuning.py#L296-L303)）；kitchen 可用时由 bench 决定，大概率 `off`。两种都是正确结果。prefill 的基线是 core 自己的循环，所以 `feature.deltanet_prefill` 在任何卡上都能测出来。`qwen35` 不由 bench 写，决定权在 `COMFY_GFX906_QWEN35`；`--qwen35` 的计时是 4 层合成模型的代理，等价性检查才是主交付。
+8. gfx906 上 `textgen` 四项都是 on（`kvdecode`/`llama` 常开、`qwen35` 由 env 默认开、`deltanet` 结构性开启）。别的卡上 `status()` 打出 `n/a` 是正常的：那一项没装上，节点里选 `on` 也打不开。
+9. 需要 resident CUDA graph 时再装 overlay；不装不影响正确性。
+10. 改动内核后跑 `tools/verify_backends.py`（选择 parity + 数值 A/B，需要 GPU；无设备时会直接退出并说明原因），再记录性能。
+11. 测量数据换了 torch/驱动就失效，重跑第 3 步即可；表写错时 `COMFY_GFX906_MEASURED=0` 整体关掉。
 
 ## 8. 已知边界
 
