@@ -102,6 +102,7 @@ bench 的 tile 站点在 `native_covers("int8_linear")` 时跳过：覆盖的卡
 | `qwen35` 计算类替换 | **B 类（可选开关）**：`COMFY_GFX906_QWEN35` 默认开，它是逐方法对过 core 的等价改写 | `bench.py --qwen35` 只出证据不写 feature：合成小模型 fp32 A/B（1e-3 门槛）+ 计时；但用例只覆盖 prefill，而收益主要在 decode，测量覆盖不了决策面。未覆盖：recurrent 解码路径、真实 checkpoint 权重 |
 | `convrot` | 没有实测数据就不安装 | `bench.py --convrot` 计时 kitchen 的 matmul 旋转 vs 我们的 butterfly vs fused，写 `feature.convrot` 和 `convrot.mode`（赢家 mode，`COMFY_GFX906_CONVROT` 可覆盖） |
 | `vae` | 没有实测数据就不安装 | `bench.py --vae` 计时 depth-1 Conv3d：torch conv3d / conv2d squeeze / kitchen 的 `fp16_conv3d`（有原生后端的卡），写 `feature.vae` |
+| `image_tower`（Qwen3.5 图像塔） | 包装器总是安装，但默认值看 `feature.vision`：没数据的卡保持 core 的行为，节点可以手动 on | `bench.py --vision` 计时 patch 投影三种走法：`conv3d_fp32`（现状）/ `conv3d`（只改 dtype）/ `gemm`（补丁），写 `vision.patch_embed` 和 `feature.vision`。gfx906 实测 gemm 比现状快 30-400 倍（0.58/2.0/8.4 ms vs 17.7/70.3/284 ms），而且 **bf16 的 conv3d 比 fp32 慢 12 倍**，所以 dtype 和 conv 必须一起换 |
 | `qkv` | 默认关（1.6 GB 常驻，纯权衡，不归测量门） | 想用时设 `COMFY_GFX906_QKV=1` 或节点开关 |
 
 **易踩的坑**：`configure(w4a8="on")` 会在节点执行时调用 `load_w4a8_gemv()`，把模块装上；这条路径绕过了 `feature.w4a8` 的安装判定。非 gfx906 上开着 `w4a8` 时 asm 探测会自动失败、落到 per-group `tl.dot`；如果显式设 `COMFY_GFX906_W4A8_ASM=on`，探测被跳过，asm 会在实际调用时报编译错误。节点默认值是“沿用 env”，不想用就保持 `COMFY_GFX906_W4A8=0`。

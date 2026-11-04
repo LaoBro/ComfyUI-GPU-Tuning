@@ -19,7 +19,7 @@
 --all is what fills a card's measurement gates: after one run the int8 linear
 list holds a single tile, attention has a tile per head dim and a measured
 kernel mode, the GEMV sites have a winner per shape, and every feature whose
-fastest form differs per card (gemv, w4a8, deltanet, vae, convrot) has an
+fastest form differs per card (gemv, w4a8, deltanet, vae, convrot, vision) has an
 on/off record against its real fallback.
 
 The pipeline per shape is fixed, in this order:
@@ -95,6 +95,10 @@ VAE_SITE = "vae.decode"
 VAE_SHAPES = "512x64,512x128"
 CONVROT_SITE = "convrot.mode"
 CONVROT_SHAPES = "1x4096,128x4096"
+# Qwen3.5 image tower patch projection: patches x embed dim. 3024x1152 is what a
+# 1160x679 image gives the 9B; the rest are a small and a large image.
+VISION_SITE = "vision.patch_embed"
+VISION_SHAPES = "768x1152,3024x1152,12288x1152"
 # Qwen3.5: the class swap only touches Python-level copies and launches, so the
 # numbers here are a proxy. The point of the site is the numeric check -- both
 # sides run fp32, so 1e-3 is a real equivalence gate, not the 5% quantisation one.
@@ -136,6 +140,8 @@ def parse_args():
                         help="also time depth-1 Conv3d: torch vs the conv2d squeeze vs kitchen")
     parser.add_argument("--convrot", action="store_true",
                         help="also time ConvRot activation prep: kitchen rotation vs ours")
+    parser.add_argument("--vision", action="store_true",
+                        help="also time the image tower patch projection: shipped conv3d vs the GEMM")
     parser.add_argument("--qwen35", action="store_true",
                         help="also compare the Qwen3.5 block against the shipped methods")
     parser.add_argument("--qwen35-layers", type=int, default=QWEN35_LAYERS,
@@ -146,11 +152,13 @@ def parse_args():
                         help="prefill length used for the comparison")
     parser.add_argument("--all", action="store_true",
                         help="the whole table in one run: --tile + --attention + --deltanet + "
-                             "--vae + --convrot + --qwen35 + the GEMV sites")
+                             "--vae + --convrot + --vision + --qwen35 + the GEMV sites")
     parser.add_argument("--deltanet-shapes", default=DELTANET_SHAPES,
                         help="BxHVxDKxDVxS list for the DeltaNet decode benchmark")
     parser.add_argument("--vae-shapes", default=VAE_SHAPES,
                         help="channels x size list for the depth-1 Conv3d benchmark")
+    parser.add_argument("--vision-shapes", default=VISION_SHAPES,
+                        help="patches x embed list for the image tower patch projection benchmark")
     parser.add_argument("--convrot-shapes", default=CONVROT_SHAPES,
                         help="rows x k list for the ConvRot prep benchmark (k mod 256 == 0)")
     parser.add_argument("--deltanet-hidden", type=int, default=DELTANET_HIDDEN,
@@ -825,6 +833,78 @@ def run_vae_site(args, today):
     return records, defaults
 
 
+def run_vision_site(args, today):
+    """Time the Qwen3.5 image tower's patch projection three ways.
+
+    Core hands the tower an fp32 input while its weights are the text-encoder
+    dtype, and the patch Conv3d has kernel == stride, so a card without a conv3d
+    code object lowers it to im2col + bmm. The three rows separate the two costs:
+
+      conv3d_fp32  what ships today (fp32 input, conv3d) -- the baseline
+      conv3d       same conv at the weight dtype, so the dtype change alone
+      gemm         the patch: one GEMM over the flattened patch
+
+    feature.vision is written from gemm against conv3d_fp32, which is what the
+    switch controls. On a card with a real conv3d kernel and no upcast cost the
+    gain is under --min-gain and the verdict stays off.
+    """
+    import torch.nn.functional as F
+
+    records, ratios = {}, []
+    for item in args.vision_shapes.split(","):
+        rows, _, dim = item.strip().partition("x")
+        rows, dim = int(rows), int(dim)
+        key = f"p{rows}xd{dim}"
+        gen = torch.Generator(device="cuda").manual_seed(0)
+        # the real module's shape: 3 channels x temporal 2 x 16 x 16 per patch
+        weight = (torch.randn(dim, 3, 2, 16, 16, device="cuda", dtype=torch.bfloat16,
+                              generator=gen) * 0.05)
+        bias = torch.randn(dim, device="cuda", dtype=torch.bfloat16, generator=gen) * 0.01
+        x = torch.randn(rows, 3, 2, 16, 16, device="cuda", dtype=torch.bfloat16, generator=gen)
+        flat_w = weight.reshape(dim, -1)
+        expected = F.conv3d(x.float(), weight.float(), bias.float()).flatten(1)
+        print(f"\n  {key} (kernel==stride conv3d, bf16 weight)")
+
+        candidates = [
+            ("conv3d_fp32", lambda: F.conv3d(x.float(), weight.float(),
+                                             bias.float()).flatten(1)),
+            ("conv3d", lambda: F.conv3d(x, weight, bias).flatten(1)),
+            ("gemm", lambda: F.linear(x.reshape(rows, -1), flat_w, bias)),
+        ]
+        times, errors = {}, {}
+        for name, fn in candidates:
+            try:
+                out = fn()
+                torch.cuda.synchronize()
+            except Exception as exc:                            # noqa: BLE001 - a card may have no conv3d
+                print(f"    {name:<12} unavailable: {type(exc).__name__}: {exc}")
+                continue
+            error = refs.rel(out.float(), expected)
+            if error > args.max_rel:
+                print(f"    {name:<12} REJECTED: rel {error:.2e} > {args.max_rel:.0e}")
+                continue
+            times[name] = bench_ms(fn, args.iters, args.warmup)
+            errors[name] = error
+            print(f"    {name:<12} {times[name] * 1000:8.1f} us  rel {error:.1e}")
+        if "conv3d_fp32" not in times or "gemm" not in times:
+            continue
+        winner = min(times, key=times.get)
+        ratios.append(times["gemm"] / times["conv3d_fp32"])
+        records.setdefault(VISION_SITE, {})[key] = manifest_write.render(
+            key, winner, times, rel=errors[winner], date=today,
+            note="image tower patch projection, bf16 weight")
+
+    defaults = {}
+    if ratios:
+        gain = 1.0 - statistics.median(ratios)
+        defaults["feature.vision"] = "on" if gain >= args.min_gain else "off"
+        print(f"\n  vision: patch over the shipped path {gain:+.1%}, "
+              f"feature.vision={defaults['feature.vision']}")
+    else:
+        print("\n  vision: nothing comparable measured, leaving feature.vision alone")
+    return records, defaults
+
+
 def run_convrot_site(args, today):
     """Time the ConvRot activation prep: kitchen's matmul rotation vs ours.
 
@@ -998,6 +1078,10 @@ def main():
         defaults.update(choices)
     if args.vae or args.all:
         records, choices = run_vae_site(args, today)
+        written.update(records)
+        defaults.update(choices)
+    if args.vision or args.all:
+        records, choices = run_vision_site(args, today)
         written.update(records)
         defaults.update(choices)
     if args.convrot or args.all:

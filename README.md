@@ -228,7 +228,7 @@ decode step 会在 CPU 上开内存。CLIP Settings 节点的 `text_gemv=off` �
 
 Model Settings：`attention`、`contiguous`、`smooth`、`fp16`、`amax_guard`、`convrot`、`int8_tile`、`small_batch`、`qkv`、`vae`、`gemv`、`prefix_kv`、`profile`。
 
-CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`textgen`。
+CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`image_tower`、`textgen`。
 
 补充说明：
 
