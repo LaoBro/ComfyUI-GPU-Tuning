@@ -93,7 +93,7 @@ DELTANET_SHAPES = "1x16x128x128x1,1x16x128x128x4"
 DELTANET_SITE = "deltanet.decode"
 # BxHVxDKxDVxS: one Qwen3.5 DeltaNet prefill at the 2B and 9B head counts.
 DELTANET_PREFILL_SITE = "deltanet.prefill"
-DELTANET_PREFILL_SHAPES = "1x32x128x128x1024,1x32x128x128x4096"
+DELTANET_PREFILL_SHAPES = "1x32x128x128x1024,1x32x128x128x2223,1x32x128x128x4096"
 # Depth-1 Conv3d (channels x spatial size) and ConvRot prep (rows x k): the two
 # tier-3 features whose fastest form differs per card without being kernels.
 VAE_SITE = "vae.decode"
@@ -749,13 +749,24 @@ def run_deltanet_site(args, today):
 
 
 def run_deltanet_prefill_site(args, today):
-    """Time the Qwen3.5 prefill chunk rule: core's UT loop vs the doubling series.
+    """Time the Qwen3.5 prefill chunk rule: core's UT loop vs the block recursion.
 
     Both run the identical algorithm on identical inputs; the only difference is
-    the 63-step forward-substitution loop (qwen35.py:143-146) against the Neumann
-    doubling series in deltanet.chunk_rule. The numeric gate compares against
+    the 63-step forward-substitution loop (qwen35.py:143-146) against the batched
+    block inversion in deltanet.ut_inverse. The numeric gate compares against
     core's own output, so a record can only be written for a variant that answers
     the same question. feature.deltanet_prefill is written from the gain.
+
+    Each shape is checked on two input regimes and the gate is the worse of the
+    two; timing uses the mild one. Marginals alone are not enough to catch an
+    unstable transform: with independent randn keys, mild or heavy decay, the
+    Neumann doubling that used to ship here matched core to 1e-7 while it produced
+    4.29e+16 against core's 0.2672 on the model's own prefill tensors. What
+    reproduces that is key-row coherence: with every key row within 1e-3 of one
+    shared direction, k_beta @ key^T approaches the strictly-lower matrix of ones,
+    whose UT inverse is the +-1 difference matrix (absmax 1) while its powers
+    explode. On that regime the doubling measures rel 4.65e+03 and this
+    implementation 1.6e-07.
     """
     import deltanet
     from comfy.text_encoders.qwen35 import torch_chunk_gated_delta_rule
@@ -764,29 +775,44 @@ def run_deltanet_prefill_site(args, today):
     for item in args.deltanet_prefill_shapes.split(","):
         batch, heads, dk, dv, seq = (int(x) for x in item.strip().split("x"))
         key = f"b{batch}xh{heads}xdk{dk}xdv{dv}xs{seq}"
-        gen = torch.Generator(device="cuda").manual_seed(0)
-        q = torch.randn(batch, seq, heads, dk, device="cuda", dtype=torch.float32, generator=gen)
-        k = torch.randn(batch, seq, heads, dk, device="cuda", dtype=torch.float32, generator=gen)
-        v = torch.randn(batch, seq, heads, dv, device="cuda", dtype=torch.float32, generator=gen) * 0.1
-        g = (-torch.rand(batch, seq, heads, device="cuda", generator=gen) - 1.0) * 0.02
-        beta = torch.rand(batch, seq, heads, device="cuda", generator=gen).sigmoid()
+
+        def inputs(coherent):
+            gen = torch.Generator(device="cuda").manual_seed(0)
+            q = torch.randn(batch, seq, heads, dk, device="cuda", dtype=torch.float32, generator=gen)
+            k = torch.randn(batch, seq, heads, dk, device="cuda", dtype=torch.float32, generator=gen)
+            if coherent:
+                direction = torch.randn(1, 1, 1, dk, device="cuda", dtype=torch.float32, generator=gen)
+                direction = direction / direction.norm(dim=-1, keepdim=True)
+                k = 0.999 * direction + 0.001 * k / k.norm(dim=-1, keepdim=True)
+            v = torch.randn(batch, seq, heads, dv, device="cuda", dtype=torch.float32, generator=gen) * 0.1
+            g = (-torch.rand(batch, seq, heads, device="cuda", generator=gen) - 1.0) * 0.02
+            beta = torch.rand(batch, seq, heads, device="cuda", generator=gen).sigmoid()
+            return q, k, v, g, beta
+
+        sets = {"mild": inputs(False), "coherent": inputs(True)}
         print(f"\n  {key}")
 
-        times, errors = {}, {}
-        for label, fn in (("loop", torch_chunk_gated_delta_rule), ("doubling", deltanet.chunk_rule)):
-            out, state = fn(q, k, v, g, beta)
-            torch.cuda.synchronize()
-            if label == "loop":
-                expected, want_state = out, state
-            else:
-                error = refs.rel(out, expected)
+        times, errors, reference = {}, {}, {}
+        for label, fn in (("loop", torch_chunk_gated_delta_rule), ("block", deltanet.chunk_rule)):
+            worst = 0.0
+            for name, ins in sets.items():
+                out, state = fn(*ins)
+                torch.cuda.synchronize()
+                if label == "loop":
+                    reference[name] = (out, state)
+                    continue
+                want_out, want_state = reference[name]
+                error = refs.rel(out, want_out)
                 if want_state is not None:
                     error = max(error, refs.rel(state, want_state))
-                if error > args.max_rel:
-                    print(f"    {label:<9} REJECTED: rel {error:.2e} > {args.max_rel:.0e}")
+                worst = max(worst, error)
+                print(f"    {label:<9} vs loop on {name:<9} rel {error:.2e}")
+            if label != "loop":
+                if worst > args.max_rel:
+                    print(f"    {label:<9} REJECTED: worst rel {worst:.2e} > {args.max_rel:.0e}")
                     continue
-                errors[label] = error
-            times[label] = bench_ms(lambda f=fn: f(q, k, v, g, beta), args.iters, args.warmup)
+                errors[label] = worst
+            times[label] = bench_ms(lambda f=fn: f(*sets["mild"]), args.iters, args.warmup)
             print(f"    {label:<9} {times[label] * 1000:8.1f} us  "
                   f"rel {errors.get(label, 0.0):.1e}")
 
@@ -794,16 +820,16 @@ def run_deltanet_prefill_site(args, today):
             print(f"  {key}: both implementations are the shipped loop, nothing to compare")
             continue
         winner = min(times, key=times.get)
-        ratios.append(times["doubling"] / times["loop"])
+        ratios.append(times["block"] / times["loop"])
         records.setdefault(DELTANET_PREFILL_SITE, {})[key] = manifest_write.render(
-            key, winner, times, rel=errors["doubling"], date=today,
-            note="fp32 chunk rule, UT transform only difference")
+            key, winner, times, rel=errors["block"], date=today,
+            note="fp32 chunk rule, UT transform only difference, worst of mild+coherent")
 
     defaults = {}
     if ratios:
         gain = 1.0 - statistics.median(ratios)
         defaults["feature.deltanet_prefill"] = "on" if gain >= args.min_gain else "off"
-        print(f"\n  deltanet prefill: doubling {gain:+.1%} against core's loop, "
+        print(f"\n  deltanet prefill: block {gain:+.1%} against core's loop, "
               f"feature.deltanet_prefill={defaults['feature.deltanet_prefill']}")
     else:
         print("\n  deltanet prefill: nothing comparable measured, "

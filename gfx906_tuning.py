@@ -2224,7 +2224,7 @@ def status():
         w4a8_line,
         f"vae {'conv3d as conv2d' if _state.get('vae_patched') and _state.get('vae_enabled') else ('off (patched)' if _state.get('vae_patched') else 'off')}",
         f"textgen {textgen_summary()}"
-        + f", prefill {'doubling' if _state['delta_prefill_enabled'] else 'core loop'}",
+        + f", prefill {'block' if _state['delta_prefill_enabled'] else 'core loop'}",
         f"attention {_state['attn_kernel'] if _state['attention'] else 'off'}"
         + (f", smoothing {'on' if _state['smooth'] else 'off'}" if _state["attn_kernel"] == "int8qk" else "")
         + ((", inputs cast to fp16" if _state["attn_fp16"] else ", inputs left in the model dtype")

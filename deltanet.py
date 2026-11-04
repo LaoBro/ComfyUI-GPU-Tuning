@@ -14,7 +14,7 @@ These three Triton kernels replace it:
 Measured 11.5 us per layer for the last two, ~2.9 ms per decode step saved at seq=1.
 
 The prefill side is not a Triton kernel: chunk_rule is core's torch chunk rule
-with its 63-step UT loop replaced by a doubling Neumann series (see its docstring).
+with its 63-step UT loop replaced by a batched block inversion (see ut_inverse).
 """
 
 import sys
@@ -173,19 +173,42 @@ def gated_delta_decode_fused(mixed_qkv, x, w_a, w_b, dt_bias, g_decay, state,
     return out.to(out_dtype) if out.dtype != out_dtype else out
 
 
+def ut_inverse(a):
+    """(I - A)^-1 for a strictly lower chunk_size x chunk_size A, by block recursion.
+
+    Halving the chunk gives [[T1, 0], [T2 A21 T1, T2]] where T1 and T2 invert the
+    two diagonal blocks, so every level keeps all its sibling blocks batched in the
+    leading dimensions: log2(chunk_size) levels of batched matmuls instead of
+    core's 63-step row loop. The intermediates are sub-blocks of the answer, which
+    is what makes this stable where the Neumann series is not: A^2, A^4, A^8 ... are
+    bounded by nothing, and on a real Qwen3.5 prefill the doubling reached 4.29e+16
+    where core's row substitution gives 0.2672.
+    """
+    size = a.shape[-1]
+    if size == 1:
+        return torch.ones_like(a)
+    half = size // 2
+    lead = a.shape[:-2]
+    blocks = a.reshape(*lead, 2, half, 2, half)
+    diagonals = torch.diagonal(blocks, dim1=-4, dim2=-2).movedim(-1, -3).contiguous()
+    t = ut_inverse(diagonals)
+    t1, t2 = t[..., 0, :, :], t[..., 1, :, :]
+    out = torch.zeros(*lead, 2, half, 2, half, dtype=a.dtype, device=a.device)
+    out[..., 0, :, 0, :] = t1
+    out[..., 1, :, 1, :] = t2
+    out[..., 1, :, 0, :] = t2 @ blocks[..., 1, :, 0, :] @ t1
+    return out.reshape(*lead, size, size)
+
+
 def chunk_rule(query, key, value, g, beta, chunk_size=64, initial_state=None,
                output_final_state=False):
-    """comfy/text_encoders/qwen35.py:116 with the UT transform as a doubling series.
+    """comfy/text_encoders/qwen35.py:116 with the UT transform as a block recursion.
 
     Everything but the transform is core's code, kept line for line: a new core
     parameter has to be mirrored here. core builds the chunk's UT transform with a
-    63-step Python loop of forward substitution (qwen35.py:143-146), which is
-    ~315 small kernels per layer per prefill and 9.9 ms of the 32.8 ms this call
-    costs on a 4k prefill. Because the starting matrix is strictly lower it is
-    nilpotent, so the transform is the finite Neumann series I + A + ... + A^C-1,
-    and that series doubles in log2(chunk_size) steps: 2.2 ms, 4.5x, in fp32
-    (maxabs 2.2e-8 against core's own loop; bf16 is 1.8x slower than fp32 here
-    because gfx906 has no bf16 matrix unit, and fp16 buys nothing at 64x64).
+    63-step Python loop of forward substitution (qwen35.py:143-146), which is ~315
+    small kernels per layer per prefill; ut_inverse replaces it with 6 levels of
+    batched matmuls over the same numbers.
     """
     initial_dtype = query.dtype
     query = F.normalize(query, dim=-1)
@@ -218,16 +241,7 @@ def chunk_rule(query, key, value, g, beta, chunk_size=64, initial_state=None,
     decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
     attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
 
-    eye = torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
-    transform = eye + attn
-    power = attn
-    step = 2
-    while step < chunk_size:
-        # P covers I + A + ... + A^(step-1) and A^step is the next power to fold in
-        power = power @ power
-        transform = transform + power @ transform
-        step *= 2
-    attn = transform
+    attn = ut_inverse(attn)
 
     value = attn @ v_beta
     k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
