@@ -12,7 +12,12 @@ These three Triton kernels replace it:
   * _norm_kernel: the gated RMS norm (weight has +1 baked by the caller's RMSNorm add).
 
 Measured 11.5 us per layer for the last two, ~2.9 ms per decode step saved at seq=1.
+
+The prefill side is not a Triton kernel: chunk_rule is core's torch chunk rule
+with its 63-step UT loop replaced by a doubling Neumann series (see its docstring).
 """
+
+import sys
 
 import torch
 import torch.nn.functional as F
@@ -166,6 +171,121 @@ def gated_delta_decode_fused(mixed_qkv, x, w_a, w_b, dt_bias, g_decay, state,
         out, z.reshape(-1, dv), norm_weight, DV=dv, EPS=eps, num_warps=1,
     )
     return out.to(out_dtype) if out.dtype != out_dtype else out
+
+
+def chunk_rule(query, key, value, g, beta, chunk_size=64, initial_state=None,
+               output_final_state=False):
+    """comfy/text_encoders/qwen35.py:116 with the UT transform as a doubling series.
+
+    Everything but the transform is core's code, kept line for line: a new core
+    parameter has to be mirrored here. core builds the chunk's UT transform with a
+    63-step Python loop of forward substitution (qwen35.py:143-146), which is
+    ~315 small kernels per layer per prefill and 9.9 ms of the 32.8 ms this call
+    costs on a 4k prefill. Because the starting matrix is strictly lower it is
+    nilpotent, so the transform is the finite Neumann series I + A + ... + A^C-1,
+    and that series doubles in log2(chunk_size) steps: 2.2 ms, 4.5x, in fp32
+    (maxabs 2.2e-8 against core's own loop; bf16 is 1.8x slower than fp32 here
+    because gfx906 has no bf16 matrix unit, and fp16 buys nothing at 64x64).
+    """
+    initial_dtype = query.dtype
+    query = F.normalize(query, dim=-1)
+    key = F.normalize(key, dim=-1)
+    query, key, value, beta, g = [x.transpose(1, 2).contiguous().to(torch.float32)
+                                  for x in (query, key, value, beta, g)]
+
+    batch_size, num_heads, sequence_length, k_head_dim = key.shape
+    v_head_dim = value.shape[-1]
+    pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
+    query = F.pad(query, (0, 0, 0, pad_size))
+    key = F.pad(key, (0, 0, 0, pad_size))
+    value = F.pad(value, (0, 0, 0, pad_size))
+    beta = F.pad(beta, (0, pad_size))
+    g = F.pad(g, (0, pad_size))
+    total_sequence_length = sequence_length + pad_size
+    scale = 1 / (query.shape[-1] ** 0.5)
+    query = query * scale
+
+    v_beta = value * beta.unsqueeze(-1)
+    k_beta = key * beta.unsqueeze(-1)
+    query, key, value, k_beta, v_beta = [
+        x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1])
+        for x in (query, key, value, k_beta, v_beta)]
+    g = g.reshape(g.shape[0], g.shape[1], -1, chunk_size)
+    mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device),
+                      diagonal=0)
+
+    g = g.cumsum(dim=-1)
+    decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
+    attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
+
+    eye = torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
+    transform = eye + attn
+    power = attn
+    step = 2
+    while step < chunk_size:
+        # P covers I + A + ... + A^(step-1) and A^step is the next power to fold in
+        power = power @ power
+        transform = transform + power @ transform
+        step *= 2
+    attn = transform
+
+    value = attn @ v_beta
+    k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
+    last_recurrent_state = (
+        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim, device=value.device,
+                    dtype=value.dtype)
+        if initial_state is None
+        else initial_state.to(value)
+    )
+    core_attn_out = torch.zeros_like(value)
+    mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device),
+                      diagonal=1)
+
+    for i in range(0, total_sequence_length // chunk_size):
+        q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
+        attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask, 0)
+        v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state
+        v_new = v_i - v_prime
+        attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_recurrent_state
+        core_attn_out[:, :, i] = attn_inter + attn @ v_new
+        last_recurrent_state = (
+            last_recurrent_state * g[:, :, i, -1, None, None].exp()
+            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
+        )
+
+    if not output_final_state:
+        last_recurrent_state = None
+    core_attn_out = core_attn_out.reshape(core_attn_out.shape[0], core_attn_out.shape[1], -1,
+                                          core_attn_out.shape[-1])
+    core_attn_out = core_attn_out[:, :, :sequence_length]
+    core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
+    return core_attn_out, last_recurrent_state
+
+
+def install_prefill(gate=None):
+    """Route Qwen3.5's prefill chunk rule through chunk_rule.
+
+    ``gate`` is read per call like install()'s, so the textgen switch still
+    reaches core's loop. The replacement is bound by name in core and in this
+    pack's qwen35_model, so already-imported references are repointed too.
+    """
+    from comfy.text_encoders import qwen35
+
+    if getattr(qwen35, "_gfx906_chunk_rule", False):
+        return True
+    original = qwen35.torch_chunk_gated_delta_rule
+
+    def routed(*args, **kwargs):
+        if gate is not None and not gate():
+            return original(*args, **kwargs)
+        return chunk_rule(*args, **kwargs)
+
+    routed._gfx906_chunk_rule = True
+    qwen35.torch_chunk_gated_delta_rule = routed
+    for module in list(sys.modules.values()):
+        if getattr(module, "torch_chunk_gated_delta_rule", None) is original:
+            module.torch_chunk_gated_delta_rule = routed
+    return routed
 
 
 def install(gate=None):

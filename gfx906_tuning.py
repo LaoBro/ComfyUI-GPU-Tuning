@@ -116,6 +116,7 @@ _state = {
     "vae_patched": False,
     "vision_enabled": False,
     "vision_patched": False,
+    "delta_prefill_enabled": False,
     "gemv_module": None,
     "textgen_env": {},
     "textgen_ready": {},
@@ -2061,11 +2062,17 @@ def apply():
     # text-generation group: installed once with a live gate, so the CLIP node
     # can turn it off without a reload. Modules are loaded on the measured arch
     # even when the env default is off, otherwise the node could not turn them on.
-    if install_ready("deltanet"):
+    if install_ready("deltanet") or install_ready("deltanet_prefill"):
         deltanet_kernels = _install("deltanet loader", load_deltanet)
         if deltanet_kernels:
             _state["textgen_ready"]["deltanet"] = bool(
                 _install("deltanet", deltanet_kernels.install, lambda: textgen_active("deltanet")))
+            # the prefill transform is a separate measurement: gfx906 may want
+            # one and not the other, and both ride the textgen switch when installed
+            _state["delta_prefill_enabled"] = install_ready("deltanet_prefill")
+            if _state["delta_prefill_enabled"]:
+                _install("deltanet prefill", deltanet_kernels.install_prefill,
+                         lambda: textgen_active("deltanet"))
     _state["textgen_ready"]["kvdecode"] = bool(
         _install("kv decode", patch_kv_decode, lambda: textgen_active("kvdecode")))
     llama_patches = _install("llama loader", load_llama_patches)
@@ -2216,7 +2223,8 @@ def status():
         text_gemv_line,
         w4a8_line,
         f"vae {'conv3d as conv2d' if _state.get('vae_patched') and _state.get('vae_enabled') else ('off (patched)' if _state.get('vae_patched') else 'off')}",
-        f"textgen {textgen_summary()}",
+        f"textgen {textgen_summary()}"
+        + f", prefill {'doubling' if _state['delta_prefill_enabled'] else 'core loop'}",
         f"attention {_state['attn_kernel'] if _state['attention'] else 'off'}"
         + (f", smoothing {'on' if _state['smooth'] else 'off'}" if _state["attn_kernel"] == "int8qk" else "")
         + ((", inputs cast to fp16" if _state["attn_fp16"] else ", inputs left in the model dtype")

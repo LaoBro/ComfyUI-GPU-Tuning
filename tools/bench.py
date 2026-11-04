@@ -90,6 +90,9 @@ W4A8_GROUP = 128
 DELTANET_HIDDEN = 2048
 DELTANET_SHAPES = "1x16x128x128x1,1x16x128x128x4"
 DELTANET_SITE = "deltanet.decode"
+# BxHVxDKxDVxS: one Qwen3.5 DeltaNet prefill at the 2B and 9B head counts.
+DELTANET_PREFILL_SITE = "deltanet.prefill"
+DELTANET_PREFILL_SHAPES = "1x32x128x128x1024,1x32x128x128x4096"
 # Depth-1 Conv3d (channels x spatial size) and ConvRot prep (rows x k): the two
 # tier-3 features whose fastest form differs per card without being kernels.
 VAE_SITE = "vae.decode"
@@ -149,7 +152,8 @@ def parse_args():
     parser.add_argument("--tile", action="store_true", help="also sweep the int8 GEMM tiles")
     parser.add_argument("--attention", action="store_true", help="also sweep the attention tiles")
     parser.add_argument("--deltanet", action="store_true",
-                        help="also time the DeltaNet decode against comfy-kitchen's fused op")
+                        help="also time the DeltaNet decode against comfy-kitchen's fused op, "
+                             "and the prefill chunk rule against core's UT loop")
     parser.add_argument("--vae", action="store_true",
                         help="also time depth-1 Conv3d: torch vs the conv2d squeeze vs kitchen")
     parser.add_argument("--convrot", action="store_true",
@@ -169,6 +173,8 @@ def parse_args():
                              "--vae + --convrot + --vision + --qwen35 + the GEMV sites")
     parser.add_argument("--deltanet-shapes", default=DELTANET_SHAPES,
                         help="BxHVxDKxDVxS list for the DeltaNet decode benchmark")
+    parser.add_argument("--deltanet-prefill-shapes", default=DELTANET_PREFILL_SHAPES,
+                        help="BxHVxDKxDVxS list for the DeltaNet prefill chunk-rule benchmark")
     parser.add_argument("--vae-shapes", default=VAE_SHAPES,
                         help="channels x size list for the depth-1 Conv3d benchmark")
     parser.add_argument("--vision-shapes", default=VISION_SHAPES,
@@ -722,6 +728,69 @@ def run_deltanet_site(args, today):
     return records, defaults
 
 
+def run_deltanet_prefill_site(args, today):
+    """Time the Qwen3.5 prefill chunk rule: core's UT loop vs the doubling series.
+
+    Both run the identical algorithm on identical inputs; the only difference is
+    the 63-step forward-substitution loop (qwen35.py:143-146) against the Neumann
+    doubling series in deltanet.chunk_rule. The numeric gate compares against
+    core's own output, so a record can only be written for a variant that answers
+    the same question. feature.deltanet_prefill is written from the gain.
+    """
+    import deltanet
+    from comfy.text_encoders.qwen35 import torch_chunk_gated_delta_rule
+
+    records, ratios = {}, []
+    for item in args.deltanet_prefill_shapes.split(","):
+        batch, heads, dk, dv, seq = (int(x) for x in item.strip().split("x"))
+        key = f"b{batch}xh{heads}xdk{dk}xdv{dv}xs{seq}"
+        gen = torch.Generator(device="cuda").manual_seed(0)
+        q = torch.randn(batch, seq, heads, dk, device="cuda", dtype=torch.float32, generator=gen)
+        k = torch.randn(batch, seq, heads, dk, device="cuda", dtype=torch.float32, generator=gen)
+        v = torch.randn(batch, seq, heads, dv, device="cuda", dtype=torch.float32, generator=gen) * 0.1
+        g = (-torch.rand(batch, seq, heads, device="cuda", generator=gen) - 1.0) * 0.02
+        beta = torch.rand(batch, seq, heads, device="cuda", generator=gen).sigmoid()
+        print(f"\n  {key}")
+
+        times, errors = {}, {}
+        for label, fn in (("loop", torch_chunk_gated_delta_rule), ("doubling", deltanet.chunk_rule)):
+            out, state = fn(q, k, v, g, beta)
+            torch.cuda.synchronize()
+            if label == "loop":
+                expected, want_state = out, state
+            else:
+                error = refs.rel(out, expected)
+                if want_state is not None:
+                    error = max(error, refs.rel(state, want_state))
+                if error > args.max_rel:
+                    print(f"    {label:<9} REJECTED: rel {error:.2e} > {args.max_rel:.0e}")
+                    continue
+                errors[label] = error
+            times[label] = bench_ms(lambda f=fn: f(q, k, v, g, beta), args.iters, args.warmup)
+            print(f"    {label:<9} {times[label] * 1000:8.1f} us  "
+                  f"rel {errors.get(label, 0.0):.1e}")
+
+        if len(times) < 2:
+            print(f"  {key}: both implementations are the shipped loop, nothing to compare")
+            continue
+        winner = min(times, key=times.get)
+        ratios.append(times["doubling"] / times["loop"])
+        records.setdefault(DELTANET_PREFILL_SITE, {})[key] = manifest_write.render(
+            key, winner, times, rel=errors["doubling"], date=today,
+            note="fp32 chunk rule, UT transform only difference")
+
+    defaults = {}
+    if ratios:
+        gain = 1.0 - statistics.median(ratios)
+        defaults["feature.deltanet_prefill"] = "on" if gain >= args.min_gain else "off"
+        print(f"\n  deltanet prefill: doubling {gain:+.1%} against core's loop, "
+              f"feature.deltanet_prefill={defaults['feature.deltanet_prefill']}")
+    else:
+        print("\n  deltanet prefill: nothing comparable measured, "
+              "leaving feature.deltanet_prefill alone")
+    return records, defaults
+
+
 def run_qwen35_site(args, today):
     """Compare the Qwen3.5 class swap against the shipped methods.
 
@@ -1115,6 +1184,9 @@ def main():
         run_attention_site(args, today)
     if args.deltanet or args.all:
         records, choices = run_deltanet_site(args, today)
+        written.update(records)
+        defaults.update(choices)
+        records, choices = run_deltanet_prefill_site(args, today)
         written.update(records)
         defaults.update(choices)
     if args.vae or args.all:
