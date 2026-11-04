@@ -1166,6 +1166,10 @@ class BaseGenerate:
         # static buffers for graphed decode blocks in every regime: the capture
         # bakes their addresses, so a per-step clone would go stale on replay
         if self.model.graph_dynamic_vbar_blocks and not comfy.model_management.args.disable_cuda_graphs:
+            # the buffers below are what the blocks capture into their graphs, so a
+            # second generate() in the same process must not replay call one's graph
+            # onto the addresses the allocator just recycled
+            comfy.model_prefetch.drop_resident_graphs(self.model)
             init_decode_buffers = getattr(self.model, "init_decode_buffers", None)
             if init_decode_buffers is not None:
                 decode_buffers = init_decode_buffers(embeds.shape[0], device, execution_dtype)

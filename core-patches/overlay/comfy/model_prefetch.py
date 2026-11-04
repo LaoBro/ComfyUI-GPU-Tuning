@@ -149,6 +149,19 @@ def _drop_graph(module):
         graph["graph"].reset()
     del module._comfy_graph
 
+def drop_resident_graphs(module):
+    """Invalidate every resident graph under `module`.
+
+    Resident capture bakes the caller's buffer addresses and replays without
+    checking them, on the assumption that those buffers live as long as the graph.
+    A generate() loop breaks that: it allocates its decode buffers and KV cache per
+    call, so the next call gets fresh objects at the addresses the allocator just
+    recycled and the old graph replays onto them. The streaming path does not need
+    this because it revalidates a vbar page signature on every replay.
+    """
+    for child in module.modules():
+        _drop_graph(child)
+
 def _capture_stream(device):
     capture_stream = GRAPH_CAPTURE_STREAMS.get(device)
     if capture_stream is not None:

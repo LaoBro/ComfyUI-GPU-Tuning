@@ -13,10 +13,20 @@ control rather than a single function, and copying those functions at runtime
 would drift silently when ComfyUI changes. So it ships as three known-good files:
 
 ```
-overlay/comfy/model_prefetch.py          RESIDENT_GRAPH_MODULES, per-block capture/replay
-overlay/comfy/text_encoders/llama.py     decode_buffers allocation, enable_graph for resident blocks
+overlay/comfy/model_prefetch.py          RESIDENT_GRAPH_MODULES, per-block capture/replay,
+                                         drop_resident_graphs
+overlay/comfy/text_encoders/llama.py     decode_buffers allocation, enable_graph for resident
+                                         blocks, graphs invalidated at the start of generate
 overlay/execution.py                     cleanup_prefetch_queues called outside the aimdo gate
 ```
+
+A resident capture bakes the addresses of the buffers the caller handed it and then
+replays without checking them, so the graphs are only valid while those buffers are.
+`BaseGenerate.generate` allocates its decode buffers and KV cache per call, which means
+a second generate in the same process would replay call one's graph onto the addresses
+the allocator just recycled: the output silently degrades from the first decode step
+(`HSA_STATUS_ERROR_MEMORY_FAULT` if the memory was already released). The capture is
+therefore dropped per generate, right before the new buffers are made.
 
 ## Install
 
