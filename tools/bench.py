@@ -28,7 +28,8 @@ The pipeline per shape is fixed, in this order:
 2. run each implementation once and compare against the reference -- a kernel
    that is off by more than --max-rel is reported and *not* timed, so a broken
    fast path can never win a benchmark;
-3. time what survived (median of --iters after --warmup), keep every time in
+3. time what survived (the fastest of --repeats rounds, each the median of
+   --iters after --warmup), keep every time in
    the record, and mark the fastest as the winner -- unless the runner-up is
    within --min-gain, in which case the probe order wins: this card moves ~10%
    between runs, so a 0.4% "win" is the clock, not the kernel.
@@ -118,6 +119,16 @@ TILE_BATCH = "1,8,128"
 # (d64) cover the two head dims the kernels were compiled for.
 ATTENTION_SHAPES = "1x24x4608x4608@d128,1x24x4608x256@d128,2x20x4096x4096@d64"
 
+# One timed round is not trustworthy on this card. Eight fresh bench processes on
+# int8_gemv.m1 / 4096x4096@m1 gave 112-129 us six times and 163 / 177 us twice,
+# and in the 177 us round the triton implementation slowed to 178.9 us as well,
+# while a 4096^3 fp16 matmul (12834-13491 us) and a 256 MB copy (691-702 us)
+# measured the same in every round. So the disturbed rounds are not a clock state:
+# something in that process slows the small bandwidth-bound kernels. Keeping the
+# fastest of two rounds cuts the chance a winner is elected on a disturbed one
+# from ~25% to ~6%; --repeats raises it further on a noisier card.
+REPEATS = 2
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__,
@@ -127,6 +138,9 @@ def parse_args():
     parser.add_argument("--shapes", default="", help="NxK@mM list, overrides the site default")
     parser.add_argument("--iters", type=int, default=5)
     parser.add_argument("--warmup", type=int, default=2)
+    parser.add_argument("--repeats", type=int, default=REPEATS,
+                        help="timed rounds per implementation; the fastest round is kept "
+                             "(one round is disturbed often enough to flip a winner)")
     parser.add_argument("--max-rel", type=float, default=0.05,
                         help="numeric gate against tools/refs.py (default 5%%, activation quantisation is ~1%%)")
     parser.add_argument("--min-gain", type=float, default=0.03,
@@ -208,19 +222,27 @@ def parse_attention_shapes(text):
     return shapes
 
 
-def bench_ms(fn, iters, warmup):
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-    samples = []
-    for _ in range(iters):
-        start, end = torch.cuda.Event(True), torch.cuda.Event(True)
-        start.record()
-        fn()
-        end.record()
+def bench_ms(fn, iters, warmup, repeat=None):
+    """Median of one round, and the fastest round of `repeat` of them.
+
+    The warmup inside a round does not protect against a disturbed round, so the
+    rounds are repeated and the fastest kept (see REPEATS above).
+    """
+    rounds = []
+    for _ in range(REPEATS if repeat is None else repeat):
+        for _ in range(warmup):
+            fn()
         torch.cuda.synchronize()
-        samples.append(start.elapsed_time(end))
-    return statistics.median(samples)
+        samples = []
+        for _ in range(iters):
+            start, end = torch.cuda.Event(True), torch.cuda.Event(True)
+            start.record()
+            fn()
+            end.record()
+            torch.cuda.synchronize()
+            samples.append(start.elapsed_time(end))
+        rounds.append(statistics.median(samples))
+    return min(rounds)
 
 
 def int8_case(module, n, k, m, args, spec):
@@ -229,9 +251,10 @@ def int8_case(module, n, k, m, args, spec):
     The baseline is the stock int8 linear at the same shape: what runs with the
     GEMV off. That is the decision feature.gemv records.
     """
-    weight = torch.randint(-127, 127, (n, k), device="cuda", dtype=torch.int8)
-    scale = torch.rand(n, device="cuda", dtype=torch.float32) * 0.01 + 1e-4
-    x = torch.randn(m, k, device="cuda", dtype=torch.float32)
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    weight = torch.randint(-127, 127, (n, k), device="cuda", dtype=torch.int8, generator=gen)
+    scale = torch.rand(n, device="cuda", dtype=torch.float32, generator=gen) * 0.01 + 1e-4
+    x = torch.randn(m, k, device="cuda", dtype=torch.float32, generator=gen)
     reference = refs.int8_reference(x, weight, scale)
 
     def run(fn):
@@ -258,15 +281,17 @@ def w4a8_case(module, n, k, m, args, spec):
     group = args.w4a8_group
     if k % group:
         raise ValueError(f"k={k} is not a multiple of --w4a8-group {group}")
-    qdata = torch.randint(0, 256, (n, k // 2), device="cuda", dtype=torch.uint8)
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    qdata = torch.randint(0, 256, (n, k // 2), device="cuda", dtype=torch.uint8, generator=gen)
     # s_rel lives in 1..15.5 so (code - 8) * s_rel fills the int8 grid both
     # decode paths share; a smaller split silently rounds the weights to zero.
-    s_rel = torch.rand(n, k // group, device="cuda", dtype=torch.float32) * 14.5 + 1.0
-    s_channel = torch.rand(n, device="cuda", dtype=torch.float32) * 0.01 + 1e-3
+    s_rel = torch.rand(n, k // group, device="cuda", dtype=torch.float32, generator=gen) * 14.5 + 1.0
+    s_channel = torch.rand(n, device="cuda", dtype=torch.float32, generator=gen) * 0.01 + 1e-3
     codebook = None
     if not args.w4a8_uniform:
-        codebook = torch.sort(torch.randn(16, device="cuda", dtype=torch.float32)).values * 3.0
-    x = torch.randn(m, k, device="cuda", dtype=torch.float32)
+        codebook = torch.sort(torch.randn(16, device="cuda", dtype=torch.float32,
+                                          generator=gen)).values * 3.0
+    x = torch.randn(m, k, device="cuda", dtype=torch.float32, generator=gen)
     reference = x @ refs.w4a8_weight(qdata, s_rel, s_channel, group, codebook).T
 
     levels, inv_level = (module.codebook_words(codebook) if codebook is not None
@@ -498,11 +523,15 @@ def run_attention_site(args, today):
     import gfx906_tuning as tuning
 
     shapes = parse_attention_shapes(args.attention_shapes)
+    gen = torch.Generator(device="cuda").manual_seed(0)
     samples = {}                                     # (shape index, mode, label) -> ms
     for index, (batch, heads, seq_q, seq_k, head_dim) in enumerate(shapes):
-        q = torch.randn(batch, seq_q, heads, head_dim, device="cuda", dtype=torch.float16)
-        k = torch.randn(batch, seq_k, heads, head_dim, device="cuda", dtype=torch.float16)
-        v = torch.randn(batch, seq_k, heads, head_dim, device="cuda", dtype=torch.float16)
+        q = torch.randn(batch, seq_q, heads, head_dim, device="cuda", dtype=torch.float16,
+                        generator=gen)
+        k = torch.randn(batch, seq_k, heads, head_dim, device="cuda", dtype=torch.float16,
+                        generator=gen)
+        v = torch.randn(batch, seq_k, heads, head_dim, device="cuda", dtype=torch.float16,
+                        generator=gen)
         reference = refs.attention_reference(q, k, v)
         out = torch.empty_like(q)
         scale = attn._scale(None, head_dim)
@@ -627,15 +656,19 @@ def run_deltanet_site(args, today):
 
         key_dim = sub * dk
         hidden = args.deltanet_hidden
-        mixed = torch.randn(batch, 2 * key_dim + heads * dv, seq, device="cuda", dtype=torch.float32)
-        x = torch.randn(batch, seq, hidden, device="cuda", dtype=torch.float32) * 0.1
-        w_a = torch.randn(heads, hidden, device="cuda", dtype=torch.float32) * 0.02
-        w_b = torch.randn(heads, hidden, device="cuda", dtype=torch.float32) * 0.02
-        dt_bias = torch.randn(heads, device="cuda", dtype=torch.float32) * 0.1
-        g_decay = -torch.rand(heads, device="cuda", dtype=torch.float32) - 1.0
-        z = torch.randn(batch, seq, heads * dv, device="cuda", dtype=torch.float32)
-        norm_weight = torch.rand(dv, device="cuda", dtype=torch.float32) + 0.5
-        start = torch.randn(batch, heads, dk, dv, device="cuda", dtype=torch.float32) * 0.1
+        gen = torch.Generator(device="cuda").manual_seed(0)
+        mixed = torch.randn(batch, 2 * key_dim + heads * dv, seq, device="cuda",
+                            dtype=torch.float32, generator=gen)
+        x = torch.randn(batch, seq, hidden, device="cuda", dtype=torch.float32,
+                        generator=gen) * 0.1
+        w_a = torch.randn(heads, hidden, device="cuda", dtype=torch.float32, generator=gen) * 0.02
+        w_b = torch.randn(heads, hidden, device="cuda", dtype=torch.float32, generator=gen) * 0.02
+        dt_bias = torch.randn(heads, device="cuda", dtype=torch.float32, generator=gen) * 0.1
+        g_decay = -torch.rand(heads, device="cuda", dtype=torch.float32, generator=gen) - 1.0
+        z = torch.randn(batch, seq, heads * dv, device="cuda", dtype=torch.float32, generator=gen)
+        norm_weight = torch.rand(dv, device="cuda", dtype=torch.float32, generator=gen) + 0.5
+        start = torch.randn(batch, heads, dk, dv, device="cuda", dtype=torch.float32,
+                            generator=gen) * 0.1
         scale = dk ** -0.5
         eps = 1e-6
 
@@ -927,7 +960,8 @@ def run_convrot_site(args, today):
             print(f"\n  m{rows}x{k} skipped: k must be a multiple of {rot.GROUP_SIZE}")
             continue
         key = f"m{rows}x{k}"
-        x = torch.randn(rows, k, device="cuda", dtype=torch.float16)
+        gen = torch.Generator(device="cuda").manual_seed(0)
+        x = torch.randn(rows, k, device="cuda", dtype=torch.float16, generator=gen)
         reference = rot.hadamard_rotate(x).float()
         print(f"\n  {key}")
 
@@ -1021,7 +1055,10 @@ def write_manifest(arch, fingerprint, written, winners, defaults, path, today):
 
 
 def main():
+    global REPEATS
+
     args = parse_args()
+    REPEATS = args.repeats
     if not torch.cuda.is_available():
         print("no device: torch.cuda.is_available() is False (see tools/verify_backends.py for the same check)")
         return 2
@@ -1041,7 +1078,8 @@ def main():
         return 2
 
     print(f"{arch} | {fingerprint}")
-    print(f"{args.iters} iters, {args.warmup} warmup, numeric gate {args.max_rel:.0%}")
+    print(f"{args.iters} iters, {args.warmup} warmup, {args.repeats} round(s), "
+          f"numeric gate {args.max_rel:.0%}")
     today = datetime.date.today().isoformat()
 
     written, winners, defaults = {}, {}, {}
