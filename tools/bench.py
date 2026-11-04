@@ -49,6 +49,7 @@ import gc
 import os
 import statistics
 import sys
+import time
 from pathlib import Path
 
 TOOLS_DIR = Path(__file__).resolve().parent
@@ -122,15 +123,30 @@ TILE_BATCH = "1,8,128"
 # (d64) cover the two head dims the kernels were compiled for.
 ATTENTION_SHAPES = "1x24x4608x4608@d128,1x24x4608x256@d128,2x20x4096x4096@d64"
 
-# One timed round is not trustworthy on this card. Eight fresh bench processes on
-# int8_gemv.m1 / 4096x4096@m1 gave 112-129 us six times and 163 / 177 us twice,
-# and in the 177 us round the triton implementation slowed to 178.9 us as well,
-# while a 4096^3 fp16 matmul (12834-13491 us) and a 256 MB copy (691-702 us)
-# measured the same in every round. So the disturbed rounds are not a clock state:
-# something in that process slows the small bandwidth-bound kernels. Keeping the
-# fastest of two rounds cuts the chance a winner is elected on a disturbed one
-# from ~25% to ~6%; --repeats raises it further on a noisier card.
+# Why a single timed round used to flip winners: after ~0.5 s of GPU idle the
+# first kernels measure 2-3x slow (asm GEMV on 4096x4096@m1: 113.9 us back to
+# back, 272.2 us after a 0.5 s gap, 318.7 us after 1 s), and pp_dpm_sclk reports
+# the same 1556 MHz level the whole time, so the DPM file shows nothing. The JIT
+# compile between shapes is exactly that kind of GPU-idle gap. warm_clocks() runs
+# after the warmup so the samples do not start in the ramp; the fastest of
+# REPEATS rounds is kept on top of that because a noisier card can still disturb
+# one round.
 REPEATS = 2
+
+_WARM = None
+
+
+def warm_clocks(ms=100):
+    """Run the GPU up to working clocks, after the warmup compiled the kernel."""
+    global _WARM
+    if _WARM is None:
+        _WARM = (torch.randn(4096, 4096, device="cuda", dtype=torch.float16),
+                 torch.randn(4096, 4096, device="cuda", dtype=torch.float16))
+    stop = time.perf_counter() + ms / 1000
+    while time.perf_counter() < stop:
+        for _ in range(8):
+            _WARM[0] @ _WARM[1]
+        torch.cuda.synchronize()
 
 
 def parse_args():
@@ -231,14 +247,15 @@ def parse_attention_shapes(text):
 def bench_ms(fn, iters, warmup, repeat=None):
     """Median of one round, and the fastest round of `repeat` of them.
 
-    The warmup inside a round does not protect against a disturbed round, so the
-    rounds are repeated and the fastest kept (see REPEATS above).
+    Each round warms the clocks after its warmup, so a compile pause cannot put
+    the timed samples into the idle ramp (see the REPEATS note above).
     """
     rounds = []
     for _ in range(REPEATS if repeat is None else repeat):
         for _ in range(warmup):
             fn()
         torch.cuda.synchronize()
+        warm_clocks()
         samples = []
         for _ in range(iters):
             start, end = torch.cuda.Event(True), torch.cuda.Event(True)
@@ -568,7 +585,10 @@ def run_attention_site(args, today):
             if error > args.attention_max_rel:
                 print(f"    {mode:<5} {label:<10} REJECTED: rel {error:.2e} > {args.attention_max_rel:.0%}")
                 continue
-            # same election as bench_ms: the fastest round is the undisturbed one
+            # same election as bench_ms: the fastest round is the undisturbed one.
+            # _time_call compiles inside its own warmup, so the clocks are also
+            # pinned up here; the second round covers the ramp the compile leaves.
+            warm_clocks()
             samples[(index, mode, label)] = min(attn._time_call(run, runs=args.iters)
                                                  for _ in range(REPEATS))
             print(f"    {mode:<5} {label:<10} {samples[(index, mode, label)] * 1000:8.1f} us  "

@@ -17,6 +17,7 @@ import argparse
 import os
 import statistics
 import sys
+import time
 from pathlib import Path
 
 NODE_DIR = Path(__file__).resolve().parent.parent
@@ -92,18 +93,39 @@ def default_candidates(kernels):
     return unique
 
 
+_WARM = None
+
+
+def warm_clocks(ms=100):
+    """Run the GPU up to working clocks before the samples.
+
+    After ~0.5 s of idle the first kernels measure 2-3x slow and pp_dpm_sclk
+    reports no change, so the compile pause between tiles used to bias whichever
+    candidate happened to follow it. See the REPEATS note in tools/bench.py.
+    """
+    global _WARM
+    if _WARM is None:
+        _WARM = (torch.randn(4096, 4096, device="cuda", dtype=torch.float16),
+                 torch.randn(4096, 4096, device="cuda", dtype=torch.float16))
+    stop = time.perf_counter() + ms / 1000
+    while time.perf_counter() < stop:
+        for _ in range(8):
+            _WARM[0] @ _WARM[1]
+        torch.cuda.synchronize()
+
+
 def bench(fn, iters, warmup, repeat=1):
     """The fastest of `repeat` rounds, each round the median of `iters` calls.
 
-    A single round is not trustworthy on this card: about a quarter of fresh
-    processes slow one bandwidth-bound kernel by 30-50% while a 4096^3 matmul and
-    a 256 MB copy stay flat. The disturbed round is the one to drop, not average.
+    The clocks are warmed after the warmup, so a compile pause in the warmup
+    cannot push the timed rounds into the idle ramp.
     """
     rounds = []
     for _ in range(repeat):
         for _ in range(warmup):
             fn()
         torch.cuda.synchronize()
+        warm_clocks()
         samples = []
         for _ in range(iters):
             start, end = torch.cuda.Event(True), torch.cuda.Event(True)
