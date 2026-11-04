@@ -136,10 +136,12 @@ class Gfx906ClipSettings(io.ComfyNode):
                                        "activations (fastest on 4-bit checkpoints, embeddings shift ~6%); "
                                        "default keeps fp16 activations and dequantizes in registers on "
                                        "the fly (best quality, same speed on 8-bit checkpoints)."),
-                io.Combo.Input("text_attention", options=["default"] + backend_options(), default="default",
-                               tooltip="default keeps what core picks for "
-                                       "small inputs; the rest route to that backend, no restart needed. The "
-                                       "custom int8/hand kernels are not listed: they reject masked calls."),
+                io.Combo.Input("text_attention", options=["default"], default="default",
+                               tooltip="default keeps what core picks for small inputs. Text encoders "
+                                       "fetch attention with small_input=True and a named backend does "
+                                       "replace that pick, but none of them has a measured win on text "
+                                       "shapes on this card, so none is offered here; the routing is live, "
+                                       "add a name back when a measurement justifies it."),
                 io.Combo.Input("text_gemv", options=list(TRISTATE), default="default",
                                tooltip="Single-row text-encoder GEMV: the direct int8 kernel call and the "
                                        "torch.mv path for the unquantized gate projections. default keeps "
