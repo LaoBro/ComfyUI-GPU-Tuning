@@ -151,6 +151,13 @@ class Gfx906ClipSettings(io.ComfyNode):
                                        "prefill unpacks one layer to int8. default keeps it on; "
                                        "off dequantizes through the shipped layout. status shows the call count "
                                        "so a swapped checkpoint can be confirmed."),
+                io.Combo.Input("image_tower", options=list(TRISTATE), default="default",
+                               tooltip="Qwen3.5 image tower: keep the input in the weight dtype instead of "
+                                       "the fp32 core hands it, and answer the patch Conv3d with the "
+                                       "equivalent GEMM (its kernel equals its stride, and gfx906 has no "
+                                       "conv3d kernel). Measured 3.83 -> 1.6 s for a 1160x679 image on this "
+                                       "card. default keeps the manifest verdict: unmeasured cards stay on "
+                                       "the shipped path, tools/bench.py --vision writes the verdict."),
                 io.Combo.Input("textgen", options=list(TRISTATE), default="default",
                                tooltip="Text-generation patches: DeltaNet decode kernels, folded KV decode, "
                                        "llama RMSNorm/RoPE caching and the Qwen3.5 compute classes. default "
@@ -163,10 +170,10 @@ class Gfx906ClipSettings(io.ComfyNode):
 
     @classmethod
     def execute(cls, clip, text_encoder: str, text_attention: str, text_gemv: str, w4a8: str,
-                textgen: str) -> io.NodeOutput:
+                textgen: str, image_tower: str) -> io.NodeOutput:
         apply()
         configure(text_encoder=text_encoder, text_attention=text_attention, text_gemv=text_gemv,
-                  w4a8=w4a8, textgen=textgen)
+                  w4a8=w4a8, textgen=textgen, image_tower=image_tower)
         return io.NodeOutput(clip)
 
 

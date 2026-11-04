@@ -114,6 +114,8 @@ _state = {
     "reason": "",
     "vae_enabled": True,
     "vae_patched": False,
+    "vision_enabled": False,
+    "vision_patched": False,
     "gemv_module": None,
     "textgen_env": {},
     "textgen_ready": {},
@@ -1305,7 +1307,7 @@ def triton_backend_active():
 def configure(attention=None, smooth=None, convrot=None, profile=None, text_encoder=None,
               fp16=None, text_attention=None, contiguous=None, qkv=None,
               vae=None, gemv=None, textgen=None, prefix_kv=None, text_gemv=None, w4a8=None,
-              amax_guard=None, int8_tile=None, small_batch=None):
+              amax_guard=None, int8_tile=None, small_batch=None, image_tower=None):
     """Runtime settings, used by the GFX906 nodes.
 
     Every argument is three-state: None/"default" keeps the built-in default
@@ -1342,6 +1344,9 @@ def configure(attention=None, smooth=None, convrot=None, profile=None, text_enco
                                   or stock_backend(wanted) is not None else "default")
     if vae is not None:
         _state["vae_enabled"] = resolve_flag(vae, feature_on("vae"))
+    if image_tower is not None and _state["vision_patched"]:
+        # "default" keeps the boot decision (manifest verdict, or a FORCE opt-in)
+        _state["vision_enabled"] = resolve_flag(image_tower, _state["vision_enabled"])
     if gemv is not None:
         want = flag_value(gemv)
         if want is None:
@@ -1910,6 +1915,76 @@ def patch_vae():
     return True
 
 
+def patch_vision():
+    """Qwen3.5 image tower: keep its own dtype and answer the patch Conv3d with a GEMM.
+
+    Core hands the tower an fp32 input (qwen35.py:735) while its weights are the
+    text-encoder dtype, so every vision linear upcasts its weights on every call:
+    4.04 -> 2.71 s for a 1160x679 image on this card with the dtype alone, and
+    1.5-1.7 s with both parts here. The tower output is bit-identical for the
+    dtype change because the result lands in the weight dtype anyway.
+
+    The patch projection is a Conv3d whose kernel equals its stride
+    ((temporal, patch, patch)), so each output element is one dot product over a
+    whole flattened patch and the conv is exactly a Linear. gfx906 has no conv3d
+    kernel, so torch lowers it to im2col + bmm: 2.24 s of the 2.7 s left above,
+    unchanged by dtype. Measured against F.conv3d on the same weight the GEMM is
+    the same answer to within the accumulation order (4.2e-5 maxabs on a 29.8
+    scale in fp32, <= 2 bf16 ulp), and it keeps the same weight tensor, so
+    checkpoint loading and state dicts do not change.
+
+    Both parts sit behind one live switch (the CLIP node's `image_tower`) whose
+    default is the manifest's `feature.vision`, so an unmeasured card keeps the
+    shipped path and can still be switched on by hand. Inside the fast path a
+    plain-tensor Conv3d with groups 1, no padding, unit dilation and kernel equal
+    to stride takes the GEMM; anything else falls through.
+    """
+    from comfy.text_encoders import qwen35
+    from comfy.quant_ops import QuantizedTensor
+    import comfy.ops
+
+    if getattr(qwen35.Qwen35VisionModel, "_gfx906_vision", False):
+        return True
+    model = qwen35.Qwen35VisionModel
+    patch = qwen35.Qwen35VisionPatchEmbed
+    original_forward = model.forward
+    original_proj = patch.forward
+
+    def forward(self, x, grid_thw):
+        if not _state.get("vision_enabled", False):
+            return original_forward(self, x, grid_thw)
+        dtype = next(self.parameters()).dtype
+        return original_forward(self, x.to(dtype), grid_thw)
+
+    def proj_forward(self, x):
+        conv = self.proj
+        weight = conv.weight
+        kernel = tuple(conv.kernel_size)
+        if (not _state.get("vision_enabled", False)
+                or not isinstance(weight, torch.Tensor) or isinstance(weight, QuantizedTensor)
+                or weight.is_meta or conv.groups != 1
+                or tuple(weight.shape[2:]) != kernel or tuple(conv.stride) != kernel
+                or any(conv.padding) or any(d != 1 for d in conv.dilation)):
+            return original_proj(self, x)
+        # kernel equals stride: every output element is one dot product over a
+        # whole flattened patch, so the conv is exactly a Linear. Cast through the
+        # same door the shipped Conv3d uses so offload and compute dtype hold.
+        flat = x.reshape(x.shape[0], -1)
+        w, b, stream = comfy.ops.cast_bias_weight(conv, flat, offloadable=True,
+                                                  compute_dtype=flat.dtype)
+        try:
+            out = torch.nn.functional.linear(flat, w.reshape(w.shape[0], -1), b)
+        finally:
+            comfy.ops.uncast_bias_weight(conv, w, b, stream)
+        return out.view(-1, self.embed_dim)
+
+    model.forward = forward
+    patch.forward = proj_forward
+    model._gfx906_vision = True
+    _state["vision_patched"] = True
+    return True
+
+
 def apply():
     if _state["applied"]:
         return _state
@@ -1955,6 +2030,11 @@ def apply():
         _install("convrot", patch_convrot)
     if feature_on("vae"):
         _install("vae", patch_vae)
+    # the image tower belongs to the text encoder, but whether its conv3d and fp32
+    # cast cost anything is a per-card fact: the wrappers are always installed so
+    # the node switch works everywhere, and the measured verdict decides the default
+    _install("vision", patch_vision)
+    _state["vision_enabled"] = install_ready("vision")
     # opt-in: the fused GEMM is 1.5% faster but holds 1.6 GB of merged weights
     _state["qkv"] = False
     _install("qkv", patch_qkv)
@@ -2146,6 +2226,7 @@ def status():
         f"text encoder {'int8' if _state['te_int8'] else 'default (dequantize per call)'}"
         + f", lm_head {'int8' if _state.get('logits_patched') and _state['te_int8'] else 'default'}"
         + f", encoder attention {_state['te_attention']}",
+        f"image tower {'weight dtype + patch gemm' if _state['vision_enabled'] else 'shipped path'}",
         f"resident graph hooks {'present' if _state.get('resident_graph_patch') else 'absent'}",
     ]
     manifest_line = manifest_status_line()
