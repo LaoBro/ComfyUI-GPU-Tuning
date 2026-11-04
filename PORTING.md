@@ -40,7 +40,7 @@ def feature_on(item):         # env (on/off) > feature.<item> > off
     return table is not None and table.default_impl("feature." + item) == "on"
 ```
 
-`tools/bench.py --all --write` 写这些 feature 与取值：`feature.w4a8`（和 int8 基线比）、`feature.gemv`（和 stock int8 线性比）、`feature.vae`（和 torch conv3d 或 kitchen 的 `fp16_conv3d` 比）、`feature.convrot` / `convrot.mode`（和 kitchen 的 matmul 旋转比）。attention 不在其中——它的内核是质量分层（见 B 类），mode 由 node/env 手动选；`bench.py --attention` 只打印证据，不写任何记录。`deltanet` 是半例外：kitchen 没有 fused op 的卡上它结构性开启（那个事实不随测量过期），kitchen 有的卡上由 `feature.deltanet` 决定。bench 目前**不写** `feature.qwen35`（它的用例只覆盖 prefill，而收益主要在 decode 路径），所以 qwen35 留在 B 类。
+`tools/bench.py --all --write` 写这些 feature 与取值：`feature.w4a8`（和 int8 基线比）、`feature.gemv`（和 stock int8 线性比）、`feature.vae`（和 torch conv3d 或 kitchen 的 `fp16_conv3d` 比）、`feature.convrot` / `convrot.mode`（和 kitchen 的 matmul 旋转比）、`feature.vision`（和现状的 conv3d patch 投影比）、`feature.deltanet_prefill`（和 core 的逐行 UT 变换比）；完整清单见 §5.2。attention 不在其中——它的内核是质量分层（见 B 类），mode 由 node/env 手动选；`bench.py --attention` 只打印证据，不写任何记录。`deltanet` 是半例外：kitchen 没有 fused op 的卡上它结构性开启（那个事实不随测量过期），kitchen 有的卡上由 `feature.deltanet` 决定。bench 目前**不写** `feature.qwen35`（它的用例只覆盖 prefill，而收益主要在 decode 路径），所以 qwen35 留在 B 类。
 
 `COMFY_GFX906_FORCE=deltanet,w4a8,...` 仍然是手动逃生口：跳过一切判定直接安装，启动日志会 WARNING 说明这些内核不是在当前卡上测的。
 
@@ -414,10 +414,17 @@ default_grade = "derived"
 |---|---|---|---|
 | `<op>.<形状类>` | `NxK@mM` | 实现名（asm/triton/hip） | 注册表按形状选后端 |
 | `int8_gemm.tile` | `large` / `small` | 与 `COMFY_GFX906_TILE_CONFIG` 相同的 tile 文本 | `_triton_config()` / `_small_tile_config()` |
+| `convrot.mode` | `mMxK` | `fused` / `butterfly` | `resolved_convrot_mode()` |
 | `deltanet.decode` | `bBxhvHxdkDKxdvDVxsS` | `triton` / `kitchen` | 只作证据；开不开看 `feature.deltanet` |
+| `deltanet.prefill` | `bBxhHxdkDKxdvDVxsS` | `block`（分块递归）/ `loop`（core 的逐行） | 只作证据；开不开看 `feature.deltanet_prefill` |
+| `vae.decode` | `cCxSS` | `conv2d` / `torch` / `fp16_conv3d` | 只作证据；看 `feature.vae` |
+| `vision.patch_embed` | `pPx dD` | `gemm` / `conv3d` / `conv3d_fp32` | 只作证据；看 `feature.vision` |
+| `qwen35.block` | `bBxsSxhHxlL` | `ours` / `stock` | 只作证据；`feature.qwen35` 不由 bench 写 |
 | `feature.<item>` | —（只有 `default`） | `on` / `off` | `install_ready()` |
 
-`feature.*` 目前由 bench 写四项：`attention`、`w4a8`、`deltanet`、`qwen35`。
+只有 `<op>.<形状类>`、`int8_gemm.tile`、`convrot.mode` 和 `feature.*` 会被运行时读到；其余形状记录是给人看的证据（哪张卡上谁赢、数值差多少），删掉不影响调度。
+
+`feature.*` 由 bench 写七项：`gemv` 和 `w4a8`（GEMV 站点的 `spec["feature"]`，[bench.py:1212](tools/bench.py#L1212)）、`deltanet`（[:743](tools/bench.py#L743)）、`deltanet_prefill`（[:831](tools/bench.py#L831)）、`vae`（[:979](tools/bench.py#L979)）、`vision`（[:1051](tools/bench.py#L1051)）、`convrot`（[:1133](tools/bench.py#L1133)）。**不写**三项：`attention`（mode 是质量取舍，`--attention` 只打印证据）、`qwen35`（用例只覆盖 prefill，收益在 decode，决定权在 `COMFY_GFX906_QWEN35`）、`te_dequant`（表里那行是手写的，bench 没有对应站点）。
 
 信任靠字段而不是靠约定：
 
@@ -452,7 +459,7 @@ backend = _REGISTRY.choose(n=..., k=..., m=...)
 
 `COMFY_GFX906_MEASURED=off` 把整层关掉（表读到了但不用），用于驱动比 fingerprint 漂移时救急。
 
-**现状**：随节点分发的 `arch/gfx906/manifest.toml` 仍是 `derived` 数据、`fingerprint = "unmeasured"`，所以默认显示 `STALE`；跑过 `tools/bench.py --write` 之后本地覆盖会补上 fingerprint 并显示 `in use`。
+**现状**：随节点分发的 `arch/gfx906/manifest.toml` 是 `grade = "measured"`、`fingerprint = "unmeasured"`，所以在 gfx906 上开箱就是 `in use`（`tools/status.py`：`23 shapes (23 measured), in use`）；没跑过 bench 的其它架构没有对应文件，走下面的 `absent`。本地 `--write` 会带上真实指纹，并按 shape 覆盖 shipped 表。
 
 ### 降级必须看得见
 
@@ -528,10 +535,10 @@ backend = _REGISTRY.choose(n=..., k=..., m=...)
 
 1. 确认：AMD + HIP、`comfy-kitchen`、triton 可用；overlay 仅 0.39.0 可选。
 2. 先用节点默认值跑通——没跑过 bench 的卡上测量门功能是关的，这是预期行为，不是坏了。
-3. 跑一次 `tools/bench.py --all --write`：int8 tile、两个 GEMV 站点，以及 gemv / w4a8 / deltanet / vae / convrot 的 on/off（convrot 还有 mode）都写进本机 manifest，之后启动不再 autotune。attention mode 不在此列——节点里手动选。只想看数字就先不加 `--write`。
+3. 跑一次 `tools/bench.py --all --write`：int8 tile、两个 GEMV 站点，以及 gemv / w4a8 / deltanet / deltanet prefill / vae / convrot / vision 的 on/off（convrot 还有 mode）都写进本机 manifest，之后启动不再 autotune。attention mode 不在此列——节点里手动选。只想看数字就先不加 `--write`。
 4. 用 `tools/status.py` 确认 `measured ... in use`、`int8 tiles (measured tile)`、`gemv ... measured`，以及 `w4a8`/`textgen deltanet` 的 on/off；日志里不应再有 `no measured data`。
 5. 逐项 A/B：`vae`、`gemv`、`convrot`、`qkv`。这些还没有自动登记，默认值在多数卡上是赚的；`vae`/`convrot` 已经被 §2.1 在原生卡上关掉。
-6. `deltanet` 在 kitchen 的 fused op 不可用的卡上会是 `on`（bench 写），可用时大概率是 `off`——两种都是正确结果。`qwen35` 同理由 `--qwen35` 决定；它的计时是 4 层合成模型的代理，等价性检查才是主交付。
+6. `deltanet` 在 kitchen 的 fused op 不可用的卡上**结构性开启**——此时 bench 没有基线可比，不写 `feature.deltanet`（[gfx906_tuning.py:296-303](gfx906_tuning.py#L296-L303)）；kitchen 可用时由 bench 决定，大概率 `off`。两种都是正确结果。prefill 的基线是 core 自己的循环，所以 `feature.deltanet_prefill` 在任何卡上都能测出来。`qwen35` 不由 bench 写，决定权在 `COMFY_GFX906_QWEN35`；`--qwen35` 的计时是 4 层合成模型的代理，等价性检查才是主交付。
 7. `textgen` 默认只会启用 `kvdecode` + `llama`；`qwen35` 显示 `n/a` 是预期行为。
 8. 需要 resident CUDA graph 时再装 overlay；不装不影响正确性。
 9. 改动内核后跑 `tools/verify_backends.py`（选择 parity + 数值 A/B，需要 GPU；无设备时会直接退出并说明原因），再记录性能。
