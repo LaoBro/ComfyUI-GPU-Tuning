@@ -1,14 +1,14 @@
 # gfx906 (MI50 / MI60 / Radeon VII) measurement manifest.
 #
 # Measured on gfx906 with tools/bench.py and shipped so the arch works from
-# one install: the node reads feature.* / int8_gemm.tile / attention.* straight
-# from here. Records are grade = "measured" and the fingerprint is left as
-# "unmeasured": it matches every build of this arch. A local
-# bench (tools/bench.py --all --write) overwrites these records per shape;
-# delete the local override to fall back to this file.
+# one install: the node reads feature.* / int8_gemm.tile / convrot.mode and the
+# GEMV backend choices straight from here. Records are grade = "measured" and
+# the fingerprint is left as "unmeasured": it matches every build of this arch.
+# A local bench (tools/bench.py --all --write) overwrites these records per
+# shape; delete the local override to fall back to this file.
 #
-# Regenerate with:
-#   python tools/bench.py --site int8_gemv.m1 --site w4a8.m1 --write
+# Regenerate with, then set fingerprint back to "unmeasured":
+#   python tools/bench.py --all --write --out arch/gfx906/manifest.toml
 
 schema = 1
 
@@ -16,7 +16,7 @@ schema = 1
 gcn = "gfx906"
 fingerprint = "unmeasured"
 capabilities = ["v_dot4_i32_i8", "v_perm_b32"]
-note = "60 CU, wave64; transcribed from PORTING.md, not re-measured here"
+note = "60 CU, wave64; measured 2026-11-05 under rocm7.18.26441, torch2.15.0+rocm10.3.0a20261104, triton3.9.0"
 
 # 4-bit weight GEMV, one to eight rows. `ms` keeps every implementation that was
 # timed, so a later run can show what changed instead of a single winner.
@@ -26,20 +26,20 @@ default = "asm"
 default_grade = "measured"
 
 [sites."w4a8.m1".shapes]
-"4096x4096@m1" = { impl = "asm", ms = { asm = 0.129599, int8 = 0.125439, sum = 0.259358, triton = 0.535356 }, rel = 1.11e-02, grade = "measured", date = "2026-11-03", note = "convrot off, weight group 128" }
-"4096x4096@m8" = { impl = "asm", ms = { asm = 0.219359, int8 = 0.625755, sum = 0.864634, triton = 0.540316 }, rel = 8.83e-03, grade = "measured", date = "2026-11-03", note = "convrot off, weight group 128" }
-"12288x4096@m1" = { impl = "asm", ms = { asm = 0.154079, int8 = 0.158559, sum = 0.405437, triton = 0.999192 }, rel = 9.21e-03, grade = "measured", date = "2026-11-03", note = "convrot off, weight group 128" }
-"12288x4096@m8" = { impl = "asm", ms = { asm = 0.371197, int8 = 1.18927, sum = 2.40382, triton = 1.00479 }, rel = 8.20e-03, grade = "measured", date = "2026-11-03", note = "convrot off, weight group 128" }
+"4096x4096@m1" = { impl = "asm", ms = { asm = 0.11744, int8 = 0.11232, sum = 0.248482, triton = 0.498563 }, rel = 1.16e-02, grade = "measured", date = "2026-11-05", note = "convrot off, weight group 128" }
+"4096x4096@m8" = { impl = "asm", ms = { asm = 0.227842, int8 = 0.626243, sum = 0.893606, triton = 0.491043 }, rel = 9.37e-03, grade = "measured", date = "2026-11-05", note = "convrot off, weight group 128" }
+"12288x4096@m1" = { impl = "asm", ms = { asm = 0.152161, int8 = 0.151521, sum = 0.410563, triton = 0.994086 }, rel = 1.01e-02, grade = "measured", date = "2026-11-05", note = "convrot off, weight group 128" }
+"12288x4096@m8" = { impl = "asm", ms = { asm = 0.376483, int8 = 1.19473, sum = 2.47921, triton = 1.01441 }, rel = 1.34e-02, grade = "measured", date = "2026-11-05", note = "convrot off, weight group 128" }
 
 [sites."int8_gemv.m1"]
 default = "asm"
 default_grade = "measured"
 
 [sites."int8_gemv.m1".shapes]
-"4096x4096@m1" = { impl = "asm", ms = { asm = 0.125119, int8 = 0.490236, triton = 0.139519 }, rel = 6.88e-03, grade = "measured", date = "2026-11-03", note = "convrot off" }
-"4096x12288@m1" = { impl = "asm", ms = { asm = 0.168158, int8 = 1.11951, triton = 0.192959 }, rel = 8.87e-03, grade = "measured", date = "2026-11-03", note = "convrot off" }
-"12288x4096@m1" = { impl = "asm", ms = { asm = 0.165118, int8 = 0.942552, triton = 0.180799 }, rel = 7.58e-03, grade = "measured", date = "2026-11-03", note = "convrot off" }
-"152064x4096@m1" = { impl = "asm", ms = { asm = 0.844633, int8 = 6.37483, triton = 0.915513 }, rel = 7.53e-03, grade = "measured", date = "2026-11-03", note = "convrot off" }
+"4096x4096@m1" = { impl = "asm", ms = { asm = 0.108161, int8 = 0.480643, triton = 0.124801 }, rel = 6.68e-03, grade = "measured", date = "2026-11-05", note = "convrot off" }
+"4096x12288@m1" = { impl = "asm", ms = { asm = 0.157921, int8 = 1.14945, triton = 0.184001 }, rel = 9.23e-03, grade = "measured", date = "2026-11-05", note = "convrot off" }
+"12288x4096@m1" = { impl = "asm", ms = { asm = 0.150241, int8 = 0.932166, triton = 0.171201 }, rel = 8.98e-03, grade = "measured", date = "2026-11-05", note = "convrot off" }
+"152064x4096@m1" = { impl = "asm", ms = { asm = 0.857125, int8 = 6.33476, triton = 0.913126 }, rel = 1.10e-02, grade = "measured", date = "2026-11-05", note = "convrot off" }
 
 [sites."feature.gemv"]
 default = "on"
@@ -50,23 +50,24 @@ default = "on"
 default_grade = "measured"
 
 [sites."int8_gemm.tile".shapes]
-"large" = { impl = "block_m=128,block_n=256,block_k=64,group_size_m=8,warps=8,stages=3", ms = { 128x128x32g8w4s4 = 1.36831, 128x256x32g8w4s2 = 1.44623, 128x256x64g8w8s3 = 1.22735, 128x32x32g8w4s4 = 1.82447, 128x64x32g8w4s4 = 1.86143, 16x32x64g8w4s3 = 1.76095, 64x128x32g8w4s4 = 1.89534, 64x256x32g8w4s4 = 1.62655 }, grade = "measured", date = "2026-11-03", note = "3 cell(s), convrot on" }
-"small" = { impl = "block_m=16,block_n=32,block_k=64,group_size_m=8,warps=4,stages=3", ms = { 128x128x32g8w4s4 = 1.28039, 128x256x32g8w4s2 = 1.48383, 128x256x64g8w8s3 = 1.26223, 128x32x32g8w4s4 = 1.53991, 128x64x32g8w4s4 = 1.66135, 16x32x64g8w4s3 = 0.520876, 64x128x32g8w4s4 = 1.11287, 64x256x32g8w4s4 = 1.33663 }, grade = "measured", date = "2026-11-03", note = "6 cell(s), convrot on" }
+"large" = { impl = "block_m=128,block_n=256,block_k=64,group_size_m=8,warps=8,stages=3", ms = { 128x128x32g8w4s4 = 1.33777, 128x256x32g8w4s2 = 1.32001, 128x256x64g8w8s3 = 1.24049, 128x32x32g8w4s4 = 1.78705, 128x64x32g8w4s4 = 1.85153, 16x32x64g8w4s3 = 1.75041, 64x128x32g8w4s4 = 1.85361, 64x256x32g8w4s4 = 1.58001 }, grade = "measured", date = "2026-11-05", note = "3 cell(s), convrot on" }
+"small" = { impl = "block_m=16,block_n=32,block_k=64,group_size_m=8,warps=4,stages=3", ms = { 128x128x32g8w4s4 = 1.28641, 128x256x32g8w4s2 = 1.31201, 128x256x64g8w8s3 = 1.23057, 128x32x32g8w4s4 = 1.52769, 128x64x32g8w4s4 = 1.65865, 16x32x64g8w4s3 = 0.509363, 64x128x32g8w4s4 = 1.07617, 64x256x32g8w4s4 = 1.26585 }, grade = "measured", date = "2026-11-05", note = "6 cell(s), convrot on" }
 
 [sites."feature.vae"]
 default = "on"
 default_grade = "measured"
 
 [sites."vae.decode".shapes]
-"c512x64" = { impl = "conv2d", ms = { conv2d = 0.629755, torch = 2.64942 }, grade = "measured", date = "2026-11-03", note = "depth-1 conv3d, fp16, padding 0" }
-"c512x128" = { impl = "conv2d", ms = { conv2d = 2.30254, torch = 8.11578 }, grade = "measured", date = "2026-11-03", note = "depth-1 conv3d, fp16, padding 0" }
+"c512x64" = { impl = "conv2d", ms = { conv2d = 0.628644, torch = 2.7541 }, grade = "measured", date = "2026-11-05", note = "depth-1 conv3d, fp16, padding 0" }
+"c512x128" = { impl = "conv2d", ms = { conv2d = 2.42322, torch = 7.90901 }, grade = "measured", date = "2026-11-05", note = "depth-1 conv3d, fp16, padding 0" }
 
 [sites."convrot.mode"]
 default = "fused"
 default_grade = "measured"
+
 [sites."convrot.mode".shapes]
-"m1x4096" = { impl = "fused", ms = { butterfly = 0.085599, fused = 0.05056, off = 0.190079 }, grade = "measured", date = "2026-11-03", note = "rotate + quantize, fp16" }
-"m128x4096" = { impl = "fused", ms = { butterfly = 0.0872, fused = 0.04928, off = 0.191838 }, grade = "measured", date = "2026-11-03", note = "rotate + quantize, fp16" }
+"m1x4096" = { impl = "fused", ms = { butterfly = 0.076481, fused = 0.04592, off = 0.226561 }, grade = "measured", date = "2026-11-05", note = "rotate + quantize, fp16" }
+"m128x4096" = { impl = "fused", ms = { butterfly = 0.077281, fused = 0.04656, off = 0.198561 }, grade = "measured", date = "2026-11-05", note = "rotate + quantize, fp16" }
 
 [sites."feature.convrot"]
 default = "on"
@@ -75,3 +76,28 @@ default_grade = "measured"
 [sites."feature.te_dequant"]
 default = "on"
 default_grade = "measured"
+
+[sites."feature.deltanet_prefill"]
+default = "on"
+default_grade = "measured"
+
+[sites."feature.vision"]
+default = "on"
+default_grade = "measured"
+
+[sites."deltanet.decode".shapes]
+"b1xhv16xdk128xdv128xs1" = { impl = "triton", ms = { triton = 0.131521 }, grade = "measured", date = "2026-11-05", note = "hidden 2048, key heads 16" }
+"b1xhv16xdk128xdv128xs4" = { impl = "triton", ms = { triton = 0.129601 }, grade = "measured", date = "2026-11-05", note = "hidden 2048, key heads 16" }
+
+[sites."deltanet.prefill".shapes]
+"b1xh32xdk128xdv128xs1024" = { impl = "block", ms = { block = 6.20916, loop = 9.2591 }, rel = 5.13e-07, grade = "measured", date = "2026-11-05", note = "fp32 chunk rule, UT transform only difference, worst of mild+coherent" }
+"b1xh32xdk128xdv128xs2223" = { impl = "block", ms = { block = 13.6143, loop = 18.5962 }, rel = 4.78e-07, grade = "measured", date = "2026-11-05", note = "fp32 chunk rule, UT transform only difference, worst of mild+coherent" }
+"b1xh32xdk128xdv128xs4096" = { impl = "block", ms = { block = 25.5378, loop = 33.96 }, rel = 4.47e-07, grade = "measured", date = "2026-11-05", note = "fp32 chunk rule, UT transform only difference, worst of mild+coherent" }
+
+[sites."vision.patch_embed".shapes]
+"p768xd1152" = { impl = "gemm", ms = { conv3d = 210.929, conv3d_fp32 = 18.0096, gemm = 0.612804 }, rel = 2.88e-03, grade = "measured", date = "2026-11-05", note = "image tower patch projection, bf16 weight" }
+"p3024xd1152" = { impl = "gemm", ms = { conv3d = 829.315, conv3d_fp32 = 70.6048, gemm = 2.08945 }, rel = 2.93e-03, grade = "measured", date = "2026-11-05", note = "image tower patch projection, bf16 weight" }
+"p12288xd1152" = { impl = "gemm", ms = { conv3d = 3366.28, conv3d_fp32 = 288.787, gemm = 8.27157 }, rel = 2.92e-03, grade = "measured", date = "2026-11-05", note = "image tower patch projection, bf16 weight" }
+
+[sites."qwen35.block".shapes]
+"b1xs16xh2048xl4" = { impl = "ours", ms = { ours = 14.8745, stock = 14.8924 }, grade = "measured", date = "2026-11-05", note = "prefill, fp32, gate on/off" }
