@@ -27,6 +27,9 @@ NODE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(NODE_DIR))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+# Same pin as the pack's __init__.py, which these top-level imports bypass.
+os.environ.setdefault("TRITON_DEFAULT_FP_FUSION", "1")
+
 import torch                                                           # noqa: E402
 import refs                                                            # noqa: E402
 

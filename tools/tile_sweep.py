@@ -22,6 +22,9 @@ from pathlib import Path
 NODE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(NODE_DIR))
 
+# Same pin as the pack's __init__.py, which these top-level imports bypass.
+os.environ.setdefault("TRITON_DEFAULT_FP_FUSION", "1")
+
 import torch
 import triton
 

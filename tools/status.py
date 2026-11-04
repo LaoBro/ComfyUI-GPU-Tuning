@@ -12,12 +12,16 @@ It runs apply() on this process only -- no file is touched, and the process
 exits right after printing.
 """
 
+import os
 import sys
 from pathlib import Path
 
 NODE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(NODE_DIR))
 sys.path.insert(0, str(NODE_DIR.parent.parent))          # ComfyUI root, for `import comfy`
+
+# Same pin as the pack's __init__.py, which these top-level imports bypass.
+os.environ.setdefault("TRITON_DEFAULT_FP_FUSION", "1")
 
 import gfx906_tuning                                     # noqa: E402
 

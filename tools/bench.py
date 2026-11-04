@@ -45,6 +45,7 @@ shapes. Do not run it while ComfyUI is generating.
 import argparse
 import datetime
 import gc
+import os
 import statistics
 import sys
 from pathlib import Path
@@ -54,6 +55,9 @@ NODE_DIR = TOOLS_DIR.parent
 sys.path.insert(0, str(NODE_DIR))
 sys.path.insert(0, str(TOOLS_DIR))
 sys.path.insert(0, str(NODE_DIR.parent.parent))          # ComfyUI root, for the qwen35 check
+
+# Same pin as the pack's __init__.py, which these top-level imports bypass.
+os.environ.setdefault("TRITON_DEFAULT_FP_FUSION", "1")
 
 import torch                                                           # noqa: E402
 
