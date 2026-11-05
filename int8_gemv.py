@@ -102,13 +102,39 @@ def gemv_kernel(a_ptr, b_ptr, c_ptr, gmax_ptr, b_scale_ptr, bias_ptr,
     tl.store(c_ptr + offs_n, out.to(c_ptr.dtype.element_ty), mask=mask_n)
 
 
+def load_hip_rotate():
+    """Import the gfx906 HIP rotation loader shipped next to this file."""
+    try:
+        from . import hip_rotate
+        return hip_rotate
+    except ImportError:
+        pass
+    try:
+        import hip_rotate
+        return hip_rotate
+    except ImportError:
+        return None
+
+
+def _hip_rotate_enabled():
+    return os.getenv("COMFY_GFX906_ROTATE", "1").strip().lower() not in ("0", "off", "false", "no")
+
+
 def rotate(x, groupsize):
     """Rotate an [m, k] activation; returns the rotated tensor and group maxima [m, k // groupsize]."""
     rows, k = x.shape
     ngroups = k // groupsize
-    h = _build_hadamard(groupsize, device=x.device, dtype=x.dtype)
     rotated = torch.empty_like(x)
     gmax = torch.empty((rows, ngroups), device=x.device, dtype=torch.float32)
+    # HIP butterfly: no Hadamard matrix traffic, ~12x on the fp32 decode path.
+    # COMFY_GFX906_ROTATE=off restores the Triton kernel for A/B. On fp16 x the
+    # HIP kernel accumulates in fp32, so its quantized activation is more
+    # accurate but not bit-identical to the Triton path.
+    if _hip_rotate_enabled():
+        hip = load_hip_rotate()
+        if hip is not None and hip.rotate(x, rotated, gmax, groupsize):
+            return rotated, gmax, ngroups
+    h = _build_hadamard(groupsize, device=x.device, dtype=x.dtype)
     rotate_kernel[(rows * ngroups,)](x, h, rotated, gmax, ngroups, k, G=groupsize,
                                      BJ=BLOCK_J, num_warps=ROTATE_WARPS)
     return rotated, gmax, ngroups

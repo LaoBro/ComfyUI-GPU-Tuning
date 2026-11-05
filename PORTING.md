@@ -573,7 +573,7 @@ cd /home/liu/ComfyUI-0.39.0
 - **`unattributed`**：墙钟减去所有根区域的总时间，即 tokenize、python、launch gap 和没被包住的东西。它大就说明瓶颈不在 GPU 内核上，先别去调内核。
 - **`md5`**：输出文本的哈希，是"变了没有"的探测器，不是正确性判据。上面那组 `text_gemv` A/B 在 `--sampling off` 下两边 md5 完全相同（数值等价），而 sampling 开着时同样的微小差异会逐 token 放大成完全不同的文本——比等价性就加 `--sampling off`。反例是上一版 prefill 变换：更快，但生文从第一个 token 就退化。
 
-旗标透传靠 `comfy.options.enable_args_parsing(True)`：库模式下 `comfy/cli_args.py` 走 `parse_args([])`，不设这一句 `--disable-cuda-graphs` 之类会被**静默忽略**（工具自己在 import comfy 之前设好了）。textgen 子项没有 `configure()` 入口，A/B 用 env：`COMFY_GFX906_DELTANET` / `_KVDECODE` / `_LLAMA` / `_QWEN35` / `_GRAPH`（resident graph 也跟随 CLIP 节点的 `textgen` 开关）。
+旗标透传靠 `comfy.options.enable_args_parsing(True)`：库模式下 `comfy/cli_args.py` 走 `parse_args([])`，不设这一句 `--disable-cuda-graphs` 之类会被**静默忽略**（工具自己在 import comfy 之前设好了）。textgen 子项没有 `configure()` 入口，A/B 用 env：`COMFY_GFX906_DELTANET` / `_KVDECODE` / `_LLAMA` / `_QWEN35` / `_GRAPH` / `_ROTATE`（其中 `_GRAPH` 也跟随 CLIP 节点的 `textgen` 开关，`_ROTATE` 是独立总开关）。
 
 ## 6. 开关优先级
 

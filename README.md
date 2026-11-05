@@ -113,6 +113,10 @@ tile 只能把分块 GEMM 调到 55 GB/s；解码的权重是"读一遍、每个
 所以结果与 GEMM 路径同值）。旋转与量化也折进来：旋转内核顺手写出每个 256-group 的最大值，
 GEMV 内核自己合成行 scale 并在线量化，一条 linear 从 3 次启动降到 2 次。
 
+旋转本身也换成了 HIP radix-4 butterfly（`hip_rotate.py` + `arch/gfx906/kernels/rotate.cu`）：
+Hadamard 符号在寄存器里生成，不再逐 tile 读 256x256 矩阵。fp32 档量化激活与 Triton 逐元素一致，
+`COMFY_GFX906_ROTATE=off` 回退到 Triton 做 A/B；fp16 档按 fp32 累加，结果更准但不等价。
+
 单条 linear 实测（合成权重，m=1，深队列下的平均墙钟）：
 
 | 形状 | 分块 GEMM | GEMV | 带宽 |
@@ -265,7 +269,7 @@ CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`imag
 | `int8qk` | 介于两者 | PV 保留 fp16，慢约 10%，精度好 4-7 倍 |
 
 `hip` 是本包自带的融合注意力内核（`arch/gfx906/kernels/hip_attn.cu`，ctypes 加载，不依赖 torch 扩展）。
-同一个脚本也编出 int8 大 m 路径要用的 `libgfx906_int8.so`（见下节）。两个 `.so` 随包分发，按 HIP 7.18（ROCm 10.3）的运行时构建，
+同一个脚本也编出 int8 大 m 路径要用的 `libgfx906_int8.so` 和解码激活旋转的 `libgfx906_rotate.so`（见下节）。三个 `.so` 随包分发，按 HIP 7.18（ROCm 10.3）的运行时构建，
 动态依赖里写死了 `libamdhip64.so.7`：本机是别的大版本时加载会失败，节点照常跑 Triton 路径，并在启动日志给一行
 `... did not load ...; rebuild it for this HIP runtime with tools/build_hip_attn.py --force`。重编命令：
 
@@ -275,7 +279,7 @@ CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`imag
 
 `tools/bench.py --attention` / `--tile` 在 `.so` 缺失时自己跑这个构建（约 4 秒），因为少了它们那两个站点只是静默少一行最快的数据。节点启动不构建任何东西。
 
-产物是 gfx906-only 的 `libgfx906_attn.so` / `libgfx906_int8.so`（代码对象标志 `gfx906, xnack any, sramecc any`）；换卡时加载器按 `gcnArchName` 直接跳过，不会把别的卡带崩。
+产物是 gfx906-only 的 `libgfx906_attn.so` / `libgfx906_int8.so` / `libgfx906_rotate.so`（代码对象标志 `gfx906, xnack any, sramecc any`）；换卡时加载器按 `gcnArchName` 直接跳过，不会把别的卡带崩。
 
 ### int8 线性的大 m 路径
 
@@ -336,7 +340,9 @@ m ≤ 1 的解码仍走 GEMV；m < 128 直接回落 Triton（128 行 tile 在更
 | `COMFY_GFX906_DELTANET` | `1` | textgen 分项基准旋钮：DeltaNet 解码 Triton 内核 |
 | `COMFY_GFX906_KVDECODE` | `1` | 同上：折叠 GQA 的 KV decode |
 | `COMFY_GFX906_LLAMA` | `1` | 同上：llama RMSNorm 预计算 + RoPE 频率表 |
+| `COMFY_GFX906_QWEN35` | `1` | 同上：Qwen3.5 计算类替换（等价改写，逐方法对过 core） |
 | `COMFY_GFX906_GRAPH` | `1` | textgen 分项基准旋钮：权重常驻时的逐块 CUDA graph（也跟随 CLIP 节点的 `textgen` 开关） |
+| `COMFY_GFX906_ROTATE` | `1` | 解码激活旋转的 HIP butterfly 内核；`off` 回落到 Triton 做 A/B。fp16 输入下 HIP 以 fp32 累加，量化激活更准但与 Triton 不等价 |
 
 ## 已知边界
 
