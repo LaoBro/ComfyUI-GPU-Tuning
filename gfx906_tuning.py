@@ -193,6 +193,7 @@ def _init_env_settings():
         "kvdecode": env_flag("COMFY_GFX906_KVDECODE"),
         "llama": env_flag("COMFY_GFX906_LLAMA"),
         "qwen35": env_flag("COMFY_GFX906_QWEN35"),
+        "graph": env_flag("COMFY_GFX906_GRAPH"),
     }
     _state["textgen_ready"] = {name: False for name in TEXTGEN_ITEMS}
     _state["textgen_override"] = None
@@ -678,6 +679,20 @@ def load_qwen35_model():
     try:
         import qwen35_model
         return qwen35_model
+    except ImportError:
+        return None
+
+
+def load_resident_graph():
+    """Import the per-block resident CUDA graph hooks shipped next to this file."""
+    try:
+        from . import resident_graph
+        return resident_graph
+    except ImportError:
+        pass
+    try:
+        import resident_graph
+        return resident_graph
     except ImportError:
         return None
 
@@ -2145,16 +2160,12 @@ def apply():
     _state["w4a8_module"] = (_install("w4a8 module", load_w4a8_gemv)
                              if install_ready("w4a8") else None)
     _state["w4a8"] = _state["w4a8_module"]
-    # the per-block graph hooks live in core on purpose; say so when they are absent
-    def _probe_resident():
-        import comfy.model_prefetch
-
-        return hasattr(comfy.model_prefetch, "RESIDENT_GRAPH_MODULES")
-
-    _state["resident_graph_patch"] = bool(_install("resident graph probe", _probe_resident))
-    if not _state["resident_graph_patch"]:
-        logging.info("gfx906: resident graph hooks absent, decode runs without per-block CUDA graphs "
-                     "(see custom_nodes/ComfyUI-gfx906-Tuning/core-patches/README.md)")
+    # per-block CUDA graphs for resident weights: installed here, not in core.
+    # The gate follows the CLIP node's textgen switch like the other four items.
+    resident_graph = _install("resident graph loader", load_resident_graph)
+    _state["resident_graph"] = bool(
+        _install("resident graph", resident_graph.install,
+                 lambda: textgen_requested("graph")) if resident_graph else None)
     # attention kernels differ in quality (int8 PV rel ~2e-2 vs hand 2.5e-4), so
     # the mode is a manual node/env choice, not a manifest verdict -- and the TE
     # never routes here anyway (its resolver returns core's pytorch/basic). It
@@ -2295,7 +2306,7 @@ def status():
         + f", lm_head {'int8' if _state.get('logits_patched') and _state['te_int8'] else 'default'}"
         + f", encoder attention {_state['te_attention']}",
         f"image tower {'weight dtype + patch gemm' if _state['vision_enabled'] else 'shipped path'}",
-        f"resident graph hooks {'present' if _state.get('resident_graph_patch') else 'absent'}",
+        f"resident graph {'on' if _state.get('resident_graph') else 'off'}",
     ]
     manifest_line = manifest_status_line()
     if manifest_line:

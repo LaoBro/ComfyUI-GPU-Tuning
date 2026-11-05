@@ -14,7 +14,8 @@ NVIDIA / CPU 上整个包会跳过（[gfx906_tuning.py](gfx906_tuning.py#L251)�
 
 - AMD 显卡，PyTorch 为 ROCm/HIP 构建；
 - `comfy-kitchen` 的 triton backend 可用（否则 int8/convrot/attention 补丁会跳过并只打日志）；
-- 可选：ComfyUI 0.39.0 + `core-patches` overlay（resident CUDA graph 用，非必须，版本不匹配时不要装）。
+- ComfyUI 0.39.0 或更新版本；逐块 CUDA graph 由节点自带的 `resident_graph.py` 以运行时包装提供，不需要改动 core 文件。
+
 ## 2. 功能分级：常开 / 可选开关 / 测量门
 
 所有功能按“答案是否随卡变”分三类，这是整个包的门控总纲：
@@ -114,9 +115,9 @@ bench 的 tile 站点在 `native_covers("int8_linear")` 时跳过：覆盖的卡
 | 场景 | 原因 |
 |---|---|
 | NVIDIA（有 GPU） | `is_amd()` 为假 → triton 内核补丁与 attention 都不装（cuda 的 capability 集没有 `int8_linear`，N 卡的 int8 线性走 triton，但本包没在 N 卡测过 tile）。**文本生成重写组生效**：prefix KV、KV decode 折叠、llama 缓存、TE GEMV、TE int8 常驻；`w4a8`/`deltanet` 由本机 bench 的 `feature.*` 决定（没跑过就是关）；qwen35 随 env 默认开（B 类等价改写）。manifest 的 key 是 `sm<major><minor>`。**未在 N 卡实测**，性能结论要由有卡的人跑出来 |
-| NVIDIA，无 core-patches | 解码仍会跑，但没有 per-block CUDA graph——那约是文本生成 37% 的时间（见 core-patches/README.md），且该 overlay 与 GPU 无关 |
+| NVIDIA，权重非全量常驻 | 逐块 CUDA graph 不会捕获（权重按块换入时走 core 的 vbar 路径），只影响 launch 开销，结果不变 |
 | CPU | `torch.cuda.is_available()` 为假，整包不安装 |
-| ComfyUI 不是 0.39.0 时使用 core overlay / resident CUDA graph | overlay 是版本固定的三个核心文件（[core-patches/README.md](core-patches/README.md#L43-L53)），换版本需重新生成；节点本身仍可不用 overlay 运行 |
+| ComfyUI 升级后 | 所有 core 接触点都是包装原函数，最坏降级为 eager 解码，不需要重新生成任何文件 |
 
 AMD 上“kitchen 已经有后端”的卡不再归到这里：它们走 §2.1，只装四个与后端无关的改写，没有需要按卡验证的内核。
 
@@ -568,11 +569,11 @@ cd /home/liu/ComfyUI-0.39.0
 
 读数时注意三件事：
 
-- **`graphed` 列**：捕获进 CUDA graph 的调用不能带 event，只计数不计时；而且**回放根本不进 python**，所以图开着时 block 以下的行只包含 prefill 和捕获那一遍。要看每步归因就加 `--disable-cuda-graphs`，但那次运行不能和图开着的比——图正是用来消掉每 block 的 dispatch 成本的（约文本生成的 37%，见 [core-patches/README.md](core-patches/README.md)）。
+- **`graphed` 列**：捕获进 CUDA graph 的调用不能带 event，只计数不计时；而且**回放根本不进 python**，所以图开着时 block 以下的行只包含 prefill 和捕获那一遍。要看每步归因就加 `--disable-cuda-graphs`，但那次运行不能和图开着的比——图正是用来消掉每 block 的 dispatch 成本的（约文本生成的 37%，见 `resident_graph.py`）。
 - **`unattributed`**：墙钟减去所有根区域的总时间，即 tokenize、python、launch gap 和没被包住的东西。它大就说明瓶颈不在 GPU 内核上，先别去调内核。
 - **`md5`**：输出文本的哈希，是"变了没有"的探测器，不是正确性判据。上面那组 `text_gemv` A/B 在 `--sampling off` 下两边 md5 完全相同（数值等价），而 sampling 开着时同样的微小差异会逐 token 放大成完全不同的文本——比等价性就加 `--sampling off`。反例是上一版 prefill 变换：更快，但生文从第一个 token 就退化。
 
-旗标透传靠 `comfy.options.enable_args_parsing(True)`：库模式下 `comfy/cli_args.py` 走 `parse_args([])`，不设这一句 `--disable-cuda-graphs` 之类会被**静默忽略**（工具自己在 import comfy 之前设好了）。四个 textgen 子项没有 `configure()` 入口，A/B 用 env：`COMFY_GFX906_DELTANET` / `_KVDECODE` / `_LLAMA` / `_QWEN35`。
+旗标透传靠 `comfy.options.enable_args_parsing(True)`：库模式下 `comfy/cli_args.py` 走 `parse_args([])`，不设这一句 `--disable-cuda-graphs` 之类会被**静默忽略**（工具自己在 import comfy 之前设好了）。textgen 子项没有 `configure()` 入口，A/B 用 env：`COMFY_GFX906_DELTANET` / `_KVDECODE` / `_LLAMA` / `_QWEN35` / `_GRAPH`（resident graph 也跟随 CLIP 节点的 `textgen` 开关）。
 
 ## 6. 开关优先级
 

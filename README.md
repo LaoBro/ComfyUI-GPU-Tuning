@@ -4,6 +4,7 @@
 
 这张卡没有矩阵核心，`bf16` 是软件模拟，ComfyUI 的默认实现在它上面处处踩慢路径。
 本包在启动时给 int8 权重、注意力、VAE 换成本机实测更快的实现，**不改 ComfyUI 源码**，
+包括逐块 CUDA graph 在内的全部补丁都以运行时包装安装，不需要覆盖或备份任何 core 文件，
 `COMFY_GFX906_TUNING=off` 可整体关闭。
 
 内核加速是 gfx906 专属的；**文本生成的改写不是**——m=1 走 GEMM、每层分派开销、
@@ -67,6 +68,10 @@ KV cache 容量级拷贝、launch 开销，这些在别的卡上一样存在。�
 # 2. 或 git clone 到 custom_nodes/
 git clone https://github.com/<your>/ComfyUI-gfx906-Tuning custom_nodes/ComfyUI-gfx906-Tuning
 ```
+
+不需要改动 ComfyUI 源码，也没有安装脚本；逐块 CUDA graph 的 hook 随节点在启动时安装。
+如果之前手动打过 core 补丁，把干净 0.39.0 的 execution.py、comfy/model_prefetch.py、
+comfy/text_encoders/llama.py 覆盖回去即可，根节点目录里的 .core-patch-backup/ 也可以删掉。
 
 重启 ComfyUI，启动日志里会出现：
 
@@ -301,7 +306,7 @@ m ≤ 1 的解码仍走 GEMV；m < 128 直接回落 Triton（128 行 tile 在更
 | gfx906（Vega 56/64、MI50/60、Radeon VII） | 全部生效：出厂自带实测表（`arch/gfx906/manifest.toml`），测量门功能开箱即得，不跑 autotune |
 | 其它 AMD，kitchen 无后端（gfx900、gfx90a/94x、RDNA1 后期） | 测量门功能默认关（tile 走 stock autotune、attention 首调现场扫参）；跑一次 `bench.py --all --write` 后按本机实测自动开关，启动即免 autotune |
 | 其它 AMD，kitchen 已有 hip 后端（RDNA2/3/4） | 同上；tile 补丁照装但退为兜底（dispatch 优先 hip）。attention 照装并自测与 SDPA 的快慢。常开组始终生效 |
-| NVIDIA（有 GPU） | triton 内核补丁与 attention 不装（`is_amd()` 为假；cuda 的 capability 集没有 `int8_linear`，N 卡的 int8 线性走 triton，但本包没在 N 卡测过 tile，保持 stock autotune）。常开组生效：prefix KV、KV decode 折叠、llama 缓存、TE GEMV、TE int8；`w4a8`/`deltanet` 由本机 bench 的 `feature.*` 决定（manifest key 是 `sm<major><minor>`）。**未实测**，性能结论要由有卡的人跑；强烈建议加 core-patches（per-block CUDA graph，与 GPU 无关） |
+| NVIDIA（有 GPU） | triton 内核补丁与 attention 不装（`is_amd()` 为假；cuda 的 capability 集没有 `int8_linear`，N 卡的 int8 线性走 triton，但本包没在 N 卡测过 tile，保持 stock autotune）。常开组生效：prefix KV、KV decode 折叠、llama 缓存、TE GEMV、TE int8；`w4a8`/`deltanet` 由本机 bench 的 `feature.*` 决定（manifest key 是 `sm<major><minor>`）。**未实测**，性能结论要由有卡的人跑；逐块 CUDA graph 由节点自带，不需要改动 core |
 | CPU | `torch.cuda.is_available()` 为假，整包不安装 |
 
 其它 AMD 的功能分级、需要测量/移植的项和扫描工具用法见 [PORTING.md](PORTING.md)。
@@ -327,7 +332,7 @@ m ≤ 1 的解码仍走 GEMV；m < 128 直接回落 Triton（128 行 tile 在更
 | `COMFY_GFX906_DELTANET` | `1` | textgen 分项基准旋钮：DeltaNet 解码 Triton 内核 |
 | `COMFY_GFX906_KVDECODE` | `1` | 同上：折叠 GQA 的 KV decode |
 | `COMFY_GFX906_LLAMA` | `1` | 同上：llama RMSNorm 预计算 + RoPE 频率表 |
-| `COMFY_GFX906_QWEN35` | `1` | 同上：Qwen3.5 计算类替换（等价改写，逐方法对过 core） |
+| `COMFY_GFX906_GRAPH` | `1` | textgen 分项基准旋钮：权重常驻时的逐块 CUDA graph（也跟随 CLIP 节点的 `textgen` 开关） |
 
 ## 已知边界
 
