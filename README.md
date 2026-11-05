@@ -33,8 +33,8 @@ KV cache 容量级拷贝、launch 开销，这些在别的卡上一样存在。�
    见下面「文本生成」。
 2. **convrot 融合**：蝶形 Hadamard 旋转与 int8 量化合成一个 kernel（原本两次全局读写）。
 3. **注意力入口**：把 `[B,S,H,D]` 统一转 fp16 + 连续布局，再分发给选中的后端。
-   可选 `int8` / `int8qk` / `hand` / `gemm`，以及 ComfyUI 自带的 `basic` / `pytorch` /
-   `sub_quad` / `split` 等全部后端。
+   可选 `hip` / `int8` / `int8qk` / `hand` / `gemm`，以及 ComfyUI 自带的 `basic` /
+   `pytorch` / `sub_quad` / `split` 等全部后端。
 4. **文本编码器 int8**：权重保持量化（每次调用不再反量化）。
 5. **QKV 三合一**：q/k/v 三个投影合成一次 int8 GEMM（逐行 scale 拼接，bit-exact）。
    只省 1.5%（5.24 s 步里 -81 ms），却常驻 1.6 GB 合并权重，所以**默认关**，
@@ -72,7 +72,7 @@ git clone https://github.com/<your>/ComfyUI-gfx906-Tuning custom_nodes/ComfyUI-g
 
 ```
 gfx906 tuning active: int8 linear measured tile + decode gemv, convrot fused, vae conv3d->conv2d,
-qkv off, attention int8, text encoder int8 + lm_head, encoder attention default,
+qkv off, attention hip, text encoder int8 + lm_head, encoder attention default,
 textgen deltanet on, kvdecode on, llama on, qwen35 on
 ```
 
@@ -247,16 +247,45 @@ CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`imag
 
 **[PORTING.md — 其它显卡移植与二次开发指南](PORTING.md)**
 
-最短路径：先用节点默认值跑通（没跑过 bench 的卡上测量门功能是关的），再运行一次 `python custom_nodes/ComfyUI-gfx906-Tuning/tools/bench.py --all --write`。它测出这张卡的 int8 tile，以及 GEMV / w4a8 / deltanet（含 prefill）/ vae / convrot / vision 的开或关，写进 `~/.config/comfy-gfx-tune/arch/<gcn>/manifest.toml`，之后启动不再 autotune。attention 只打印证据不写记录——mode 是质量取舍，在节点里手选。想知道时间落在哪一段（而不是哪个内核快）用 `tools/chain_profile.py`，见 [PORTING.md §5.4](PORTING.md)。
+最短路径：先用节点默认值跑通（没跑过 bench 的卡上测量门功能是关的），再运行一次 `python custom_nodes/ComfyUI-gfx906-Tuning/tools/bench.py --all --write`。它测出这张卡的 int8 tile，以及 GEMV / w4a8 / deltanet（含 prefill）/ vae / convrot / vision 的开或关，写进 `~/.config/comfy-gfx-tune/arch/<gcn>/manifest.toml`，之后启动不再 autotune。attention 只打印证据不写记录：`hip` 扩展构建好时它就是默认模式（下面有实测），没构建时回落到 `int8`，其余模式仍可在节点里手选。想知道时间落在哪一段（而不是哪个内核快）用 `tools/chain_profile.py`，见 [PORTING.md §5.4](PORTING.md)。
 
 ### 注意力模式怎么选
 
 | 模式 | 精度 | 适用 |
 |---|---|---|
-| `int8`（默认） | 有 int8 量化误差 | 最快，SDXL 与 Qwen 都适用 |
-| `gemm` | fp16 | **Qwen 这类 head_dim=128、长 K 的 DiT 上最快**，比 `hand` 快 1.5–2x；纯 torch 实现，任意 head_dim 都能用（含 SD1.5 的 40、SD2.1 的 80） |
-| `hand` | fp16 | 自研 Triton 内核，D=64 时有优势 |
+| `hip`（默认，需构建） | fp32 累加，rel ≈ 2.5–3.3e-4 | **三个实测形状全部最快**：比 `int8` 快 1.3–1.6x、比 `gemm` 快 1.3–3.5x。只支持 D=64/128 |
+| `int8` | 有 int8 量化误差（rel ≈ 2e-2） | `hip` 扩展缺失时的默认；无扩展也能用 |
+| `gemm` | fp16 | 任意 head_dim 都能用（含 SD1.5 的 40、SD2.1 的 80），但长 K 上被 `hip` 反超，且会拷贝 ~1 GB |
+| `hand` | fp16 | 自研 Triton 内核，现已被 `hip` 全面取代，留作对照 |
 | `int8qk` | 介于两者 | PV 保留 fp16，慢约 10%，精度好 4-7 倍 |
+
+`hip` 是本包自带的融合注意力内核（`arch/gfx906/kernels/hip_attn.cu`，ctypes 加载，不依赖 torch 扩展）。
+同一个构建脚本也会编出 int8 大 m 路径要用的 `libgfx906_int8.so`（见下节）。它默认只在构建过 `.so` 时启用，构建命令：
+
+```bash
+.venv/bin/python custom_nodes/ComfyUI-gfx906-Tuning/tools/build_hip_attn.py
+```
+
+构建产物是 gfx906-only 的 `libgfx906_attn.so` / `libgfx906_int8.so`；换卡时加载器按 `gcnArchName` 直接跳过，不会把别的卡带崩。
+
+### int8 线性的大 m 路径
+
+`int8_gemm` 开关（Model Settings）把「行数 ≥ 128」的 int8 线性交给自带的 HIP dot4 GEMM：
+128×128 tile、256 线程、每线程 64 个 int32 累加器、**one block/CU（4 波）**。4 波看着反直觉，
+但它才是峰值：单 block 才有 256 个寄存器放 64 累加器，LDS 读取比因此从 0.125 降到 0.0625；
+实测 2 波 5.5–5.8 TMAC/s、8 波（只能用 16 累加器）9.1–9.6、4 波 **10.0**。
+
+节点内实测（同一进程、convrot 开，含节点自己的旋转+量化）：
+
+| 形状 (m×k×n) | Triton | HIP GEMM | 倍数 |
+|---|---:|---:|---:|
+| 4032×4096×4096 | 8.26 ms | 7.42 | 1.11x |
+| 4032×12288×4096 | 24.05 | 20.65 | 1.16x |
+| 4032×4096×24576 | 45.63 | 41.31 | 1.10x |
+
+数值与 Triton 路径的差是 fp16 输出舍入（最大约 1 ulp）；int8 累加本身是精确 int32。
+m ≤ 1 的解码仍走 GEMV；m < 128 直接回落 Triton（128 行 tile 在更小 m 上会浪费行）。
+`int8_gemm=off` 可强制回到 Triton；没构建 `.so` 时该开关自动无效。
 
 `basic` / `pytorch` / `sub_quad` / `split` 是 ComfyUI 自带实现，选中后原样转发，
 用于对比。注意 `pytorch`（SDPA）在 gfx906 上只有 math 后端，通常不是最快。
@@ -304,7 +333,12 @@ CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`imag
 
 - **QKV 三合一额外占 1.6 GB 显存**（50 MB × 32 层）且只快 1.5%，因此默认关；
   显存富余时再用节点开关）打开。
-- **int8 注意力在 D=128/长 K 上不再是首选**（77.7 ms vs gemm 57 ms），只在 D=64 的 SDXL 形状占优。
+- **int8 线性只在大 m 上换 HIP GEMM**（≥128 行，1.10–1.16x）；m<128 回落 Triton，m≤1 走 GEMV。
+  4 波是实测峰值，2 波只有 5.5–5.8 TMAC/s（纯 dot4 上限 7.07），8 波需要把 tile 缩到 16 累加器（9.1–9.6）。
+- **注意力首选已换成 `hip`**：4608² d128 23.3 ms（int8 35.1、gemm 31.3）、4608×256 d128 1.44 ms
+  （int8 2.35、gemm 4.99）、4096² d64（B2 H20）17.2 ms（int8 23.1、gemm 28.4）。它的上限也很清楚：
+  4 波/CU 的 VALU 天花板约 7.2 TMAC/s，实测 5.1–5.6 TMAC/s；再快需要 8 波/双 kernel 方案。
+  **int8 注意力在 D=128/长 K 上不再是首选**（77.7 ms vs gemm 57 ms），只在 `hip` 不可用时兜底。
 - **不要试图用 fp16 模拟 int8 linear**：实测慢 1.16–1.85 倍（形状越大差得越少）。int8 只赢
   1.3–1.8 倍而不是规格上的 2 倍，因为瓶颈是每线程的独立累加链数，不是精度格式；换 fp16 一样
   填不满发射槽，还多占一倍显存。社区对 `torch._int_mm` 的回退补丁是 fp32 精确回退，定位是
@@ -330,7 +364,8 @@ CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`imag
 - `gfx906fix/qwen-image21-remaining-ops.md` — 各补丁的收益与测量方法
 - `gfx906fix/gfx906-triton-attention-tuning.md` — Triton 注意力调优全过程
 - `gfx906fix/gfx906-int8-ceiling.md` — int8 在这张卡上的理论上限
-- `gfx906fix/hip_attn/NOTES_F16.md` — HIP fp16 内核（D=128 可用，未进入本包）
+- `gfx906fix/hip_attn/NOTES_F16.md` — 第一版 HIP fp16 内核（dot2 只有 ILP2–4，实测 2.7 TMAC/s，未进入本包）
+- `gfx906fix/hip_attn_v2/` — 本包内核的推导与微基准：指令吞吐/占用率曲线、每 lane tile 扫描、阶段消融
 
 ## 许可
 

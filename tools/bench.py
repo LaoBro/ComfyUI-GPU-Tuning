@@ -534,6 +534,36 @@ def run_tile_site(args, today):
         records[bucket] = manifest_write.render(bucket, best, medians, date=today,
                                                 note=f"{len(scores[best])} cell(s), convrot on")
         print(f"  {bucket:<6} {best}  median {statistics.median(scores[best]):.2f} ms")
+
+    # evidence only: the HIP dot4 GEMM against the Triton path, same shapes
+    try:
+        import hip_int8_gemm as hipg
+    except ImportError:
+        hipg = None
+    if hipg is None or not hipg.available():
+        return records
+    from comfy_kitchen.backends.triton import quantization
+    print("\n  hip int8 gemm (evidence only, not written to the manifest)")
+    for n_gemm, k_gemm in shapes:
+        for m_gemm in widths:
+            if m_gemm < hipg.MIN_ROWS:
+                print(f"  {n_gemm}x{k_gemm}@m{m_gemm}: skipped (m < {hipg.MIN_ROWS})")
+                continue
+            x = torch.randn(m_gemm, k_gemm, device="cuda", dtype=torch.float16)
+            w = torch.randint(-127, 127, (n_gemm, k_gemm), device="cuda", dtype=torch.int8)
+            ws = torch.rand(n_gemm, device="cuda", dtype=torch.float32) * 1e-3 + 1e-4
+            bias = torch.randn(n_gemm, device="cuda", dtype=torch.float32)
+            tuning.configure(int8_gemm="off")
+            triton_ms = bench_ms(lambda: quantization.int8_linear(
+                x, w, ws, bias, out_dtype=torch.float16), args.iters, args.warmup)
+            tuning.configure(int8_gemm="default")
+            hip_ms = bench_ms(lambda: hipg.linear(x, w, ws, bias, torch.float16, False),
+                              args.iters, args.warmup)
+            print(f"  {n_gemm}x{k_gemm}@m{m_gemm}: hip {hip_ms:.2f} ms  triton {triton_ms:.2f} ms  "
+                  f"{triton_ms / hip_ms:.2f}x")
+            del x, w, ws, bias
+            gc.collect()
+            torch.cuda.empty_cache()
     return records
 
 
@@ -545,6 +575,10 @@ def run_attention_site(args, today):
     """
     import attention_kernel as attn
     import gfx906_tuning as tuning
+    try:
+        import hip_attention as hip
+    except ImportError:
+        hip = None
 
     shapes = parse_attention_shapes(args.attention_shapes)
     gen = torch.Generator(device="cuda").manual_seed(0)
@@ -572,6 +606,8 @@ def run_attention_site(args, today):
                        for config in attn.INT8_CANDIDATES]
         if tuning._gemm_ok(q, k, v):
             candidates.append(("gemm", "gemm", lambda: tuning._gemm_attention(q, k, v, None)))
+        if hip is not None and hip.available() and hip.supported(q, k, v):
+            candidates.append(("hip", "hip", lambda: hip.attention_fwd(q, k, v, None)))
         candidates.append(("sdpa", "sdpa", lambda: tuning._sdpa(q, k, v, None)))
 
         for mode, label, run in candidates:
@@ -606,7 +642,7 @@ def run_attention_site(args, today):
     # contiguous copies per call -- users hit OOM under memory pressure that
     # the int8 kernel (int8 KV, strided reads, no copies) survives.
     ratios = {}
-    for mode in ("int8", "hand"):
+    for mode in ("int8", "hand", "hip"):
         per_shape = []
         for index in range(len(shapes)):
             ours, _ = best(index, mode)

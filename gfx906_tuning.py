@@ -58,7 +58,7 @@ FUSED_MAX_GROUPS = 32
 CONVROT_MODES = ("fused", "butterfly", "off")
 # Own kernels (exposed in the node). "sdpa" also exists as an internal value:
 # the auto-tune fallback when a tile loses to SDPA on an untested card.
-ATTENTION_KERNELS = ("hand", "int8", "int8qk", "gemm")
+ATTENTION_KERNELS = ("hand", "int8", "int8qk", "gemm", "hip")
 
 # Node switches are three-state: "default" keeps the startup/env value,
 # "on"/"off" are explicit overrides. None is the internal spelling of "default".
@@ -880,6 +880,8 @@ def patch_int8_tile_switch():
 
     _state["gemv_module"] = load_int8_gemv()
     _state["gemv_model"] = feature_on("gemv")
+    gemm_module = _hip_int8_gemm()
+    _state["hip_gemm_module"] = gemm_module if (gemm_module is not None and gemm_module.available()) else None
 
     def int8_linear(x, weight, weight_scale, bias=None, out_dtype=torch.bfloat16, convrot=False,
                     convrot_groupsize=256, input_act=None, input_act_weight=None,
@@ -889,6 +891,13 @@ def patch_int8_tile_switch():
             out = select_int8_gemv(x, weight, weight_scale, bias, out_dtype, input_act, residual,
                                    convrot_groupsize if convrot else 0)
             if out is not None:
+                return out
+        gemm = _state.get("hip_gemm_module")
+        if gemm is not None and _state.get("int8_gemm_enabled", True):
+            out = gemm.linear(x, weight, weight_scale, bias, out_dtype, convrot, convrot_groupsize,
+                              input_act, input_act_weight, input_act_eps, residual, residual_scale)
+            if out is not None:
+                _state["hip_gemm_calls"] = _state.get("hip_gemm_calls", 0) + 1
                 return out
         select_int8_tile(rows)
         return previous(x, weight, weight_scale, bias, out_dtype, convrot, convrot_groupsize,
@@ -1057,6 +1066,30 @@ def _swap_optimized_attention(old, new):
                 setattr(module, name, new)
 
 
+def _hip_int8_gemm():
+    """The gfx906 HIP int8 GEMM module, or None when it is not built."""
+    try:
+        from . import hip_int8_gemm
+    except ImportError:
+        try:
+            import hip_int8_gemm
+        except ImportError:
+            return None
+    return hip_int8_gemm
+
+
+def _hip_attention():
+    """The gfx906 HIP attention extension module, or None when it is not built."""
+    try:
+        from . import hip_attention
+    except ImportError:
+        try:
+            import hip_attention
+        except ImportError:
+            return None
+    return hip_attention
+
+
 def patch_attention():
     """Run eligible attention calls on the gfx906 kernel, delegate the rest.
 
@@ -1079,6 +1112,11 @@ def patch_attention():
     except ImportError:
         from attention_kernel import (SUPPORTED_HEAD_DIMS, attention_fwd, attention_fwd_int8,
                                       supported as kernel_supported)
+    hip = _hip_attention()
+    if hip is not None and hip.available():
+        hip_supported, hip_fwd = hip.supported, hip.attention_fwd
+    else:
+        hip_supported = hip_fwd = None
 
     fallback = attention.optimized_attention
     if fallback in (attention.attention_sage, attention.attention_comfy_kitchen_int8):
@@ -1086,7 +1124,9 @@ def patch_attention():
                      getattr(fallback, "__name__", "?"))
         return False
 
-    kernel = "int8"
+    # the fused HIP kernel won every measured shape (tools/bench.py --attention)
+    # and keeps fp32 accumulators, so it is the default when it was built
+    kernel = "hip" if hip_supported is not None else "int8"
     _state["attn_kernel"] = kernel if kernel in ATTENTION_KERNELS or stock_backend(kernel) is not None else "int8"
     _state["attn_backend_fn"] = stock_backend(_state["attn_kernel"])
     _state["smooth"] = True
@@ -1097,7 +1137,7 @@ def patch_attention():
     _state["attn_fp16"] = True
     _state["attn_contiguous"] = True
     stats = _state["attn_cast"] = {"fp16": 0, "fp32": 0, "hand": 0, "int8": 0, "int8qk": 0,
-                                   "gemm": 0, "sdpa": 0}
+                                   "gemm": 0, "hip": 0, "sdpa": 0}
 
     def run(q, k, v, softmax_scale):
         """[B, S, H, D] -> same, or None to delegate. fp16 unless the cast is off."""
@@ -1110,6 +1150,11 @@ def patch_attention():
                 return None
             stats["gemm"] += 1
             return _gemm_attention(q, k, v, softmax_scale)
+        if mode == "hip":
+            if hip_supported is None or not hip_supported(q, k, v):
+                return None
+            stats["hip"] += 1
+            return hip_fwd(q, k, v, softmax_scale)
         if not kernel_supported(q, k, v):
             return None
         if mode == "int8":
@@ -1308,7 +1353,8 @@ def triton_backend_active():
 def configure(attention=None, smooth=None, convrot=None, profile=None, text_encoder=None,
               fp16=None, text_attention=None, contiguous=None, qkv=None,
               vae=None, gemv=None, textgen=None, prefix_kv=None, text_gemv=None, w4a8=None,
-              amax_guard=None, int8_tile=None, small_batch=None, image_tower=None):
+              amax_guard=None, int8_tile=None, small_batch=None, image_tower=None,
+              int8_gemm=None):
     """Runtime settings, used by the GFX906 nodes.
 
     Every argument is three-state: None/"default" keeps the built-in default
@@ -1318,7 +1364,14 @@ def configure(attention=None, smooth=None, convrot=None, profile=None, text_enco
     if attention is not None:
         wanted = str(attention).strip().lower()
         if wanted == "default":
-            wanted = "int8"
+            hip = _hip_attention()
+            wanted = "hip" if hip is not None and hip.available() else "int8"
+        if wanted == "hip":
+            hip = _hip_attention()
+            if hip is None or not hip.available():
+                logging.info("gfx906: HIP attention extension is not built, keeping mode %s",
+                             _state["attn_kernel"])
+                wanted = _state["attn_kernel"]
         # combo values are untrusted: stale workflows may still carry removed names
         _state["attn_kernel"] = (wanted if wanted in ATTENTION_KERNELS
                                  or stock_backend(wanted) is not None else "int8")
@@ -1345,6 +1398,8 @@ def configure(attention=None, smooth=None, convrot=None, profile=None, text_enco
                                   or stock_backend(wanted) is not None else "default")
     if vae is not None:
         _state["vae_enabled"] = resolve_flag(vae, feature_on("vae"))
+    if int8_gemm is not None:
+        _state["int8_gemm_enabled"] = resolve_flag(int8_gemm, True)
     if image_tower is not None and _state["vision_patched"]:
         # "default" keeps the boot decision (manifest verdict, or a FORCE opt-in)
         _state["vision_enabled"] = resolve_flag(image_tower, _state["vision_enabled"])
@@ -2107,10 +2162,11 @@ def apply():
     if on_amd:
         _install("attention", patch_attention)
     logging.info(
-        "gfx906 tuning active: int8 linear %s%s, convrot %s, vae %s, qkv %s, attention %s%s%s%s, "
+        "gfx906 tuning active: int8 linear %s%s%s, convrot %s, vae %s, qkv %s, attention %s%s%s%s, "
         "text encoder %s + lm_head, encoder attention %s, textgen %s",
         "measured tile" if _state.get("int8_tile_replaced") else ("on (stock candidates)" if _state["int8_linear"] else "off"),
         " + decode gemv" if _state.get("gemv_model") else "",
+        " + hip gemm" if _state.get("hip_gemm_module") is not None and _state.get("int8_gemm_enabled", True) else "",
         _state["convrot_mode"] if _state["convrot"] else "off",
         "conv3d->conv2d" if _state.get("vae_patched") and _state.get("vae_enabled") else "off",
         "fused" if _state.get("qkv") else "off",
@@ -2144,8 +2200,8 @@ def report_lines():
     if not cast:
         return []
     line = (f"attention fp16-ok {cast['fp16']} / amax overflow {cast['fp32']}"
-            f" (own kernel: hand {cast['hand']}, int8 {cast['int8']}, int8qk {cast['int8qk']},"
-            f" gemm {cast['gemm']}, sdpa {cast['sdpa']})")
+            f" (own kernel: hip {cast['hip']}, hand {cast['hand']}, int8 {cast['int8']},"
+            f" int8qk {cast['int8qk']}, gemm {cast['gemm']}, sdpa {cast['sdpa']})")
     for k in cast:
         cast[k] = 0
     return [line]
@@ -2170,6 +2226,9 @@ def status():
         small_line = f"small batch tile {'on' if _state.get('small_batch_enabled', True) else 'off (large tile only)'}"
     else:
         small_line = (f"small batch tile {'candidate' if _state.get('small_batch_enabled', True) else 'off (not a candidate)'}")
+    hip_gemm = _state.get("hip_gemm_module")
+    gemm_line = ("int8 gemm hip " + ("on" if _state.get("int8_gemm_enabled", True) else "off")
+                 + f" ({_state.get('hip_gemm_calls', 0)} calls)") if hip_gemm is not None else "int8 gemm hip n/a"
     prefix_patched = _state.get("prefix_kv_patched")
     if not prefix_patched:
         prefix_line = "prefix kv n/a"
@@ -2214,6 +2273,7 @@ def status():
         f"comfy-kitchen triton backend {triton_backend_active()}",
         tile_line,
         small_line,
+        gemm_line,
         f"convrot {_state['convrot_mode'] or 'off'}",
         f"qkv {'one int8 gemm' if _state.get('qkv') else 'off'}"
         + (f", {_state['qkv_calls']} fused / {_state.get('qkv_fallbacks', 0)} fallback"
@@ -2259,8 +2319,8 @@ def status():
     cast = _state["attn_cast"]
     if cast:
         lines.append(f"attention calls: fp16-ok {cast['fp16']}, amax overflow {cast['fp32']}"
-                     f" (own kernel: hand {cast['hand']}, int8 {cast['int8']}, int8qk {cast['int8qk']},"
-                     f" gemm {cast['gemm']}, sdpa {cast['sdpa']})")
+                     f" (own kernel: hip {cast['hip']}, hand {cast['hand']}, int8 {cast['int8']},"
+                     f" int8qk {cast['int8qk']}, gemm {cast['gemm']}, sdpa {cast['sdpa']})")
     failures = _state.get("install_failures") or []
     if failures:
         lines.append(f"patches skipped on this device: {', '.join(failures)} (see the boot log)")
