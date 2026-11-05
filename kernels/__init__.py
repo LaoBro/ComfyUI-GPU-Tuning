@@ -1,6 +1,6 @@
 """Kernel registry: implementation contract plus the backend dispatch chain.
 
-Layout this package grows into (see PORTING.md):
+Layout this package grows into (see docs/PORTING.md):
 
     kernels/            # arch-agnostic: contracts, portable Triton impls
     arch/<gcn>/         # per-arch measurement manifests and specialised kernels

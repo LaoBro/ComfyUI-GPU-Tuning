@@ -247,16 +247,18 @@ CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`imag
 - `int8_tile`：关闭后恢复上游 autotune 的 tile 列表，不再注入 gfx906 的 `128×256×32`；GEMV 仍由 `gemv` 单独控制。
 - `small_batch`：gfx906 上把“`m≤8` 切到 `16×32×64` 窄 tile、`m>8` 切回 `128×256×32`”单独控制；其它 AMD 上表示“把窄 tile 追加为 autotune 候选”（是否真的用它由该卡实测决定）。需要 `int8_tile` 为 on，否则显示 n/a。GEMV 仍由 `gemv` 单独控制。
 - `text_gemv`：单行文本编码器解码时，int8 权重直调 GEMV、未量化的小投影走 `torch.mv`；关闭后两者都回到分派层。
-- `w4a8`：4-bit 权重解码；`status()` 会打印实际调用次数和当前后端（`hip` / `asm` / `triton`），换 checkpoint 后可据此确认是否真的走到了 w4a8 内核（`on: 0 calls ...` 表示权重布局没被识别）。能否用 `tl.dot` 替代 `v_dot4` 的实测结论见 [PORTING.md](PORTING.md#w4a8能否用-tldot-替代-v_dot4)。
+- `w4a8`：4-bit 权重解码；`status()` 会打印实际调用次数和当前后端（`hip` / `asm` / `triton`），换 checkpoint 后可据此确认是否真的走到了 w4a8 内核（`on: 0 calls ...` 表示权重布局没被识别）。能否用 `tl.dot` 替代 `v_dot4` 的实测结论见 [docs/PORTING.md 附录 E](docs/PORTING.md)。
 - `textgen`：一次控制 DeltaNet 内核、KV decode 折叠、llama RMSNorm/RoPE 缓存、Qwen3.5 计算类；关闭时逐调用委托回 core 实现（Qwen3.5 类符号本身不换回）。
 
 ### 在其它显卡上使用 / 扫描 int8 tile
 
 其它 AMD 显卡上的功能分级（常开 / 可选开关 / 测量门 / 不可用）、门控与 dispatch 的分工、扫描工具 `tools/tile_sweep.py` 的完整用法，以及 `COMFY_GFX906_TILE_CONFIG` / `SMALL_TILE_CONFIG` 的使用方式，见：
 
-**[PORTING.md — 其它显卡移植与二次开发指南](PORTING.md)**
+**[docs/PORTING.md — 其它显卡移植与二次开发指南](docs/PORTING.md)**
 
-最短路径：先用节点默认值跑通（没跑过 bench 的卡上测量门功能是关的），再运行一次 `python custom_nodes/ComfyUI-gfx906-Tuning/tools/bench.py --all --write`。它测出这张卡的 int8 tile，以及 GEMV / w4a8 / deltanet（含 prefill）/ vae / convrot / vision 的开或关，写进 `~/.config/comfy-gfx-tune/arch/<gcn>/manifest.toml`，之后启动不再 autotune。attention 只打印证据不写记录：`hip` 是默认模式（下面有实测，内核随包分发），本机 HIP 装不上它时回落到 `int8` 并在启动日志提示重编，其余模式仍可在节点里手选。想知道时间落在哪一段（而不是哪个内核快）用 `tools/chain_profile.py`，见 [PORTING.md §5.4](PORTING.md)。
+给其它架构写 HIP 内核见 [docs/HIP_KERNELS.md](docs/HIP_KERNELS.md)。
+
+最短路径：先用节点默认值跑通（没跑过 bench 的卡上测量门功能是关的），再运行一次 `python custom_nodes/ComfyUI-gfx906-Tuning/tools/bench.py --all --write`。它测出这张卡的 int8 tile，以及 GEMV / w4a8 / deltanet（含 prefill）/ vae / convrot / vision 的开或关，写进 `~/.config/comfy-gfx-tune/arch/<gcn>/manifest.toml`，之后启动不再 autotune。attention 只打印证据不写记录：`hip` 是默认模式（下面有实测，内核随包分发），本机 HIP 装不上它时回落到 `int8` 并在启动日志提示重编，其余模式仍可在节点里手选。想知道时间落在哪一段（而不是哪个内核快）用 `tools/chain_profile.py`，见 [docs/PORTING.md](docs/PORTING.md)。
 
 ### 注意力模式怎么选
 
@@ -317,7 +319,7 @@ m ≤ 1 的解码仍走 GEMV；m < 128 直接回落 Triton（128 行 tile 在更
 | NVIDIA（有 GPU） | triton 内核补丁与 attention 不装（`is_amd()` 为假；cuda 的 capability 集没有 `int8_linear`，N 卡的 int8 线性走 triton，但本包没在 N 卡测过 tile，保持 stock autotune）。常开组生效：prefix KV、KV decode 折叠、llama 缓存、TE GEMV、TE int8；`w4a8`/`deltanet` 由本机 bench 的 `feature.*` 决定（manifest key 是 `sm<major><minor>`）。**未实测**，性能结论要由有卡的人跑；逐块 CUDA graph 由节点自带，不需要改动 core |
 | CPU | `torch.cuda.is_available()` 为假，整包不安装 |
 
-其它 AMD 的功能分级、需要测量/移植的项和扫描工具用法见 [PORTING.md](PORTING.md)。
+其它 AMD 的功能分级、需要测量/移植的项和扫描工具用法见 [docs/PORTING.md](docs/PORTING.md)。
 
 ## 开关
 
@@ -372,7 +374,7 @@ m ≤ 1 的解码仍走 GEMV；m < 128 直接回落 Triton（128 行 tile 在更
 所有数字都来自本机实测。测量工具随包分发，逐项推导在仓库外的 `gfx906fix/` 目录：
 
 - `tools/bench.py` — 站点微基准（数值门先于计时），`--all --write` 写本机 manifest
-- `tools/chain_profile.py` — **生文链路归因**：一次 TextGenerate 的嵌套 CUDA event 分解（图像塔 / block / MLP / lm_head / prefill vs 每步），按结构发现归因点，跨架构可用，见 [PORTING.md §5.4](PORTING.md)
+- `tools/chain_profile.py` — **生文链路归因**：一次 TextGenerate 的嵌套 CUDA event 分解（图像塔 / block / MLP / lm_head / prefill vs 每步），按结构发现归因点，跨架构可用，见 [docs/PORTING.md](docs/PORTING.md)
 - `tools/status.py` / `tools/verify_backends.py` — 不开 ComfyUI 看当前判定 / 改内核后的选择 parity 与数值 A/B
 
 - `gfx906fix/textgen-tuning.md` — **文本生成调优记录**：现状、时间分解、五个坑、后续方向

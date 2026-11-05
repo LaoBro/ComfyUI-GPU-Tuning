@@ -40,4 +40,4 @@ Sites that exist today: `w4a8.m1` (`w4a8_gemv.linear`), `int8_gemv.m1`
 first; a file whose `SITE` nobody declares is simply never loaded.
 
 Measurements for whatever you add belong in `arch/<gcn>/manifest.toml`, keyed by
-the same `NAME` -- see `tools/bench.py` and PORTING.md §5.2.
+the same `NAME` -- see `tools/bench.py` and docs/PORTING.md (manifest appendix).
