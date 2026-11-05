@@ -44,6 +44,11 @@ try:
 except ImportError:
     import int8_gemv
 
+try:
+    from . import hip_w4a16
+except ImportError:
+    import hip_w4a16
+
 BN = 16
 MAX_M = 8
 WARPS = 4
@@ -387,11 +392,16 @@ def linear_dequant(x, qdata, s_rel, s_channel, bias, out_dtype, group_size,
         xr = x.float()
     rows = _row_block(m)
     bk = min(4 * group_size, 256)
-    lut = codebook.float().reshape(-1).contiguous() if codebook is not None else xr
+    lut = codebook.float().reshape(-1).contiguous() if codebook is not None else None
     out = torch.empty((m, n), device=x.device, dtype=out_dtype)
+    # One row is the decode case the HIP kernel was written for; it reads the
+    # nibbles as nibbles instead of materialising one fp32 value per code.
+    if rows == 1 and hip_w4a16.enabled():
+        if hip_w4a16.linear_dequant(xr, qdata, s_rel, s_channel, bias, out, group_size, lut):
+            return out
     dequant_w4a16_kernel[(triton.cdiv(n, BN),)](
         xr, qdata.view(torch.int32), out, s_rel.view(torch.uint8), s_channel,
-        bias if bias is not None else xr, lut,
+        bias if bias is not None else xr, lut if lut is not None else xr,
         n, k, m, qdata.view(torch.int32).stride(0), s_rel.stride(0),
         BN=BN, BK=bk, M=rows, GS=group_size,
         BSCALE_VEC=s_channel.numel() > 1, HAS_BIAS=bias is not None,

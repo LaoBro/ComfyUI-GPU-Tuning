@@ -85,6 +85,24 @@ SITES = {
         # the site answers "which w4a8 backend"; the baseline answers "w4a8 at all"
         "feature": "w4a8",
     },
+    # The two register-dequant GEMVs (te=default: fp16 activations, no activation
+    # quant). Evidence only: no "feature" key, because feature.te_dequant is decided
+    # against the per-call dequantise rather than against another GEMV. The site's
+    # registry names are timed next to `dequant` on purpose -- the int8 GEMV is the
+    # near-ceiling kernel at these shapes, so the ratio says how far the register
+    # dequant is from the hardware limit instead of whether it is more accurate.
+    "w8a16.m1": {
+        "module": "int8_gemv",
+        "impls": ("dequant",),
+        "default": "4096x4096@m1,4096x4096@m8,12288x4096@m1,12288x4096@m8",
+        "max_m": 8,
+    },
+    "w4a16.m1": {
+        "module": "w4a8_gemv",
+        "impls": ("dequant",),
+        "default": "4096x4096@m1,4096x4096@m8,12288x4096@m1,12288x4096@m8",
+        "max_m": 8,
+    },
 }
 W4A8_GROUP = 128
 # Qwen3.5 DeltaNet decode: 16 value heads of 128 in, 128 out, seq 1 and 4.
@@ -333,6 +351,46 @@ def w4a8_case(module, n, k, m, args, spec):
     return run, reference, baseline
 
 
+def w4a16_case(module, n, k, m, args, spec):
+    """Packed 4-bit weights read by fp16/fp32 activations, no activation quant.
+
+    `linear_dequant` takes the per-group scale as fp8 because that is what the
+    checkpoints carry and what it bit-decodes in registers; the activation-quantising
+    kernels take the same *values* in fp32, which is what w4a8.m1 already does. The
+    scale is rounded through fp8 before either side sees it, so all rows of the
+    table decode the same numbers and one reference covers them.
+    """
+    group = args.w4a8_group
+    if k % group:
+        raise ValueError(f"k={k} is not a multiple of --w4a8-group {group}")
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    qdata = torch.randint(0, 256, (n, k // 2), device="cuda", dtype=torch.uint8, generator=gen)
+    s_rel = (torch.rand(n, k // group, device="cuda", dtype=torch.float32, generator=gen)
+             * 14.5 + 1.0).to(torch.float8_e4m3fn).to(torch.float32).contiguous()
+    s_channel = torch.rand(n, device="cuda", dtype=torch.float32, generator=gen) * 0.01 + 1e-3
+    codebook = None
+    if not args.w4a8_uniform:
+        codebook = torch.sort(torch.randn(16, device="cuda", dtype=torch.float32,
+                                          generator=gen)).values * 3.0
+    x = torch.randn(m, k, device="cuda", dtype=torch.float32, generator=gen)
+    reference = x @ refs.w4a8_weight(qdata, s_rel, s_channel, group, codebook).T
+
+    levels, inv_level = (module.codebook_words(codebook) if codebook is not None
+                         else (None, 1.0))
+    dequant = module.linear_dequant
+
+    def run(fn):
+        if fn is dequant:
+            return fn(x, qdata, s_rel.to(torch.float8_e4m3fn), s_channel, None,
+                      torch.float32, group, 0, codebook)
+        return fn(x, qdata, s_rel, s_channel, None, torch.float32, group, 0,
+                  levels=levels, inv_level=inv_level)
+
+    weight8 = module.decode_int8(qdata, s_rel, group, codebook)
+    baseline = None if weight8 is None else ("int8", lambda: int8_baseline(x, weight8, s_channel))
+    return run, reference, baseline
+
+
 def int8_baseline(x, weight, scale):
     """What runs with w4a8 off: the int8 GEMV at m=1, the int8 GEMM above it."""
     from comfy_kitchen.backends.triton import quantization
@@ -346,7 +404,8 @@ def int8_baseline(x, weight, scale):
     return quantization.int8_linear(x, weight, scale, None, out_dtype=torch.float32, convrot=False)
 
 
-CASES = {"int8_gemv.m1": int8_case, "w4a8.m1": w4a8_case}
+CASES = {"int8_gemv.m1": int8_case, "w4a8.m1": w4a8_case,
+         "w8a16.m1": int8_case, "w4a16.m1": w4a16_case}
 
 
 def call_for(module, impl):
@@ -356,7 +415,8 @@ def call_for(module, impl):
     arch/<gcn>/kernels and is called through its `linear`, the same contract the
     site uses. Returns None when the name cannot be resolved.
     """
-    private = {"asm": "_linear_asm", "sum": "_linear_sum", "triton": "_linear_triton"}
+    private = {"asm": "_linear_asm", "sum": "_linear_sum", "triton": "_linear_triton",
+               "dequant": "linear_dequant"}
     if impl in private and hasattr(module, private[impl]):
         return getattr(module, private[impl])
     if impl == "triton" and hasattr(module, "_linear_dot"):

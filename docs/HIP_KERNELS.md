@@ -11,7 +11,8 @@
 LDS 布局或寄存器分配救回来**。我们在这里成功过两次（融合注意力、大 m int8
 GEMM），也失败过几次：
 
-- 带宽受限的 decode GEMV：换更宽的加载、更少的指令都没用，权重流式读取是硬上限；
+- 带宽受限的 decode GEMV：换更宽的加载、更少的指令都没用，权重流式读取是硬上限
+  （这条只适用于已经贴顶的内核，int8 GEMV 深队列 400-654 GB/s 才是这一类）；
 - 绝对耗时本来就小的算子（DeltaNet 递推、量化、归一化）：快 2 倍也只省零点几毫秒；
 - 把 Triton kernel 直译成 HIP：算法没变，只是换语言，收益接近 0。
 
@@ -25,7 +26,9 @@ radix-4 butterfly 拿到约 12 倍，靠的是消掉 8 次串行全局读和 O(G
 ## 基本流程
 
 1. **量基线**。CUDA event 交替轮次取 min；如果节点用了 per-block CUDA graph，
-   要在 graph 回放里量，单次 launch 的数字会被 Python 调度污染。
+   要在 graph 回放里量，单次 launch 的数字会被 Python 调度污染。两种计时分的不是
+   精度而是对象：单次调用的区间量用户付的代价（A/B、manifest 用它），判断内核离
+   硬件上限还有多远必须用深队列（连续提交几百次、只在两端同步），见坑点。
 2. **写 `.cu`**。用 `extern "C"` 平铺 ABI：`void*` 指针加 `int` 尺寸
    加 `void* stream`，返回 `int` 错误码。不做 torch 扩展，用 ctypes 直接调。
 3. **构建**。把源文件加进 `tools/build_hip_attn.py` 的 `TARGETS`，复用同一套
@@ -45,9 +48,37 @@ radix-4 butterfly 拿到约 12 倍，靠的是消掉 8 次串行全局读和 O(G
 捕获流；用捕获前缓存的 handle，launch 不会进图，测出来是「空图 + 0.04 us」
 这种假数字。最容易踩、也最隐蔽。
 
+**单次计时会把内核的余量算大 3 倍。** 单次调用的 CUDA event 区间包含 CPU 侧的启动和
+分配空档：本卡三个启动加两次分配实测 29 us，而 GEMV 内核本身只有 42 us。按单次数字
+反推带宽，w4a8 GEMV 是 72 GB/s，看着有 5-20x 的空间；深队列下它是 198，而同形状的
+int8 GEMV 是 400，真实差距 2x。「字节减半而时间不变」这条判据两种计时下都成立，
+方向没错，但相对排序被压平了（对照表见附录）。
+
+**多一次启动就是多 20-30 us。** 提升如果不在「少一个启动」这一侧，就很难赢。把
+GEMV 循环里的激活量化加打包提到独立内核，m=1 内核只快 8%，加上启动税净亏 53%；
+同一改动在 m=8 才有 1.87x。所以这类提升要在同一次启动里拿到（HIP 内核顺手做完，
+或落在 graph 捕获里），不要作为附加的 Triton 启动落地。
+
+**组比一条 lane 宽时，每条 lane 都要自己落账。** 一行拆给 KP 条 lane 之后，一条
+lane 的 k 区间（BK/KP）常常小于一个量化组（`s_rel` 的粒度）。这时不能只在「组边界
+落在本 lane」时乘 scale 落账：同一个组里其余 lane 的部分和会被整段丢掉，而结果只是
+「偏了一点」，不像错值。让每条 lane 都用自己所属组的 scale 结算自己的部分，组求和
+交给最后的 shuffle。
+
 **等价性要按消费者验收。** 旋转的输出会被量化成 int8：只比旋转值的 relL2
 不够，要比量化后的 int8 是否逐元素一致。fp16 输入上 HIP 用 fp32 累加会更准，
 但与 Triton 不等价 —— 要么刻意对齐精度，要么明确接受并重验生文 md5。
+
+**「换更窄的累加器」在这条卡上几乎没有落脚点。** gfx906 每条 2 MAC 的 fp16 指令只有
+`v_dot2_f32_f16`（累加端 fp32，ISA 写死）和 `v_pk_fma_f16`（累加端 packed fp16），
+补测同 ILP、同占用率（`gfx906fix/hip_attn_v2/mb_pk.cu`）：4 波 6.28 对 7.11、
+8 波 9.56 对 9.57、16 波 11.39 对 11.23
+TMAC/s —— 换过去在注意力实际的 4 波反而慢 13%，指令数还一样是 2 MAC/条，另外要付
+「把 P 广播进两个半字」并丢掉 dot2 免费的键内两两归约。int8 那侧 `v_dot4_i32_i8` 只出
+int32，形态上就不可降；`rotate.cu` 12 VGPR、`w4a16.cu` 单行 5 个累加器，没有压力可解；
+`hip_attn.cu` HDT=128 的 LDS 正好 65536 B = 整个 CU，占用率不由寄存器决定。fp16 成对
+唯一还剩的价值是**替换 fp32 FMA 链**：`v_pk_fma_f16` 对 `v_fma_f32` 在 4/8 波是
+1.7-2.0x，这才是 w4a16 接 m≥2 时该用的形态（它现在是 fp32 FMA）。
 
 **A/B 一次只动一个变量**，并且用 `--sampling off` 让 md5 有意义。采样开启时
 微小数值差会逐 token 放大成完全不同的文本。反过来，更快但生文从第一个
@@ -67,10 +98,12 @@ token 就退化，也是真失败。
 `tools/build_hip_attn.py --force`。`.so` 只含目标架构的代码对象，换卡时
 loader 按 `gcnArchName` 直接跳过。
 
-**LDS bank conflict 往往是第一瓶颈。** 行主序 padding 不一定够：列消费的
-operand 用 `+1 vec4` padding，八行八列同时别名时只能 XOR swizzle。先用
+**LDS bank conflict 往往是第一瓶颈。** 行主序 padding 不一定够：列消费的operand 用 `+1 vec4` padding，八行八列同时别名时只能 XOR swizzle。先用
 微基准把 LDS 指令比隔离出来，再动主内核 —— 我们第一个 int8 GEMM 版本
-就是被这个从 3.4 拖到 10.0 TMAC/s 的。
+就是被这个从 3.4 拖到 10.0 TMAC/s 的。流式操作数也要小心：`w4a16.cu` 的激活按
+行主序落进 LDS 后，一条 lane 的窗口宽度（ROWK=32 float）正好是 bank 数的约数，
+同一个位置在 32 条 lane 上只落在 2 个 bank，8-way 冲突；把存储改成 lane-major
+（word = lane + KP*位置）就是 **1.37-1.55x**，不用 padding 也不用 swizzle。
 
 **别急着追占用率。** 试过把 16 个 program 拆成 128 个，反而更慢；真正的
 瓶颈是 8 次串行的全局矩阵读。先量，再改。同理，寄存器预取在带宽受限的
@@ -103,6 +136,21 @@ load 阶段只会增加 VGPR 和私有拷贝，实测是负结果。
 - **工具**：`tools/chain_profile.py`（链路归因）、`tools/verify_backends.py`
   （选择 parity + 数值 A/B）、`tools/bench.py`（站点计时）、
   `tools/status.py`（不开 ComfyUI 看判定）。
+- **看内核真实资源**：`--save-temps` 留不下 GCN 汇编，得从 `.so` 的
+  `.hip_fatbin` 里挖设备 ELF（找 `\x7fELF`，按 `e_shoff/e_shnum/e_shentsize`
+  截尾），再 `llvm-readelf --notes` 读 `vgpr_count` / `vgpr_spill_count`。
+  spill 非零就是累加器和临时值不够用，比猜占用率快得多。
+- **相位计时**：房内已有惯例 —— `gfx906fix/hip_attn/hip_attn_f16.cu:149` 的
+  runtime-gated `s_memtime` 戳（`hip_attn_v2/mb_stamp2.cu` 验过 builtin）。
+  三条必要约定：只有 block 0 记时；**每个 wave 一套槽**（写手 `(tid & 63) == 0`，
+  索引带 `tid/64`）——共用槽会让跨块差值变负、四个 wave 互相覆盖；戳要打在大
+  「消费上一次结果的语句之后」，否则量不到 load 等待。再加两个自检：跨块差值必须
+  为正、四个 wave 的 span 应吻合在几个百分点内。还要把 span 和
+  「实测时间 ÷ 每块 row-group 数」比一下：比值 <1 说明一个 CU 上排了多轮块，
+  那是驻留/轮数信息，不是计时错了。**含 `__syncthreads` 的段不能按份额折算收益**：
+  那一段里混着「等最慢的 wave 到齐」，把它要做的活搬走，等待不会消失，只会挪进
+  下一个 barrier 所在的那一段重新分配（`w4a16.cu` 的 pack 相位就是这么从 44% 掉到
+  7-25% 却只换来 1.19-1.45x，而按份额本该值 1.3-1.8x 的）。
 
 ## gfx906 的硬件限制（其它架构不一定成立）
 
@@ -153,26 +201,77 @@ load 阶段只会增加 VGPR 和私有拷贝，实测是负结果。
 | VGPR | 256/thread（1 block/CU）；128（2 blocks/CU） |
 | 理论 dot2 / dot4 / dot8 | 13.4 / 26.5 / 53.0 TMAC/s |
 | 纯 dot2 实测（8 累加器，16-32 波） | 12.0 TMAC/s |
-| 4 波 VALU 天花板 | dot2 7.23、dot4 12.8 TMAC/s |
+| 4 波 VALU 天花板 | dot2 7.23、dot4 12.8 TMAC/s（packed fp16 见下，更低） |
 | 纯 dot4 循环（4 / 8 / 16 波） | 12.9 / 16.4 / 18.0 TMAC/s |
+| 纯 packed fp16 `v_pk_fma_f16`（4 / 8 / 16 波） | 6.28 / 9.56 / 11.39 TMAC/s |
+| 纯 `v_fma_f32`（4 / 8 / 16 波） | 3.64 / 4.80 / 5.69 TMAC/s（1 MAC/条） |
 | HBM 实测 | 约 410 GB/s（交错布局）～ 674 GB/s（lm_head GEMV） |
 | LDS b32 / b64 / b128 | 1.9-3.9 / 4.3-8.8 / 9.5-11.2 TB/s |
 | 全局加载 dword / dwordx4 | 814 / 867-873 GB/s |
 | 纯 FP32 FMA vs QDQ（逐次使用） | 5.95 / 4.19(dot2) / 2.00(dot4) TOPS |
 | 同上（转换成本摊薄后） | 13.0 / 21.9 / 21.7 TOPS |
 
-## 三个已落地的 HIP 内核
+## 四个已落地的 HIP 内核
 
 | 内核 | 结果 | 关键配置 |
 |---|---|---|
 | 融合注意力 `hip_attn.cu` | 5.1-5.6 TMAC/s（4 波天花板的 75-78%），比 int8 快 1.3-1.6x | 128 Q 行 x 64 keys、256 线程、1 block/CU、32+64 fp32 累加器、XOR swizzled LDS 恰好 64 KB |
 | 大 m int8 GEMM `int8_gemm.cu` | 10.04 TMAC/s，节点级 1.10-1.16x | 128x128 tile、TM8/TN8 = 64 int32 累加器、BK=32、chunk-major LDS、211 VGPR 无 spill |
 | 激活旋转 `rotate.cu` | fp32 档约 12x（graph 内 23.6 → 2.0 us/call），端到端 38.4 → 51.6 tok/s | radix-4 butterfly，D=1/4/16 用 shfl_xor、D=64 走 LDS，无全局 Hadamard 流量 |
+| W4A16 解码 GEMV `w4a16.cu` | 单行解码 3.5-4.4x（内核本身 48-62 → 179-276 GB/s） | 一行拆 32 lane（一个 wavefront 读 8 行 x 16 B）、grid 封顶 240 块 = 960 波、每 lane 一个 uint4、16 级 fp32 codebook 放 LDS、每个 dword 一条独立累加链、**激活按 quad 行落 LDS**（先 lane-major 修 bank 冲突 1.4x，再 b128 一条指令供 4 个权重又 1.15x）、**循环倒置**（每个 chunk 只 pack 一次激活，再遍历本块的 32 个 row-group，部分和走 LDS、每块一次 shuffle，寄存器不涨）；只接 m=1 |
 
 int8 GEMM 的波形 sweep（4032x12288x4096）：2 波 5.75、4 波 9.64、
 8 波 9.14 TMAC/s（8 波只能用 16 累加器，与 4 波不是同一个 tile）。
 配置 sweep：128 累加器 spill 364 B、BK=64 spill 376 B，只有 TM8/TN8
 不 spill。bank conflict 是首版 3.4 TMAC/s 的全部原因。
+
+## 深队列下的 decode GEMV 余量
+
+内核本身的耗时：300 次连续提交、只在两端同步，convrot 关，`w8a16` / `w4a16` 用
+fp16 激活、`w4a16` 走 codebook。GB/s 按权重流量折算（int8 一字节、int4 半字节）。
+program 数够多时这张卡能吃满流式带宽（lm_head 的 int8 GEMV 连单次计时都有
+726 GB/s，深队列只会更高），所以同形状的 int8 GEMV 才是这一档的实际参照。
+
+| 内核 | 4096x4096 @m1 | 12288x4096 @m1 | 12288x4096 @m8 |
+|---|---|---|---|
+| `int8_gemv.asm_kernel`（w8a8，只接 m=1） | 41.9 us / 400 | 76.9 us / 654 | 不接此形状 |
+| `w4a8_gemv.gemv_kernel`（w4a8 asm） | 42.4 us / 198 | 77.5 us / 325 | 320.5 us / 79 |
+| `int8_gemv.dequant_gemv_kernel`（w8a16） | 46.9 us / 358 | 87.3 us / 576 | 337.1 us / 149 |
+| `w4a8_gemv.dequant_w4a16_kernel`（w4a16 Triton） | 176.8 us / 47 | 455.3 us / 55 | 1870.7 us / 13 |
+| `w4a16.cu`（w4a16 HIP，同一 `linear_dequant` 入口） | 45.5 us / 184 | 122.3 us / 206 | 不接 m>1 |
+
+读数：
+
+- **w8a16 在 m=1 已经和同形状的 int8 GEMV 同级**（358-576 对 400-654 GB/s），没有
+  内核余量可拿；m≥4 掉到 149 GB/s，成本在 `tl.static_range(M)` 加 `tl.where` 把
+  M 行做成 M 次整 tile 重算。
+- **w4a16 是这张卡上余量最大的内核**：读一半字节却比 w8a16 慢 3.8x（按字节算是
+  7.5x）。每个 nibble 展成一个元素、每个 nibble 一次全局 gather
+  （`tl.load(lut_ptr + c)`），加上 fp8 格点逐元素软解码，以及 BK 被
+  `min(4 * group_size, 256)` 锁在 256。m=8 是 13 GB/s。
+  已按这一格落地 `w4a16.cu`（单行 179-276 GB/s，3.5-4.4x），离读取地板 631-776 GB/s
+  还差 2.3-4.3x。实测的几段账：消掉 barrier（每块两次 `__syncthreads`）**更慢**，
+  管线不是瓶颈；把激活从行主序改成 lane-major 落 LDS **1.37-1.55x**（行主序时 32 条 lane 的
+  同一位置只落在 2 个 bank 上，8-way 冲突）；去掉 FMA 和一半 LDS 读（NOFMA）值
+  1.5-1.7x；激活改 quad 行 + `ds_read_b128`（一条指令供 4 个权重）再 1.15x，已落地；
+  循环倒置把 pack 从「每 8 行一次」摊到「每 chunk 一次、供 32 个 row-group 复用」，
+  pack 相位从 44-46% 掉到 7-25%，同一进程内配对 A/B 实测 **1.19-1.45x**（原因见下面
+  相位一节，比按份额折算的 1.3-1.8x 少）。
+  剩下的 2.3-4.3x 里，最后一次每权重的 LDS 读是 codebook gather：换到 VALU（`v_perm_b32`
+  解析 int8 格点 + `v_cvt_f32_i32_sdwa BYTE_n`，ISA 笔记确认这两条在 gfx906 都有）
+  能把 LDS:global 从 5:1 压到 1:1，代价是 level 回到 int8 格点（~4e-3），要么刻意
+  对齐精度要么按坑点重验 md5。**每 lane 在飞 load 数已试并被否**：预取下一块的
+  uint4（+4 VGPR）没有收益，k=12288（12 个块）反而慢 17%。
+- Triton 侧的替代方案已经量过并否掉（fp16 大 dot 慢 1.6-7 倍，PORTING.md 附录 E），
+  而「nibble 留在字里 + packed fp16 成对点积」（`v_dot2_f32_f16`，两端本来就是
+  fp16，没有转换成本）是 Triton 表达不了的形状，所以 w4a16 这一格是手写 HIP 的活。
+- **w4a8 asm 那 2x 不在指令形态上，这一条已被否**：它读一半字节却和 int8 GEMV 同速
+  （42.4 对 41.9 us），看着像指令受限；但按这一格的结构手写了一个只用链式
+  `v_dot4_i32_i8`（累加操作数免费，正是 Triton 给不了的那条）+ block 内量化打包 +
+  `v_perm_b32` LUT 的 HIP 内核，结果 190-224 GB/s，**只在小 n 赢 44%**（190 对 132），
+  n≥12288 全部落后 Triton 的 282-373 GB/s。所以那 2x 不在解码/求和的指令流里，
+  也不在 dot4 累加链上；剩下的差别在我这套结构与 Triton 的流式形状之间，没量出来
+  之前不要再按「换指令形态」下注。
 
 ## 试过但没采用的路径
 
@@ -184,6 +283,38 @@ int8 GEMM 的波形 sweep（4032x12288x4096）：2 波 5.75、4 波 9.64、
 | 旋转按列分块撑到 128 个 program | 比 16 个 program 更慢（7.8 vs 13.3 us in graph） |
 | 用 per-group `tl.dot` 替代 `v_dot4` | 慢 1.6-7 倍（M 补齐到 16、256 次小 dot），见 PORTING.md 附录 E |
 | fp16 模拟 int8 linear | 慢 1.16-1.85 倍 |
+| 激活量化+打包提到独立 Triton 内核 | m=1 净亏 53%（64.5 → 98.6 us：29 us 的启动税 > 内核省的 3.5 us）；m=8 才 1.87x |
+| 预取下一块的 uint4（每 lane 两个在飞 load） | 中性偏负：175/217/223/236 GB/s 不变，k=12288（12 块）慢 17%。和消 barrier 的负结果同向 —— 这个内核不缺 MLP |
+| 手写 HIP W4A8 GEMV（链式 dot4 + LUT + block 内打包激活） | 4096²@m1 +44%，但 12288²/4096×12288/152064² 落后 25-40%（212-224 对 282-373 GB/s）→ 不落地，`w4a8.m1` 的 `hip` 槽位继续空着 |
+| 把 `KP` 从 32 降到 16/8（每 lane 2-4 个 uint4） | 更慢（142/75 GB/s）且数值坏掉（`red[]` 按 32-lane 分组，换 KP 就没写满）；`BK` 提到 2048/4096 同样更慢（168/113）|
+| `__launch_bounds__(256, 4)` 逼出 4 块/CU | 2.4x **更慢**（161-193 → 66-81 GB/s）：64 VGPR 上限把 4 条独立累加链和 gather 的中间值全挤掉，占用率不是这个内核的瓶颈，`(..., 1)` 才对 |
+| W4A16 HIP 内核接 m=2..8 | 同一套 lane 划分在 m=8 只有 0.9-1.1x：八行 fp32 累加器加上它们的激活读取把发射槽吃满，13 GB/s。现在由 loader 拒绝 m>1，回落 Triton |
+| 注意力 PV 换成 fp16 累加（`v_pk_fma_f16`，64 个累加器减到 32） | 没落地，动手前先被微基准否掉：4 波 6.28 对 dot2 7.11 TMAC/s（指令数同为 2 MAC/条，发射率更低），还要多一次 P 广播、丢掉键内两两归约；且 LDS 65536 B 已把占用率钉在 1 block/CU，省下的寄存器换不来波数 |
+| `tl.reduce(combine_fn=v_dot4)` 用满累加操作数 | 表达不了：reduce 的叶子值必须是待归约元素本身，`(w, a)` 双流喂进 c 槽会把权重原值当部分和加上。只剩先 `dot4(w,a,0)` 再求和，即现状。累加链在 HIP 里才免费（`int8_gemm.cu` 的 `__builtin_amdgcn_sdot4`） |
 
 这些「不要做」的结论和 gfx906 的 LDS/VGPR 预算绑得很紧；换一张卡，
 结论可能完全反过来。
+
+### 资源与相位实测（`w4a16.cu`，m=1）
+
+- `vgpr_count 94 / vgpr_spill_count 0 / sgpr_count 46-48`（16 个实例化一致，倒置前是
+  88）。256 线程 × 94 = 24064 → 驻留 2 block/CU（8 波），而纯读探针的最优点是
+  4 block/CU（16 波）。但 `-DMINB=4` 压到 64 VGPR 实测**慢 2.4x**：占用率不是
+  这条路的瓶颈，别再拿它试。
+- 每 chunk 相位（`s_memtime`，每 wave 独立槽，四个形状一致）：**倒置前**激活 pack
+  ≈ 44-46%（1702-2100 cyc）、load 等待+解码+LDS ≈ 31-41%（1272-2176）、group scale
+  累账 ≈ 10-13%（464-546）、跨块固定开销 ≈ 8-11%（421-429）、**发出 load 只占
+  1.5-2.1%**（78-80 cyc，等待全在下一段里）。最大的单项是 pack，而它当时只摊在
+  BN=8 行上；m=1 的激活整块共享，所以把它提到 row-group 循环之外（循环倒置：每个
+  chunk pack 一次，再遍历本块的所有 row-group，各组部分和走 LDS + 每块一次 shuffle
+  归约，寄存器不涨）。按 44% 折算本该值 1.3-1.8x。
+- **倒置后 pack 相位确实掉到 7.3-25.1%，但只换来 1.19-1.45x**（同一进程内配对 A/B：
+  140-191 → 179-276 GB/s），load 发出仍是 80 cyc，各 wave 的总周期数彼此仍差 1% 以内。
+  原因是 pack 那一段量到的 1700-2100 cyc 里混着**等最慢的 wave 到齐**（段首的
+  `__syncthreads`），它是 barrier 收敛不是纯工作量；把它搬出循环，等待不会消失，
+  只会挪到下一个 barrier 所在的那一段里重新分配。**一条相位的耗时只有在它做的是
+  纯工作时才能按份额折算收益**；含 barrier 的段要先看 wave 间的离散度，离散度大
+  就说明这段里有等待，收益要打折。
+- 顺带纠正一次错误读数：先前「整行一次 pack 反而更慢」的 NOSYNC 实验把 `xa`
+  撑到 32 KB，驻留从 2 block/CU 掉到 1 —— 那是 LDS 尺寸的失败，不是「提出来」
+  的失败。一个结论如果被一个没控制的变量陪着，就等于没测。

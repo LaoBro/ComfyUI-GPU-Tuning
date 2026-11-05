@@ -1,4 +1,4 @@
-"""Build the node's HIP kernels (attention, int8 GEMM, activation rotation).
+"""Build the node's HIP kernels (attention, int8 GEMM, activation rotation, W4A16 GEMV).
 
 The HIP toolchain lives in the ComfyUI venv (torch's ROCm wheel), not in a
 system ROCm install, so the SDK is staged into /tmp where clang expects it.
@@ -15,7 +15,7 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 KERNELS = os.path.join(ROOT, "arch", "gfx906", "kernels")
 TARGETS = [("hip_attn.cu", "libgfx906_attn.so"), ("int8_gemm.cu", "libgfx906_int8.so"),
-           ("rotate.cu", "libgfx906_rotate.so")]
+           ("rotate.cu", "libgfx906_rotate.so"), ("w4a16.cu", "libgfx906_w4a16.so")]
 STAGE = "/tmp/hip_rocm"
 
 

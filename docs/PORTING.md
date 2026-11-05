@@ -270,6 +270,11 @@ schema 不符、TOML 语法错、单条记录类型不对都只影响那一条�
 那才是关掉 w4a8 时真正会跑的路径。`--w4a8-uniform` 测均匀格点，
 `--w4a8-group` 默认 128、改成 8 会跑 `tl.sum` 保底。
 
+`w8a16.m1` / `w4a16.m1` 量 te=default 的寄存器内反量化（fp16 激活、m≤8），同形状的
+其它内核并排进表，用来判断反量化离上限多远。它们只出证据、不写 `feature.*`：
+`feature.te_dequant` 的对端是逐调用反量化，不是另一个 GEMV。读表前先按
+HIP_KERNELS.md 基本流程第 1 条分清两种计时——本站点是单次计时，比内核本身多 20-30 us。
+
 各站点形状可用 `--tile-shapes` / `--tile-m` / `--attention-shapes` /
 `--deltanet-shapes` / `--vae-shapes` / `--convrot-shapes` / `--qwen35-*` 覆盖。
 表里没有的形状回落 `default`，再没有就回到 autotune/探测。
