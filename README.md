@@ -117,15 +117,17 @@ GEMV 内核自己合成行 scale 并在线量化，一条 linear 从 3 次启动
 Hadamard 符号在寄存器里生成，不再逐 tile 读 256x256 矩阵。fp32 档量化激活与 Triton 逐元素一致，
 `COMFY_GFX906_ROTATE=off` 回退到 Triton 做 A/B；fp16 档按 fp32 累加，结果更准但不等价。
 
-te=default 的单行 4-bit 解码（激活不量化、权重在寄存器内反量化）换成 HIP 内核
+te=default 的 4-bit 解码（激活不量化、权重在寄存器内反量化）换成 HIP 内核
 （`hip_w4a16.py` + `arch/gfx906/kernels/w4a16.cu`）：nibble 不再展成 8 个 fp32 元素，
 16 级 codebook 走 LDS 索引读，一行拆给 32 条 lane、grid 封顶 240 块，每个 k 块的激活
-只打包一次（一条 `ds_read_b128` 供 4 个权重）再摊给整块的 row-group 复用。
+只打包一次（一条 `ds_read_b128` 供 4 个权重）再摊给整块的 row-group 复用。单行与
+多行（m=2..8，一个 dword 解出的 8 个格点跨行复用）各一个入口。
 bench 的 `w4a16.m1` 站点 266.6 → 93.3 us（4096x4096@m1）、496.8 → 172.0 us
-（12288x4096@m1），深队列下内核本身 48-62 → 179-276 GB/s，单行解码整体 3.5-4.4x；
-与 Triton 路径的差在 fp32 舍入内（归一化 ≤2.2e-7），fp16 输出另含舍入（≤2.1e-4）。
-`COMFY_GFX906_W4A16_HIP=off` 回退 Triton；MTP 的多行仍走 Triton
-（同一布局在 m=8 只有 0.9-1.1x，见 docs/HIP_KERNELS.md 附录）。
+（12288x4096@m1），深队列下内核本身 m=1 为 48-62 → 185-274 GB/s（3.6-4.4x）、
+m=2..8 为 11-45 → 18-238 GB/s（1.6-5.3x）；与 Triton 路径的差在 fp32
+舍入内（归一化 ≤3.0e-7），fp16 输出另含 1 ulp 舍入（≤4.9e-4）。
+`COMFY_GFX906_W4A16_HIP=off` 回退 Triton；m>8、fp16 激活的多行批等不合形状的批
+仍走 Triton（多行内核按 fp32 激活在 LDS 里摆 M 行，见 docs/HIP_KERNELS.md 附录）。
 
 单条 linear 实测（合成权重，m=1，深队列下的平均墙钟）：
 
@@ -355,7 +357,7 @@ m ≤ 1 的解码仍走 GEMV；m < 128 直接回落 Triton（128 行 tile 在更
 | `COMFY_GFX906_QWEN35` | `1` | 同上：Qwen3.5 计算类替换（等价改写，逐方法对过 core） |
 | `COMFY_GFX906_GRAPH` | `1` | textgen 分项基准旋钮：权重常驻时的逐块 CUDA graph（也跟随 CLIP 节点的 `textgen` 开关） |
 | `COMFY_GFX906_ROTATE` | `1` | 解码激活旋转的 HIP butterfly 内核；`off` 回落到 Triton 做 A/B。fp16 输入下 HIP 以 fp32 累加，量化激活更准但与 Triton 不等价 |
-| `COMFY_GFX906_W4A16_HIP` | `1` | te=default 单行 4-bit 反量化 GEMV 的 HIP 内核（`arch/gfx906/kernels/w4a16.cu`）；`off` 回落到 Triton 的 `dequant_w4a16_kernel` 做 A/B。只接单行解码，MTP 的多行仍走 Triton |
+| `COMFY_GFX906_W4A16_HIP` | `1` | te=default 4-bit 反量化 GEMV 的 HIP 内核（`arch/gfx906/kernels/w4a16.cu`，m=1 与 m=2..8 两个入口）；`off` 回落到 Triton 的 `dequant_w4a16_kernel` 做 A/B。m>8 或不合形状的批仍走 Triton |
 
 ## 已知边界
 

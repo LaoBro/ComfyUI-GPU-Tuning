@@ -394,9 +394,11 @@ def linear_dequant(x, qdata, s_rel, s_channel, bias, out_dtype, group_size,
     bk = min(4 * group_size, 256)
     lut = codebook.float().reshape(-1).contiguous() if codebook is not None else None
     out = torch.empty((m, n), device=x.device, dtype=out_dtype)
-    # One row is the decode case the HIP kernel was written for; it reads the
-    # nibbles as nibbles instead of materialising one fp32 value per code.
-    if rows == 1 and hip_w4a16.enabled():
+    # The HIP kernels read the nibbles as nibbles instead of materialising one fp32
+    # value per code: one entry per row for the single-row decode, a multi-row one
+    # that shares each decoded dword across the batch. The loader declines anything
+    # it cannot take (m > 8, fp16 activation for the multi-row entry) back to Triton.
+    if hip_w4a16.enabled():
         if hip_w4a16.linear_dequant(xr, qdata, s_rel, s_channel, bias, out, group_size, lut):
             return out
     dequant_w4a16_kernel[(triton.cdiv(n, BN),)](
