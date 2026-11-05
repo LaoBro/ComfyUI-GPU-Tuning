@@ -52,12 +52,12 @@ def stage_sdk():
     return STAGE
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--force", action="store_true", help="rebuild even if up to date")
-    parser.add_argument("--arch", default="gfx906")
-    args = parser.parse_args()
+def missing():
+    """Kernel libraries not built yet."""
+    return [output for _, output in TARGETS if not os.path.exists(os.path.join(KERNELS, output))]
 
+
+def build(arch="gfx906", force=False):
     hipcc = find_hipcc()
     if hipcc is None:
         print("hipcc not found; run this with the ComfyUI venv python", file=sys.stderr)
@@ -68,10 +68,10 @@ def main():
         if not os.path.exists(src):
             print(f"missing source: {src}", file=sys.stderr)
             return 1
-        if not args.force and os.path.exists(so) and os.path.getmtime(so) >= os.path.getmtime(src):
+        if not force and os.path.exists(so) and os.path.getmtime(so) >= os.path.getmtime(src):
             print(f"up to date: {so}")
             continue
-        cmd = [hipcc, "-O3", "-std=c++17", f"--offload-arch={args.arch}",
+        cmd = [hipcc, "-O3", "-std=c++17", f"--offload-arch={arch}",
                "-shared", "-fPIC", src, "-o", so, "-lamdhip64"]
         if rocm:
             cmd[4:4] = [f"--rocm-path={rocm}"]
@@ -80,6 +80,14 @@ def main():
         subprocess.run(cmd, check=True)
         print(f"built {so}")
     return 0
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--force", action="store_true", help="rebuild even if up to date")
+    parser.add_argument("--arch", default="gfx906")
+    args = parser.parse_args()
+    return build(args.arch, args.force)
 
 
 if __name__ == "__main__":

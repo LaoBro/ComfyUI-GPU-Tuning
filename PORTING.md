@@ -23,7 +23,7 @@ NVIDIA / CPU 上整个包会跳过（[gfx906_tuning.py](gfx906_tuning.py#L251)�
 | 类 | 判据 | 内容 |
 |---|---|---|
 | **A. 常开** | 行为不随卡变、无权衡 | prefix kv、kvdecode、llama、text gemv、TE int8、amax guard |
-| **B. 可选开关** | 代价不是速度，或内核质量有分层 | qkv（1.6 GB 常驻）、qwen35（等价类替换，env 默认开）、profiler、attention mode（构建了 `hip` 扩展时默认 `hip`：fp32 累加、各形状最快；否则 `int8`，也可 node/env 手选） |
+| **B. 可选开关** | 代价不是速度，或内核质量有分层 | qkv（1.6 GB 常驻）、qwen35（等价类替换，env 默认开）、profiler、attention mode（随包的 `hip` 内核能加载时默认 `hip`：fp32 累加、各形状最快；本机 HIP 装不上时 `int8`，也可 node/env 手选） |
 | **C. 测量门** | 最优解随卡变，没数据就没有默认值 | int8 tile、w4a8、deltanet、vae、convrot（mode + 开关）、gemv（backend + 开关） |
 
 第三类是关键设计：**没跑过测量就是关闭，跑一次 `bench.py --all --write` 后由数据决定开或关**。数据有两个来源，本地覆盖出厂：
@@ -97,7 +97,7 @@ bench 的 tile 站点在 `native_covers("int8_linear")` 时跳过：覆盖的卡
 | int8 linear tile | 未实测卡**只用 stock 6 个**候选；gfx906 的大/小 tile 只在 gfx906 上追加（别把 60 CU 的参数塞进不认识的卡，LDS/寄存器预算不同，可能编不过） | `tools/bench.py --all --write` 会扫出 winner 并写进 `int8_gemm.tile`；也可以只用 `tools/tile_sweep.py` 测，再设 `COMFY_GFX906_TILE_CONFIG` / `SMALL_TILE_CONFIG` |
 | `small_batch` 窄 tile | 候选模式，由 autotune 决定 | 测 `m≤8`；更慢或不想付首次扫参成本时设 `small_batch=off` |
 | `gemv`（模型 int8 解码 GEMV） | 没有实测数据就不安装；text gemv 不受影响（它有自己的开关） | `bench.py --all` 在 `int8_gemv.m1` 站点加计 stock int8 线性基线，赢了写 `feature.gemv="on"`；backend 照旧按形状选 |
-| int8 线性大 m（`int8_gemm`） | C 类（性能）：≥128 行走自带 HIP dot4 GEMM（4 波/CU），否则回落 Triton；m≤1 仍走 GEMV | 构建过 `libgfx906_int8.so` 才生效；`bench.py --tile` 打印 hip vs triton 的证据（不写记录） |
+| int8 线性大 m（`int8_gemm`） | C 类（性能）：≥128 行走自带 HIP dot4 GEMM（4 波/CU），否则回落 Triton；m≤1 仍走 GEMV | `libgfx906_int8.so` 能本机加载才生效（随包分发，按 HIP 7.18 构建；别的大版本要重编）；`bench.py --tile` 打印 hip vs triton 的证据（不写记录） |
 | 注意力入口（`attention`） | B 类：mode 由 node/env 手动选（hip / int8 / int8qk / hand / gemm / sdpa）；tile 用内置常量；带 mask / GQA 的调用绕行到 core 后端 | `bench.py --attention` 只打印各内核 vs SDPA 的证据，不写记录。TE 不经过这条路径（见 §2.1） |
 | `w4a8`（4-bit 权重 GEMV） | asm 内核用 gfx9 `v_dot4_i32_i8`；其它卡落到纯 Triton 的 per-group `tl.dot`，通常比 int8 慢，所以在没有实测数据的卡上不安装 | `bench.py --all` 会把它和 int8 基线（`decode_int8` + int8 GEMV/GEMM）同形状对比，赢了才写 `feature.w4a8="on"`。`group_size < 16` 时 `tl.dot` 不接受，会落到 `tl.sum` 保底内核（见 §5）；保底通常更慢，表里就会是 `off` |
 | DeltaNet Triton 内核 | 只在 kitchen 的 fused op 不可用时划算（gfx906 就是没有 code object） | `bench.py --all` 直接和 `comfy_kitchen.gated_delta_decode_fused` 对比输出、state 和耗时，赢了才写 `feature.deltanet="on"` |
@@ -507,7 +507,7 @@ backend = _REGISTRY.choose(n=..., k=..., m=...)
 `--all` 追加六组测量：
 
 - **int8 tile**：复用 `tile_sweep` 的扫描，默认 3 个 NxK（DiT 的 qkv/ffn、TE 的）乘 `m=1,8,128`，`m≤8` 与 `m>8` 两桶各取所有格子耗时的中位数赢家。这一层不用 `--min-gain`：跨形状的中位数已经压掉了单次噪声，而“上一次选的是谁”在这张卡上没有意义。
-- **attention**：只出证据不写记录——mode 由 node/env 选，构建了 `hip` 扩展时默认取 `hip`（fp32 累加、rel ≈ 2.5–3.3e-4、三个实测形状都最快）。默认 `d128` 长/短 self+cross 各一个形状、`d64` 一个 SDXL 形状；每个 config 先和 `tools/refs.py` 的 fp32 参考比数值，再计时，最后打印各内核相对 SDPA 的中位数比例。
+- **attention**：只出证据不写记录——mode 由 node/env 选，随包的 `hip` 内核可加载时默认取 `hip`（fp32 累加、rel ≈ 2.5–3.3e-4、三个实测形状都最快）。默认 `d128` 长/短 self+cross 各一个形状、`d64` 一个 SDXL 形状；每个 config 先和 `tools/refs.py` 的 fp32 参考比数值，再计时，最后打印各内核相对 SDPA 的中位数比例。
 - **deltanet**：默认 `1x16x128x128x1` 与 `...xs4`（Qwen3.5-2B 的 16 个 value head、hidden 2048）。先和 `refs.delta_decode_reference` 比输出**和** `state`，再和 `comfy_kitchen.gated_delta_decode_fused` 同时计时；对端不可用（gfx906 就是没有 code object）时只记录我们自己的耗时，不写 `feature.deltanet`。
 - **vae**：depth-1 Conv3d 三方计时（torch conv3d / conv2d squeeze / kitchen 的 `fp16_conv3d`，后者只在原生后端有这个 op 时出现），写 `feature.vae`。padding 0 以便 kitchen 内核可比。
 - **convrot**：kitchen 的 matmul 旋转 + 量化 vs 我们的 butterfly 两步 vs fused 单内核，写 `feature.convrot` 和 `convrot.mode`。

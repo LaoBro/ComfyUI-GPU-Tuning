@@ -252,26 +252,30 @@ CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`imag
 
 **[PORTING.md — 其它显卡移植与二次开发指南](PORTING.md)**
 
-最短路径：先用节点默认值跑通（没跑过 bench 的卡上测量门功能是关的），再运行一次 `python custom_nodes/ComfyUI-gfx906-Tuning/tools/bench.py --all --write`。它测出这张卡的 int8 tile，以及 GEMV / w4a8 / deltanet（含 prefill）/ vae / convrot / vision 的开或关，写进 `~/.config/comfy-gfx-tune/arch/<gcn>/manifest.toml`，之后启动不再 autotune。attention 只打印证据不写记录：`hip` 扩展构建好时它就是默认模式（下面有实测），没构建时回落到 `int8`，其余模式仍可在节点里手选。想知道时间落在哪一段（而不是哪个内核快）用 `tools/chain_profile.py`，见 [PORTING.md §5.4](PORTING.md)。
+最短路径：先用节点默认值跑通（没跑过 bench 的卡上测量门功能是关的），再运行一次 `python custom_nodes/ComfyUI-gfx906-Tuning/tools/bench.py --all --write`。它测出这张卡的 int8 tile，以及 GEMV / w4a8 / deltanet（含 prefill）/ vae / convrot / vision 的开或关，写进 `~/.config/comfy-gfx-tune/arch/<gcn>/manifest.toml`，之后启动不再 autotune。attention 只打印证据不写记录：`hip` 是默认模式（下面有实测，内核随包分发），本机 HIP 装不上它时回落到 `int8` 并在启动日志提示重编，其余模式仍可在节点里手选。想知道时间落在哪一段（而不是哪个内核快）用 `tools/chain_profile.py`，见 [PORTING.md §5.4](PORTING.md)。
 
 ### 注意力模式怎么选
 
 | 模式 | 精度 | 适用 |
 |---|---|---|
-| `hip`（默认，需构建） | fp32 累加，rel ≈ 2.5–3.3e-4 | **三个实测形状全部最快**：比 `int8` 快 1.3–1.6x、比 `gemm` 快 1.3–3.5x。只支持 D=64/128 |
-| `int8` | 有 int8 量化误差（rel ≈ 2e-2） | `hip` 扩展缺失时的默认；无扩展也能用 |
+| `hip`（默认） | fp32 累加，rel ≈ 2.5–3.3e-4 | **三个实测形状全部最快**：比 `int8` 快 1.3–1.6x、比 `gemm` 快 1.3–3.5x。只支持 D=64/128 |
+| `int8` | 有 int8 量化误差（rel ≈ 2e-2） | `hip` 内核在本机装不上时的默认 |
 | `gemm` | fp16 | 任意 head_dim 都能用（含 SD1.5 的 40、SD2.1 的 80），但长 K 上被 `hip` 反超，且会拷贝 ~1 GB |
 | `hand` | fp16 | 自研 Triton 内核，现已被 `hip` 全面取代，留作对照 |
 | `int8qk` | 介于两者 | PV 保留 fp16，慢约 10%，精度好 4-7 倍 |
 
 `hip` 是本包自带的融合注意力内核（`arch/gfx906/kernels/hip_attn.cu`，ctypes 加载，不依赖 torch 扩展）。
-同一个构建脚本也会编出 int8 大 m 路径要用的 `libgfx906_int8.so`（见下节）。它默认只在构建过 `.so` 时启用，构建命令：
+同一个脚本也编出 int8 大 m 路径要用的 `libgfx906_int8.so`（见下节）。两个 `.so` 随包分发，按 HIP 7.18（ROCm 10.3）的运行时构建，
+动态依赖里写死了 `libamdhip64.so.7`：本机是别的大版本时加载会失败，节点照常跑 Triton 路径，并在启动日志给一行
+`... did not load ...; rebuild it for this HIP runtime with tools/build_hip_attn.py --force`。重编命令：
 
 ```bash
 .venv/bin/python custom_nodes/ComfyUI-gfx906-Tuning/tools/build_hip_attn.py
 ```
 
-构建产物是 gfx906-only 的 `libgfx906_attn.so` / `libgfx906_int8.so`；换卡时加载器按 `gcnArchName` 直接跳过，不会把别的卡带崩。
+`tools/bench.py --attention` / `--tile` 在 `.so` 缺失时自己跑这个构建（约 4 秒），因为少了它们那两个站点只是静默少一行最快的数据。节点启动不构建任何东西。
+
+产物是 gfx906-only 的 `libgfx906_attn.so` / `libgfx906_int8.so`（代码对象标志 `gfx906, xnack any, sramecc any`）；换卡时加载器按 `gcnArchName` 直接跳过，不会把别的卡带崩。
 
 ### int8 线性的大 m 路径
 
@@ -290,7 +294,7 @@ CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`imag
 
 数值与 Triton 路径的差是 fp16 输出舍入（最大约 1 ulp）；int8 累加本身是精确 int32。
 m ≤ 1 的解码仍走 GEMV；m < 128 直接回落 Triton（128 行 tile 在更小 m 上会浪费行）。
-`int8_gemm=off` 可强制回到 Triton；没构建 `.so` 时该开关自动无效。
+`int8_gemm=off` 可强制回到 Triton；`.so` 在本机装不上时该开关自动无效。
 
 `basic` / `pytorch` / `sub_quad` / `split` 是 ComfyUI 自带实现，选中后原样转发，
 用于对比。注意 `pytorch`（SDPA）在 gfx906 上只有 math 后端，通常不是最快。

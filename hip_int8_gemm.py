@@ -60,7 +60,8 @@ def _load():
                                                                  ctypes.c_void_p]
                                          + [ctypes.c_int] * 4 + [ctypes.c_void_p])
     except OSError as exc:
-        logging.info("gfx906: HIP int8 gemm extension unavailable (%s)", exc)
+        logging.warning("gfx906: %s did not load (%s); rebuild it for this HIP runtime with "
+                        "tools/build_hip_attn.py --force", os.path.basename(_SO), exc)
         return None
     _LIB = lib
     return lib

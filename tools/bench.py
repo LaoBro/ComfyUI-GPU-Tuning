@@ -63,6 +63,7 @@ os.environ.setdefault("TRITON_DEFAULT_FP_FUSION", "1")
 
 import torch                                                           # noqa: E402
 
+import build_hip_attn                                                  # noqa: E402
 import refs                                                            # noqa: E402
 from kernels import manifest as manifest_mod                           # noqa: E402
 from kernels import manifest_write                                     # noqa: E402
@@ -1208,6 +1209,25 @@ def write_manifest(arch, fingerprint, written, winners, defaults, path, today):
     return saved
 
 
+def ensure_hip_kernels():
+    """Build the node's HIP kernels when this card can use them and they are missing.
+
+    The tile and attention sites have no hip row without the .so files, and they
+    say nothing about it, so a fresh clone silently benchmarks the slow half.
+    """
+    if not build_hip_attn.missing():
+        return
+    if torch.version.hip is None or not torch.cuda.get_device_properties(
+            0).gcnArchName.startswith("gfx906"):
+        return
+    if build_hip_attn.find_hipcc() is None:
+        print("\nhip kernels not built and hipcc not found: run tools/build_hip_attn.py "
+              "from the ROCm venv to get the hip rows")
+        return
+    print(f"\nbuilding the hip kernels ({', '.join(build_hip_attn.missing())})")
+    build_hip_attn.build()
+
+
 def main():
     global REPEATS
 
@@ -1253,6 +1273,8 @@ def main():
 
     want_tile = args.tile or (args.all and not tile_unused)
     want_attn = args.attention or (args.all and not attn_unused)
+    if want_tile or want_attn:
+        ensure_hip_kernels()
     if args.all and (tile_unused or attn_unused):
         parts = [name for name, skip in (("tile", tile_unused), ("attention", attn_unused)) if skip]
         print(f"\n--all skips the {', '.join(parts)} site(s) here: on this device the records "

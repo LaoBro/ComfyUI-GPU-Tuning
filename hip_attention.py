@@ -56,7 +56,8 @@ def _load():
         lib.gfx906_attn_fwd.argtypes = ([ctypes.c_void_p] * 4 + [ctypes.c_int] * 5
                                         + [ctypes.c_float, ctypes.c_void_p])
     except OSError as exc:
-        logging.info("gfx906: HIP attention extension unavailable (%s)", exc)
+        logging.warning("gfx906: %s did not load (%s); rebuild it for this HIP runtime with "
+                        "tools/build_hip_attn.py --force", os.path.basename(_SO), exc)
         return None
     _LIB = lib
     return lib

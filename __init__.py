@@ -49,9 +49,10 @@ class Gfx906ModelSettings(io.ComfyNode):
                 io.Model.Input("model"),
                 io.Combo.Input("attention", options=["default"] + list(ATTENTION_KERNELS) + backend_options(),
                                default="default",
-                               tooltip="default is hip when the extension was built (fused fp32-accumulate "
+                               tooltip="default is hip when the shipped kernel loads (fused fp32-accumulate "
                                        "kernel, fastest on every measured shape), else int8; hip needs D=64/128 "
-                                       "and a built libgfx906_attn.so (tools/build_hip_attn.py); int8qk keeps PV "
+                                       "and libgfx906_attn.so, which targets HIP 7 - another runtime rebuilds it "
+                                       "with tools/build_hip_attn.py --force; int8qk keeps PV "
                                        "in fp16 (slower, 4-7x more accurate); gemm is fp16 built from rocBLAS "
                                        "bmm + softmax + bmm (any head dim, but copies ~1 GB); hand is the fp16 "
                                        "Triton kernel. basic, pytorch, sub_quad, split and any other backend core "
@@ -89,7 +90,7 @@ class Gfx906ModelSettings(io.ComfyNode):
                                tooltip="Run int8 linears with at least 128 rows on the HIP dot4 GEMM "
                                        "(128x128 tile, 4 waves/CU) instead of the Triton kernel: 1.10-1.21x "
                                        "on the measured prefill shapes. default uses it when "
-                                       "libgfx906_int8.so was built; off forces the Triton path. Decode "
+                                       "the shipped libgfx906_int8.so loads; off forces the Triton path. Decode "
                                        "(m<=1) still uses the GEMV."),
                 io.Combo.Input("qkv", options=list(TRISTATE), default="default",
                                tooltip="One int8 GEMM for q/k/v instead of three (Qwen-Image 2.1): -81 ms "
