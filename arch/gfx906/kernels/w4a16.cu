@@ -1,7 +1,9 @@
 // gfx906 W4A16 decode GEMV: packed int4 weights decoded in registers, fp16
-// activations, fp32 accumulate. Two entries: w4a16_gemv for the single-row
-// te=default decode and w4a16_gemv_m for the m = 2..8 small-batch / MTP tier,
-// both reached through w4a8_gemv.linear_dequant.
+// activations, fp32 accumulate. Three entries, all reached through
+// w4a8_gemv.linear_dequant: w4a16_gemv for the single-row te=default decode,
+// w4a16_gemv_m for m = 2..8 with fp32 activations, and w4a16_gemv_h for the same
+// m = 2..8 shape with fp16 activations and v_dot2_f32_f16 (opt-in: it rounds the
+// 16 codebook levels to fp16).
 //
 // Layout follows the read micro-benchmark in docs/HIP_KERNELS.md: a row is split
 // over KP=32 lanes so one wavefront's 64 lanes stream 8 rows x 16 bytes each, and
@@ -162,15 +164,14 @@ w4a16_gemv(const void* __restrict__ xsrc, const uint32_t* __restrict__ wq,
 // 13 GB/s. The eight levels of a dword are gathered once into lv[] and reused by
 // every row; ROWK stays 32 so a lane's block is still inside one quantisation group.
 //
-// Activations are fp32 here (the caller's rotated/converted row set) and the staging
-// is M*BK, which is what puts this kernel at one block per CU for M=8: 32 KB of LDS
-// for xa. Packing the activations as fp16 pairs would halve that and reopen two
-// blocks, but it forces the math through v_dot2_f32_f16 (fp16 levels, ~5e-4
-// systematic error on every code) -- a quality decision, not a free win.
 // Packing M rows costs M times the staging work, so it has to be amortized over as
 // many column groups as the single-row kernel uses: GB=32 keeps accg at GB*BN*M
 // floats, which is 8 KB at M=8 and does not cost a block of occupancy (M=4 and M=8
 // are already one block per CU on VGPRs).
+//
+// The fp32 staging above is what caps this kernel: one ds_read_b128 can only feed
+// four FMAs, because one activation value takes exactly one multiply per output
+// column. w4a16_gemv_h below trades that for fp16 activations.
 #define WORDS (ROWK / 8)                  // weight dwords per lane per chunk
 
 template <int M, bool CB, bool OUT_F16, bool HAS_BIAS>
@@ -273,6 +274,135 @@ w4a16_gemv_m(const float* __restrict__ x, const uint32_t* __restrict__ wq,
     }
 }
 
+// fp16 activation variant, reached only through COMFY_GFX906_W4A16_F16ACT. Same
+// shape as w4a16_gemv_m, but the staged activations are fp16 and the math is
+// v_dot2_f32_f16. That breaks the cap the fp32 variant hits: a quad row now holds
+// 8 k per lane, so one ds_read_b128 feeds four dot2 = eight MACs instead of four
+// FMAs, and because the level table is indexed by the *byte* (both nibbles of one
+// k pair packed into a single fp16x2 operand) the gathers halve as well.
+//
+// The price is that the 16 codebook levels are rounded to fp16: a systematic
+// ~5e-4 relative error on every code, identical wherever that code appears, so it
+// does not average out over k. The uniform `code - 8` grid is exact in fp16.
+// Accumulators stay fp32 and neither scale path changes.
+__device__ __forceinline__ float dot2f(uint32_t a, uint32_t b, float c)
+{
+    float d;
+    asm volatile("v_dot2_f32_f16 %0, %1, %2, %3" : "=v"(d) : "v"(a), "v"(b), "v"(c));
+    return d;
+}
+
+#define QUAD16 (KP * 8)                   // halfs per activation quad row: 8 k of each lane
+
+template <int M, bool CB>
+__global__ void __launch_bounds__(NT, 1)
+w4a16_gemv_h(const __half* __restrict__ x, const uint32_t* __restrict__ wq,
+             const uint8_t* __restrict__ srel, const float* __restrict__ sch,
+             const void* __restrict__ bias, void* __restrict__ out, const float* cb,
+             int m, int n, int k, int gs, int64_t srel_stride, int out_f16, int has_bias)
+{
+    __shared__ __half xh[M][BK];
+    __shared__ uint32_t tab2[256];
+    __shared__ float accg[GB * BN * M];
+    const int tid = threadIdx.x;
+    const int part = tid & (KP - 1);
+    const int slot = tid / KP;
+    const int groups = (n + BN - 1) / BN;
+    const __half* bias_h = (const __half*)bias;
+    const float* bias_f = (const float*)bias;
+
+    for (int b = tid; b < 256; b += NT) {
+        const float lo = CB ? cb[b & 15] : (float)(b & 15) - 8.0f;
+        const float hi = CB ? cb[b >> 4] : (float)(b >> 4) - 8.0f;
+        tab2[b] = __half_as_ushort(__float2half_rn(lo))
+                | ((uint32_t)__half_as_ushort(__float2half_rn(hi)) << 16);
+    }
+    __syncthreads();
+
+    const int gi_total = (groups - blockIdx.x + gridDim.x - 1) / gridDim.x;
+    for (int gb = 0; gb < gi_total; gb += GB) {
+        const int nb = gi_total - gb < GB ? gi_total - gb : GB;
+        __syncthreads();
+        for (int i = tid; i < nb * BN * M; i += NT) accg[i] = 0.0f;
+
+        for (int ck = 0; ck < k; ck += BK) {
+            __syncthreads();
+            // Eight halfs at a time: the source k = lane*ROWK + 8i is contiguous
+            // and so is its destination i*QUAD16 + lane*8, so the pack is uint4
+            // copies rather than BK*M scalar stores. Rows past m get zeros so the
+            // phantom rows cost multiplies only.
+            for (int j = tid; j < M * WORDS * KP; j += NT) {
+                const int r = j / (WORDS * KP), q = j - r * (WORDS * KP);
+                const int lane = q & (KP - 1), i = q / KP;
+                uint4* dst = (uint4*)&xh[r][i * QUAD16 + lane * 8];
+                if (r < m) *dst = *(const uint4*)(x + (int64_t)r * k + ck + lane * ROWK + i * 8);
+                else *dst = make_uint4(0u, 0u, 0u, 0u);
+            }
+            __syncthreads();
+
+            const int kbase = ck + part * ROWK;
+            const int64_t sbase = (int64_t)kbase / gs;
+            for (int jl = 0; jl < nb; ++jl) {
+                const int col = (blockIdx.x + (gb + jl) * gridDim.x) * BN + slot;
+                const int colc = col < n ? col : n - 1;
+                float gacc[M][WORDS];
+#pragma unroll
+                for (int r = 0; r < M; ++r)
+#pragma unroll
+                    for (int i = 0; i < WORDS; ++i) gacc[r][i] = 0.0f;
+                V4 t;
+                t.v = *reinterpret_cast<const uint4*>(wq + (int64_t)colc * (k / 8) + kbase / 8);
+#pragma unroll
+                for (int i = 0; i < WORDS; ++i) {
+                    // Byte j of the dword holds the codes of k = 8i + 2j and
+                    // k = 8i + 2j + 1, so it pairs directly with half-dword j of
+                    // the activation quad row.
+                    const uint32_t w = t.w[i];
+                    const uint32_t lv[4] = {tab2[(w >> 0) & 0xFF], tab2[(w >> 8) & 0xFF],
+                                            tab2[(w >> 16) & 0xFF], tab2[(w >> 24) & 0xFF]};
+#pragma unroll
+                    for (int r = 0; r < M; ++r) {
+                        const uint4 av = *reinterpret_cast<const uint4*>(&xh[r][i * QUAD16 + part * 8]);
+                        gacc[r][i] = dot2f(lv[0], av.x, gacc[r][i]);
+                        gacc[r][i] = dot2f(lv[1], av.y, gacc[r][i]);
+                        gacc[r][i] = dot2f(lv[2], av.z, gacc[r][i]);
+                        gacc[r][i] = dot2f(lv[3], av.w, gacc[r][i]);
+                    }
+                }
+                const float sg = srel_decode(srel[(int64_t)colc * srel_stride + sbase]);
+#pragma unroll
+                for (int r = 0; r < M; ++r) {
+                    float s = 0.0f;
+#pragma unroll
+                    for (int i = 0; i < WORDS; ++i) s += gacc[r][i];
+                    s *= sg;
+#pragma unroll
+                    for (int step = 1; step < KP; step <<= 1) s += __shfl_xor(s, step);
+                    if (part == 0) accg[(jl * BN + slot) * M + r] += s;
+                }
+            }
+        }
+
+        for (int jl = 0; jl < nb; ++jl) {
+            const int col = (blockIdx.x + (gb + jl) * gridDim.x) * BN + slot;
+            if (part == 0 && col < n) {
+                const float sc = sch[col];
+#pragma unroll
+                for (int r = 0; r < M; ++r) {
+                    if (r >= m) break;
+                    float v = accg[(jl * BN + slot) * M + r] * sc;
+                    // Output dtype and bias are runtime choices here: this kernel is
+                    // instantiated over M x CB, and a store that runs once per column
+                    // group cannot afford to double that for them.
+                    if (has_bias) v += out_f16 ? (float)bias_h[col] : bias_f[col];
+                    if (out_f16) ((__half*)out)[(int64_t)r * n + col] = (__half)v;
+                    else ((float*)out)[(int64_t)r * n + col] = v;
+                }
+            }
+        }
+    }
+}
+
 extern "C" int gfx906_w4a16(const void* x, const void* wq, const void* srel, const void* sch,
                            const void* bias, void* out, const void* cb, int n, int k, int gs,
                            int in_f16, int out_f16, int has_cb, int has_bias,
@@ -342,5 +472,33 @@ extern "C" int gfx906_w4a16_m(const void* x, const void* wq, const void* srel, c
 #undef DISPATCHM_CB
 #undef DISPATCHM
 #undef LAUNCHM
+    return hipGetLastError() == hipSuccess ? 0 : (int)hipGetLastError();
+}
+
+// Same contract as gfx906_w4a16_m, but x is the *fp16* activation rows (no
+// conversion happens here) and the levels resolve through the packed fp16 table.
+extern "C" int gfx906_w4a16_h(const void* x, const void* wq, const void* srel, const void* sch,
+                              const void* bias, void* out, const void* cb, int m, int n, int k,
+                              int gs, int out_f16, int has_cb, int has_bias,
+                              int64_t srel_stride, void* stream)
+{
+    if (m < 2 || m > 8 || n < 1 || k % BK || gs < 32 || gs % 32 || BK % gs) return -3;
+    const int M = m > 4 ? 8 : m > 2 ? 4 : 2;
+    const int groups = (n + BN - 1) / BN;
+    const int grid = groups < MAX_BLOCKS ? groups : MAX_BLOCKS;
+    hipStream_t st = (hipStream_t)stream;
+    const float* cbw = (const float*)cb;
+#define LAUNCHH(MM, CB)                                                                \
+    w4a16_gemv_h<MM, CB><<<grid, NT, 0, st>>>((const __half*)x,                        \
+        (const uint32_t*)wq, (const uint8_t*)srel, (const float*)sch, bias, out,       \
+        cbw, m, n, k, gs, srel_stride, out_f16, has_bias)
+#define DISPATCHH(MM)                                                                  \
+    do {                                                                               \
+        if (has_cb) LAUNCHH(MM, true); else LAUNCHH(MM, false);                        \
+    } while (0)
+
+    if (M == 2) DISPATCHH(2); else if (M == 4) DISPATCHH(4); else DISPATCHH(8);
+#undef DISPATCHH
+#undef LAUNCHH
     return hipGetLastError() == hipSuccess ? 0 : (int)hipGetLastError();
 }

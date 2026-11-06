@@ -386,14 +386,20 @@ def linear_dequant(x, qdata, s_rel, s_channel, bias, out_dtype, group_size,
             or s_channel.numel() != n or s_channel.dtype != torch.float32
             or s_rel.dtype != torch.float8_e4m3fn):
         return None
+    rows = _row_block(m)
+    lut = codebook.float().reshape(-1).contiguous() if codebook is not None else None
+    out = torch.empty((m, n), device=x.device, dtype=out_dtype)
+    # The fp16-activation kernel takes x unconverted, so it has to be tried before
+    # the cast it skips. It is opt-in because it resolves the 16 levels in fp16.
+    if (rows > 1 and x.dtype == torch.float16 and not convrot_groupsize
+            and hip_w4a16.enabled() and hip_w4a16.f16_enabled()):
+        if hip_w4a16.linear_dequant_h(x, qdata, s_rel, s_channel, bias, out, group_size, lut):
+            return out
     if convrot_groupsize:
         xr, _, _ = int8_gemv.rotate(x.float(), convrot_groupsize)
     else:
         xr = x.float()
-    rows = _row_block(m)
     bk = min(4 * group_size, 256)
-    lut = codebook.float().reshape(-1).contiguous() if codebook is not None else None
-    out = torch.empty((m, n), device=x.device, dtype=out_dtype)
     # The HIP kernels read the nibbles as nibbles instead of materialising one fp32
     # value per code: one entry per row for the single-row decode, a multi-row one
     # that shares each decoded dword across the batch. The loader declines anything

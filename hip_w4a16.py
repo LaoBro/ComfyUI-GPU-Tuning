@@ -2,13 +2,15 @@
 
 Loads arch/gfx906/kernels/libgfx906_w4a16.so (built from w4a16.cu by
 tools/build_hip_attn.py) and replaces w4a8_gemv.dequant_w4a16_kernel: the nibbles
-stay packed in registers and resolve through a 16-entry fp32 table in LDS. Two
-entries, picked by the row count -- one for single-row decode (m=1, 3.6-4.4x the
-Triton kernel, 185-274 GB/s against a 631-776 GB/s plane) and one for m=2..8 that
-shares each decoded dword across the batch (1.6-5.3x, 18-238 GB/s). m > 8, fp16
-activations for the multi-row entry and any other mismatch fall back to Triton.
+stay packed in registers and resolve through a 16-entry fp32 table in LDS. Three
+entries by row count -- m=1 decode (3.6-4.4x Triton, 185-274 GB/s against a
+631-776 GB/s plane), m=2..8 with fp32 activations sharing one decoded dword
+(1.6-5.3x), and the same m=2..8 shape with fp16 activations through
+v_dot2_f32_f16 (5.3-8.7x) which is opt-in because it rounds the 16 levels to
+fp16. m > 8, convrot and any other mismatch fall back to Triton.
 
-COMFY_GFX906_W4A16_HIP=off restores the Triton kernel for an A/B run.
+COMFY_GFX906_W4A16_HIP=off restores the Triton kernel for an A/B run;
+COMFY_GFX906_W4A16_F16ACT=1 turns on the fp16-activation multi-row kernel.
 
 The stream is read at call time: torch.cuda.graph() switches current_stream to its
 capture stream, so a cached handle would leave the launch out of the graph.
@@ -55,16 +57,16 @@ def _load():
         return None
     try:
         lib = ctypes.CDLL(_SO)
-        lib.gfx906_w4a16.restype = ctypes.c_int
-        lib.gfx906_w4a16.argtypes = ([ctypes.c_void_p] * 7 + [ctypes.c_int] * 7
-                                     + [ctypes.c_int64, ctypes.c_void_p])
-        # An .so built before the multi-row entry simply keeps m>1 on Triton.
-        try:
-            lib.gfx906_w4a16_m.restype = ctypes.c_int
-            lib.gfx906_w4a16_m.argtypes = ([ctypes.c_void_p] * 7 + [ctypes.c_int] * 7
-                                           + [ctypes.c_int64, ctypes.c_void_p])
-        except AttributeError:
-            lib.gfx906_w4a16_m = None
+        # An .so built before one of these entries leaves that attribute None and
+        # the caller falls back for the shapes it needs.
+        for name in ("gfx906_w4a16", "gfx906_w4a16_m", "gfx906_w4a16_h"):
+            try:
+                fn = getattr(lib, name)
+                fn.restype = ctypes.c_int
+                fn.argtypes = ([ctypes.c_void_p] * 7 + [ctypes.c_int] * 7
+                               + [ctypes.c_int64, ctypes.c_void_p])
+            except AttributeError:
+                setattr(lib, name, None)
     except OSError as exc:
         logging.warning("gfx906: %s did not load (%s); rebuild it for this HIP runtime with "
                         "tools/build_hip_attn.py --force", os.path.basename(_SO), exc)
@@ -79,6 +81,12 @@ def available():
 
 def enabled():
     return os.getenv("COMFY_GFX906_W4A16_HIP", "1").strip().lower() not in ("0", "off", "false", "no")
+
+
+def f16_enabled():
+    """The fp16-activation kernel is off by default: it rounds the 16 codebook levels
+    to fp16, which is a ~2e-4 systematic relative error rather than rounding noise."""
+    return os.getenv("COMFY_GFX906_W4A16_F16ACT", "0").strip().lower() in ("1", "on", "true", "yes")
 
 
 def _accepted(x, qdata, s_rel, s_channel, bias, out, group_size, codebook):
@@ -98,13 +106,31 @@ def _accepted(x, qdata, s_rel, s_channel, bias, out, group_size, codebook):
                 or (bias is not None and bias.dtype != out.dtype))
 
 
+def _launch_multi(entry, x, qdata, s_rel, s_channel, bias, out, group_size, codebook):
+    """Both multi-row entries take (ptrs, m, n, k, gs, out_f16, has_cb, has_bias, stride)."""
+    if entry is None:
+        return False
+    m, n, k = x.shape[0], qdata.shape[0], x.shape[1]
+    rc = entry(x.data_ptr(), qdata.view(torch.int32).data_ptr(),
+               s_rel.view(torch.uint8).data_ptr(), s_channel.data_ptr(),
+               out.data_ptr() if bias is None else bias.data_ptr(), out.data_ptr(),
+               s_channel.data_ptr() if codebook is None else codebook.data_ptr(),
+               m, n, k, group_size, 1 if out.dtype == torch.float16 else 0,
+               1 if codebook is not None else 0, 1 if bias is not None else 0,
+               k // group_size, ctypes.c_void_p(torch.cuda.current_stream().cuda_stream))
+    if rc != 0:
+        raise RuntimeError(f"gfx906 HIP W4A16 launch failed ({rc})")
+    return True
+
+
 def linear_dequant(x, qdata, s_rel, s_channel, bias, out, group_size, codebook):
     """Fill out[:, :], or return False for a shape or dtype these kernels do not take.
 
     x is the activation rows (fp16 for one row, fp32 for more), s_rel the fp8
     per-group scale plane and codebook the 16 fp32 levels, or None for the uniform
     `code - 8` grid. A bias must be in the output dtype; anything else the kernels
-    cannot take is left to the Triton path.
+    cannot take is left to the Triton path. Every path here keeps the levels in
+    fp32, so the result matches Triton inside rounding.
     """
     lib = _load()
     rows = x.shape[0]
@@ -112,25 +138,38 @@ def linear_dequant(x, qdata, s_rel, s_channel, bias, out, group_size, codebook):
             or not _accepted(x, qdata, s_rel, s_channel, bias, out, group_size, codebook)):
         return False
     n, k = qdata.shape[0], x.shape[1]
-    if rows > 1 and (lib.gfx906_w4a16_m is None or x.dtype != torch.float32):
-        # The multi-row kernel stages M x BK fp32 activations in LDS; handing it an
-        # fp16 row set would read past the plane. m=1 keeps its own fp16 path.
-        return False
-    cb_ptr = s_channel.data_ptr() if codebook is None else codebook.data_ptr()
-    args = [x.data_ptr(), qdata.view(torch.int32).data_ptr(),
-            s_rel.view(torch.uint8).data_ptr(), s_channel.data_ptr(),
-            out.data_ptr() if bias is None else bias.data_ptr(), out.data_ptr(), cb_ptr]
     if rows > 1:
-        ints = [rows, n, k, group_size, 1 if out.dtype == torch.float16 else 0,
-                1 if codebook is not None else 0, 1 if bias is not None else 0]
-        entry = lib.gfx906_w4a16_m
-    else:
-        ints = [n, k, group_size, 1 if x.dtype == torch.float16 else 0,
-                1 if out.dtype == torch.float16 else 0,
-                1 if codebook is not None else 0, 1 if bias is not None else 0]
-        entry = lib.gfx906_w4a16
-    rc = entry(*args, *ints, k // group_size,
-               ctypes.c_void_p(torch.cuda.current_stream().cuda_stream))
+        # The fp32 multi-row kernel stages M x BK fp32 activations in LDS; handing
+        # it an fp16 row set would read past the plane. m=1 keeps its own fp16 path.
+        if x.dtype != torch.float32:
+            return False
+        return _launch_multi(lib.gfx906_w4a16_m, x, qdata, s_rel, s_channel, bias, out,
+                             group_size, codebook)
+    if lib.gfx906_w4a16 is None:
+        return False
+    rc = lib.gfx906_w4a16(
+        x.data_ptr(), qdata.view(torch.int32).data_ptr(), s_rel.view(torch.uint8).data_ptr(),
+        s_channel.data_ptr(), out.data_ptr() if bias is None else bias.data_ptr(),
+        out.data_ptr(), s_channel.data_ptr() if codebook is None else codebook.data_ptr(),
+        n, k, group_size, 1 if x.dtype == torch.float16 else 0,
+        1 if out.dtype == torch.float16 else 0, 1 if codebook is not None else 0,
+        1 if bias is not None else 0, k // group_size,
+        ctypes.c_void_p(torch.cuda.current_stream().cuda_stream))
     if rc != 0:
         raise RuntimeError(f"gfx906 HIP W4A16 launch failed ({rc})")
     return True
+
+
+def linear_dequant_h(x, qdata, s_rel, s_channel, bias, out, group_size, codebook):
+    """The fp16-activation multi-row kernel: products resolved by v_dot2_f32_f16 off a
+    packed fp16 level table, which needs 36-59 VGPRs instead of 122-240 and therefore
+    runs two to four blocks per CU. Takes fp16 x, 2..8 rows, and is opt-in because the
+    16 levels round to fp16 (~2e-4 relative, systematic).
+    """
+    lib = _load()
+    rows = x.shape[0]
+    if (lib is None or rows < 2 or rows > 8 or x.dtype != torch.float16
+            or not _accepted(x, qdata, s_rel, s_channel, bias, out, group_size, codebook)):
+        return False
+    return _launch_multi(lib.gfx906_w4a16_h, x, qdata, s_rel, s_channel, bias, out,
+                         group_size, codebook)
