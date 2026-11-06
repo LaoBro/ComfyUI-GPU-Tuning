@@ -332,7 +332,7 @@ program 数够多时这张卡能吃满流式带宽（lm_head 的 int8 GEMV 连�
 - fp16 侧确实拿不到 2 block/CU：`Qs` 单项就是 32 KB，加上 Ks 16 + Vt 16 正好占满
   64 KB。只有操作数字节减半才可能降到 32 KB，这是 int8 路线唯一站得住的结构理由。
 - 真实 q/k/v 的精度代价（SDXL 两步采样、hook `optimized_attention` 抓到的两层，
-  relL2 对 fp32 参考）：
+  relL2 对 fp32 参考）。这几档 int8 后端后来都删了，表里的数字就是删除依据：
 
   | 档 | [2,4096,10,64] | [2,1024,20,64] |
   |---|---|---|
@@ -357,6 +357,8 @@ program 数够多时这张卡能吃满流式带宽（lm_head 的 int8 GEMV 连�
 
 `peak extra` 是一次调用在 q/k/v 之外多占的字节。sdpa 的 flash 与 mem-efficient
 在这张卡上都是 `No available kernel`，只剩 math 回退，所以下面 sdpa 一列就是 math。
+
+（`int8` / `int8qk` 两档已按这一表删除，数字保留作证据。默认列是本机不传启动标志时 ComfyUI 实际走的 `attention_sub_quad`。）
 
 | 形状 | hip | gemm | hand | int8 / int8qk | comfy basic / sub_quad | sdpa math |
 |---|---|---|---|---|---|---|

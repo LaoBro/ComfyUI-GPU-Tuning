@@ -58,7 +58,7 @@ FUSED_MAX_GROUPS = 32
 CONVROT_MODES = ("fused", "butterfly", "off")
 # Own kernels (exposed in the node). "sdpa" also exists as an internal value:
 # the auto-tune fallback when a tile loses to SDPA on an untested card.
-ATTENTION_KERNELS = ("hand", "int8", "int8qk", "gemm", "hip")
+ATTENTION_KERNELS = ("hand", "gemm", "hip")
 
 # Node switches are three-state: "default" keeps the startup/env value,
 # "on"/"off" are explicit overrides. None is the internal spelling of "default".
@@ -101,7 +101,6 @@ _state = {
     "attn_backend_fn": None,
     "attn_tuned": set(),
     "attn_fp16": True,
-    "smooth": True,
     "te_int8": False,
     "te_patched": False,
     "te_attention": "default",
@@ -1122,10 +1121,10 @@ def patch_attention():
     if not _triton_available("attention"):
         return False
     try:
-        from .attention_kernel import (SUPPORTED_HEAD_DIMS, attention_fwd, attention_fwd_int8,
+        from .attention_kernel import (SUPPORTED_HEAD_DIMS, attention_fwd,
                                        supported as kernel_supported)
     except ImportError:
-        from attention_kernel import (SUPPORTED_HEAD_DIMS, attention_fwd, attention_fwd_int8,
+        from attention_kernel import (SUPPORTED_HEAD_DIMS, attention_fwd,
                                       supported as kernel_supported)
     hip = _hip_attention()
     if hip is not None and hip.available():
@@ -1139,19 +1138,21 @@ def patch_attention():
                      getattr(fallback, "__name__", "?"))
         return False
 
-    # the fused HIP kernel won every measured shape (tools/bench.py --attention)
-    # and keeps fp32 accumulators, so it is the default when it was built
-    kernel = "hip" if hip_supported is not None else "int8"
-    _state["attn_kernel"] = kernel if kernel in ATTENTION_KERNELS or stock_backend(kernel) is not None else "int8"
+    # The fused HIP kernel won every measured shape (tools/bench.py --attention)
+    # and keeps fp32 accumulators, so it is the default when it was built. Without
+    # the binary the default is gemm: the int8 Triton tiers were measured slower than
+    # hip at every image shape (13.4 against 8.5 ms at 4096^2) and 30x less accurate,
+    # so they are no longer offered at all.
+    _state["attn_kernel"] = "hip" if hip_supported is not None else "gemm"
     _state["attn_backend_fn"] = stock_backend(_state["attn_kernel"])
-    _state["smooth"] = True
-    # the tile constants were hand-measured on gfx906; the mode is a quality
-    # choice (rel 2e-2 int8 vs 2.5e-4 hand), so it stays a manual node
-    # switch instead of a manifest verdict
+    # the tile constants were hand-measured on gfx906; the mode is still a
+    # quality choice (relL2 1.4e-4 for the fused fp32-accumulate kernels against
+    # 3.3e-4 for gemm, which rounds the score matrix to fp16), so it stays a
+    # manual node switch instead of a manifest verdict
     _state["attn_tuned"] = set(SUPPORTED_HEAD_DIMS)
     _state["attn_fp16"] = True
     _state["attn_contiguous"] = True
-    stats = _state["attn_cast"] = {"fp16": 0, "fp32": 0, "hand": 0, "int8": 0, "int8qk": 0,
+    stats = _state["attn_cast"] = {"fp16": 0, "fp32": 0, "hand": 0,
                                    "gemm": 0, "hip": 0, "sdpa": 0}
 
     def run(q, k, v, softmax_scale):
@@ -1172,12 +1173,6 @@ def patch_attention():
             return hip_fwd(q, k, v, softmax_scale)
         if not kernel_supported(q, k, v):
             return None
-        if mode == "int8":
-            stats["int8"] += 1
-            return attention_fwd_int8(q, k, v, softmax_scale)
-        if mode == "int8qk":
-            stats["int8qk"] += 1
-            return attention_fwd_int8(q, k, v, softmax_scale, int8_pv=False, smooth=_state["smooth"])
         stats["hand"] += 1
         return attention_fwd(q, k, v, softmax_scale)
 
@@ -1365,7 +1360,7 @@ def triton_backend_active():
     return registry.is_available("triton")
 
 
-def configure(attention=None, smooth=None, convrot=None, profile=None, text_encoder=None,
+def configure(attention=None, convrot=None, profile=None, text_encoder=None,
               fp16=None, text_attention=None, contiguous=None, qkv=None,
               vae=None, gemv=None, textgen=None, prefix_kv=None, text_gemv=None, w4a8=None,
               amax_guard=None, int8_tile=None, small_batch=None, image_tower=None,
@@ -1389,12 +1384,10 @@ def configure(attention=None, smooth=None, convrot=None, profile=None, text_enco
                 wanted = _state["attn_kernel"]
         # combo values are untrusted: stale workflows may still carry removed names
         _state["attn_kernel"] = (wanted if wanted in ATTENTION_KERNELS
-                                 or stock_backend(wanted) is not None else "int8")
+                                 or stock_backend(wanted) is not None else "gemm")
         _state["attn_backend_fn"] = stock_backend(_state["attn_kernel"])
     if contiguous is not None:
         _state["attn_contiguous"] = resolve_flag(contiguous, True)
-    if smooth is not None:
-        _state["smooth"] = resolve_flag(smooth, True)
     if fp16 is not None:
         _state["attn_fp16"] = resolve_flag(fp16, True)
     if convrot is not None:
@@ -2211,8 +2204,8 @@ def report_lines():
     if not cast:
         return []
     line = (f"attention fp16-ok {cast['fp16']} / amax overflow {cast['fp32']}"
-            f" (own kernel: hip {cast['hip']}, hand {cast['hand']}, int8 {cast['int8']},"
-            f" int8qk {cast['int8qk']}, gemm {cast['gemm']}, sdpa {cast['sdpa']})")
+            f" (own kernel: hip {cast['hip']}, hand {cast['hand']},"
+            f" gemm {cast['gemm']}, sdpa {cast['sdpa']})")
     for k in cast:
         cast[k] = 0
     return [line]
@@ -2297,7 +2290,6 @@ def status():
         f"textgen {textgen_summary()}"
         + f", prefill {'block' if _state['delta_prefill_enabled'] else 'core loop'}",
         f"attention {_state['attn_kernel'] if _state['attention'] else 'off'}"
-        + (f", smoothing {'on' if _state['smooth'] else 'off'}" if _state["attn_kernel"] == "int8qk" else "")
         + ((", inputs cast to fp16" if _state["attn_fp16"] else ", inputs left in the model dtype")
            + f", amax guard {'on' if _state.get('amax_guard', True) else 'off'}"
            if _state["attention"] else "")
@@ -2330,8 +2322,8 @@ def status():
     cast = _state["attn_cast"]
     if cast:
         lines.append(f"attention calls: fp16-ok {cast['fp16']}, amax overflow {cast['fp32']}"
-                     f" (own kernel: hip {cast['hip']}, hand {cast['hand']}, int8 {cast['int8']},"
-                     f" int8qk {cast['int8qk']}, gemm {cast['gemm']}, sdpa {cast['sdpa']})")
+                     f" (own kernel: hip {cast['hip']}, hand {cast['hand']},"
+                     f" gemm {cast['gemm']}, sdpa {cast['sdpa']})")
     failures = _state.get("install_failures") or []
     if failures:
         lines.append(f"patches skipped on this device: {', '.join(failures)} (see the boot log)")

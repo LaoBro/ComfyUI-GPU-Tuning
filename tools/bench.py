@@ -231,8 +231,8 @@ def parse_args():
     parser.add_argument("--attention-shapes", default=ATTENTION_SHAPES,
                         help="BxHxSQxSK@dD list for the attention tile sweep")
     parser.add_argument("--attention-max-rel", type=float, default=0.3,
-                        help="attention numeric gate (default 30%%: int8 PV is ~2%% relL2, so this "
-                             "only rejects a kernel that computes something else)")
+                        help="attention numeric gate (default 30%%: the fused fp16 paths sit at "
+                             "~3e-4 relL2, so this only rejects a kernel computing something else)")
     parser.add_argument("--write", action="store_true", help="update the manifest (dry run otherwise)")
     parser.add_argument("--out", default="", help="manifest path to write; default is the local override")
     return parser.parse_args()
@@ -629,9 +629,9 @@ def run_tile_site(args, today):
 
 
 def run_attention_site(args, today):
-    """Sweep the int8/hand/gemm attention paths against SDPA and record the result.
+    """Sweep the hand/hip/gemm attention paths against SDPA and record the result.
 
-    Writes a tile per head dim (both ways, so a later mode change still has
+    Writes a tile per head dim, so a later mode change still has
     data), the mode that won, and whether our kernel should be installed at all.
     """
     import attention_kernel as attn
@@ -662,9 +662,6 @@ def run_attention_site(args, today):
 
         candidates = [("hand", attn.config_text(config), lambda c=config: run_fp16(c))
                       for config in attn.CANDIDATES]
-        candidates += [("int8", attn.config_text(config),
-                        lambda c=config: attn.attention_fwd_int8(q, k, v, None, int8_pv=True, config=c))
-                       for config in attn.INT8_CANDIDATES]
         if tuning._gemm_ok(q, k, v):
             candidates.append(("gemm", "gemm", lambda: tuning._gemm_attention(q, k, v, None)))
         if hip is not None and hip.available() and hip.supported(q, k, v):
@@ -700,10 +697,10 @@ def run_attention_site(args, today):
 
     # gemm is timed as evidence but never elected: it is shape-lucky plain
     # torch, not a kernel of ours, and its prefill form holds ~1 GB of
-    # contiguous copies per call -- users hit OOM under memory pressure that
-    # the int8 kernel (int8 KV, strided reads, no copies) survives.
+    # contiguous copies per call -- users hit OOM under memory pressure that the
+    # fused kernels (hip 10-27 MiB, hand the same) survive.
     ratios = {}
-    for mode in ("int8", "hand", "hip"):
+    for mode in ("hand", "hip"):
         per_shape = []
         for index in range(len(shapes)):
             ours, _ = best(index, mode)
@@ -727,9 +724,9 @@ def run_attention_site(args, today):
     records = {}
     for head_dim in sorted({shape[4] for shape in shapes}):
         site = f"attention.tile.d{head_dim}"
-        # the tile key is the path (int8 / fp16), the sample shares names with
-        # the node's modes, where the fp16 kernel is called "hand"
-        for key, sample_mode in (("int8", "int8"), ("fp16", "hand")):
+        # the sample shares names with the node's modes, where the fp16 Triton
+        # kernel is called "hand"
+        for key, sample_mode in (("fp16", "hand"),):
             scores = {}
             for (index, mode_name, label), ms in samples.items():
                 if mode_name == sample_mode and shapes[index][4] == head_dim:

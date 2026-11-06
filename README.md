@@ -34,7 +34,7 @@ KV cache 容量级拷贝、launch 开销，这些在别的卡上一样存在。�
    见下面「文本生成」。
 2. **convrot 融合**：蝶形 Hadamard 旋转与 int8 量化合成一个 kernel（原本两次全局读写）。
 3. **注意力入口**：把 `[B,S,H,D]` 统一转 fp16 + 连续布局，再分发给选中的后端。
-   可选 `hip` / `int8` / `int8qk` / `hand` / `gemm`，以及 ComfyUI 自带的 `basic` /
+   可选 `hip` / `hand` / `gemm`，以及 ComfyUI 自带的 `basic` /
    `pytorch` / `sub_quad` / `split` 等全部后端。
 4. **文本编码器 int8**：权重保持量化（每次调用不再反量化）。
 5. **QKV 三合一**：q/k/v 三个投影合成一次 int8 GEMM（逐行 scale 拼接，bit-exact）。
@@ -238,7 +238,7 @@ decode step 会在 CPU 上开内存。CLIP Settings 节点的 `text_gemv=off` �
 
 | 节点 | 位置 | 作用 |
 |---|---|---|
-| **GFX906 Model Settings** | 模型链（加载器 → 采样器之间） | 注意力模式、连续布局、int8qk 中心化、fp16、amax 保护、convrot、int8 tile、`m≤8` 窄 tile、QKV、VAE、GEMV、prefix KV、profiler |
+| **GFX906 Model Settings** | 模型链（加载器 → 采样器之间） | 注意力模式、连续布局、fp16、amax 保护、convrot、int8 tile、`m≤8` 窄 tile、QKV、VAE、GEMV、prefix KV、profiler |
 | **GFX906 CLIP Settings** | CLIP 链（加载器 → 编码） | 文本编码器 int8、编码器注意力后端、TE GEMV、4-bit w4a8、文本生成补丁组 |
 
 设置节点改动**下一次执行就生效**，不用重启。命令行复测 `benchmark()` 已删除：它没有节点注册、也没有任何调用者，长期是死代码；需要复测时直接用 `gfx906fix/` 下的独立脚本，避免再维护第三个节点。
@@ -254,14 +254,13 @@ decode step 会在 CPU 上开内存。CLIP Settings 节点的 `text_gemv=off` �
 
 ### 节点开关清单
 
-Model Settings：`attention`、`contiguous`、`smooth`、`fp16`、`amax_guard`、`convrot`、`int8_tile`、`small_batch`、`qkv`、`vae`、`gemv`、`prefix_kv`、`profile`。
+Model Settings：`attention`、`contiguous`、`fp16`、`amax_guard`、`convrot`、`int8_tile`、`small_batch`、`qkv`、`vae`、`gemv`、`prefix_kv`、`profile`。
 
 CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`image_tower`、`textgen`。
 
 补充说明：
 
 - `contiguous`：选中 `basic`/`pytorch`/`sub_quad`/`split` 等 core 后端时，调用前把输入转成连续的 `[B,H,S,D]`；关闭可复现 core 的原始转置视图调用。
-- `smooth`：SageAttention2 的均值中心化，只在 `int8qk` 模式下生效。
 - `amax_guard`：注意力输入绝对值超过 60000 时放弃 fp16 转换，留在模型 dtype，避免 fp16 溢出。
 - `int8_tile`：关闭后恢复上游 autotune 的 tile 列表，不再注入 gfx906 的 `128×256×32`；GEMV 仍由 `gemv` 单独控制。
 - `small_batch`：gfx906 上把“`m≤8` 切到 `16×32×64` 窄 tile、`m>8` 切回 `128×256×32`”单独控制；其它 AMD 上表示“把窄 tile 追加为 autotune 候选”（是否真的用它由该卡实测决定）。需要 `int8_tile` 为 on，否则显示 n/a。GEMV 仍由 `gemv` 单独控制。
@@ -283,11 +282,13 @@ CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`imag
 
 | 模式 | 精度 | 适用 |
 |---|---|---|
-| `hip`（默认） | fp32 累加，rel ≈ 2.5–3.3e-4 | **三个实测形状全部最快**：比 `int8` 快 1.3–1.6x、比 `gemm` 快 1.3–3.5x。只支持 D=64/128 |
-| `int8` | 有 int8 量化误差（rel ≈ 2e-2） | `hip` 内核在本机装不上时的默认 |
-| `gemm` | fp16 | 任意 head_dim 都能用（含 SD1.5 的 40、SD2.1 的 80），但长 K 上被 `hip` 反超，且会拷贝 ~1 GB |
-| `hand` | fp16 | 自研 Triton 内核，现已被 `hip` 全面取代，留作对照 |
-| `int8qk` | 介于两者 | PV 保留 fp16，慢约 10%，精度好 4-7 倍 |
+| `hip`（默认） | fp32 累加，rel ≈ 2.5–3.3e-4 | 每个实测形状都最快（对 `gemm` 1.3–3.5x，对本机默认 `sub_quad` 1.5–5.5x），且只占输出显存 10–27 MiB。只支持 D=64/128 |
+| `gemm` | fp16 score 物化，rel ≈ 5.6e-4 | 任意 head_dim 都能用（含 SD1.5 的 40、SD2.1 的 80），`hip` 装不上时的默认；也会拷 58–630 MiB 的 score/连续副本 |
+| `hand` | fp16 累加，rel ≈ 2.8e-4 | Triton 内核，时间与 `gemm` 同级但只占 1–27 MiB；`hip` 不可用时的低显存选择 |
+
+`int8` 与 `int8qk` 两档已删除：真实 SDXL 形状上它们比 `hip` 慢（4096²：13.4 / 15.3 对 8.5 ms）
+且 relL2 差 30 倍（7.7e-3 对 2.1e-4），实测没有任何一个形状赢过 `hip`。原先"`hip` 装不上时
+默认走 `int8`"改成默认走 `gemm`。
 
 `hip` 是本包自带的融合注意力内核（`arch/gfx906/kernels/hip_attn.cu`，ctypes 加载，不依赖 torch 扩展）。
 同一个脚本也编出 int8 大 m 路径要用的 `libgfx906_int8.so` 和解码激活旋转的 `libgfx906_rotate.so`（见下节）。三个 `.so` 随包分发，按 HIP 7.18（ROCm 10.3）的运行时构建，

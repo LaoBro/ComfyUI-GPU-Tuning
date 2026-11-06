@@ -50,23 +50,22 @@ class Gfx906ModelSettings(io.ComfyNode):
                 io.Combo.Input("attention", options=["default"] + list(ATTENTION_KERNELS) + backend_options(),
                                default="default",
                                tooltip="default is hip when the shipped kernel loads (fused fp32-accumulate "
-                                       "kernel, fastest on every measured shape), else int8; hip needs D=64/128 "
+                                       "kernel, fastest on every measured shape), else gemm; hip needs D=64/128 "
                                        "and libgfx906_attn.so, which targets HIP 7 - another runtime rebuilds it "
-                                       "with tools/build_hip_attn.py --force; int8qk keeps PV "
-                                       "in fp16 (slower, 4-7x more accurate); gemm is fp16 built from rocBLAS "
-                                       "bmm + softmax + bmm (any head dim, but copies ~1 GB); hand is the fp16 "
-                                       "Triton kernel. basic, pytorch, sub_quad, split and any other backend core "
-                                       "registered are ComfyUI's own functions."),
+                                       "with tools/build_hip_attn.py --force; gemm is fp16 built from rocBLAS "
+                                       "bmm + softmax + bmm (any head dim, but materializes the score matrix, "
+                                       "up to ~630 MiB); hand is the fp16 Triton kernel (same 10-27 MiB footprint "
+                                       "as hip, but slower). The int8 tiers were dropped: measured slower than "
+                                       "hip at every image shape and 30x less accurate. basic, pytorch, sub_quad, "
+                                       "split and any other backend core registered are ComfyUI's own functions."),
                 io.Combo.Input("contiguous", options=list(TRISTATE), default="default",
                                tooltip="When a backend name is selected: transpose to [B,H,S,D] and "
                                        ".contiguous() before calling it. Core hands SDPA/bmm transpose views "
                                        "instead, which measures 4-15x slower on gfx906. Turn off to reproduce "
                                        "core's exact call for comparison on other GPUs. No effect on the "
-                                       "hip/int8/int8qk/hand kernels (they build their own layouts)."),
-                io.Combo.Input("smooth", options=list(TRISTATE), default="default",
-                               tooltip="SageAttention2 mean-centering before quantizing; only used by int8qk."),
+                                       "hip/hand kernels (they build their own layouts)."),
                 io.Combo.Input("fp16", options=list(TRISTATE), default="default",
-                               tooltip="Cast fp32/bf16 attention inputs to fp16. The hip/int8/int8qk/hand kernels "
+                               tooltip="Cast fp32/bf16 attention inputs to fp16. The hip and hand kernels "
                                        "are fp16-only and error out instead of running when this is off; the "
                                        "backend names then run in the model's own dtype."),
                 io.Combo.Input("amax_guard", options=list(TRISTATE), default="default",
@@ -114,11 +113,11 @@ class Gfx906ModelSettings(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, attention: str, contiguous: str, smooth: str, fp16: str, amax_guard: str,
+    def execute(cls, model, attention: str, contiguous: str, fp16: str, amax_guard: str,
                 convrot: str, int8_tile: str, small_batch: str, int8_gemm: str, qkv: str, vae: str,
                 gemv: str, prefix_kv: str, profile: str) -> io.NodeOutput:
         apply()
-        configure(attention=attention, smooth=smooth, fp16=fp16, convrot=convrot,
+        configure(attention=attention, fp16=fp16, convrot=convrot,
                   profile=profile, contiguous=contiguous, qkv=qkv,
                   vae=vae, gemv=gemv, prefix_kv=prefix_kv, amax_guard=amax_guard,
                   int8_tile=int8_tile, small_batch=small_batch, int8_gemm=int8_gemm)
