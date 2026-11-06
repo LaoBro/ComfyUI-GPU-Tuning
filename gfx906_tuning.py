@@ -99,7 +99,6 @@ _state = {
     "attn_cast": None,
     "attn_kernel": None,
     "attn_backend_fn": None,
-    "attn_tuned": set(),
     "attn_fp16": True,
     "te_int8": False,
     "te_patched": False,
@@ -1145,11 +1144,9 @@ def patch_attention():
     # so they are no longer offered at all.
     _state["attn_kernel"] = "hip" if hip_supported is not None else "gemm"
     _state["attn_backend_fn"] = stock_backend(_state["attn_kernel"])
-    # the tile constants were hand-measured on gfx906; the mode is still a
-    # quality choice (relL2 1.4e-4 for the fused fp32-accumulate kernels against
-    # 3.3e-4 for gemm, which rounds the score matrix to fp16), so it stays a
-    # manual node switch instead of a manifest verdict
-    _state["attn_tuned"] = set(SUPPORTED_HEAD_DIMS)
+    # The mode is a quality choice (relL2 1.4e-4 for the fused fp32-accumulate
+    # kernels against 3.3e-4 for gemm, which rounds the score matrix to fp16), so it
+    # stays a manual node switch instead of a manifest verdict.
     _state["attn_fp16"] = True
     _state["attn_contiguous"] = True
     stats = _state["attn_cast"] = {"fp16": 0, "fp32": 0, "hand": 0,

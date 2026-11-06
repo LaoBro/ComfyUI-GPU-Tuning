@@ -724,8 +724,11 @@ def run_attention_site(args, today):
     records = {}
     for head_dim in sorted({shape[4] for shape in shapes}):
         site = f"attention.tile.d{head_dim}"
-        # the sample shares names with the node's modes, where the fp16 Triton
-        # kernel is called "hand"
+        # Evidence only: attention_fwd picks its tile from DEFAULT_CONFIG(_D64) at
+        # call time, nothing reads this record back. It is kept because the sweep is
+        # where those constants were measured, and re-running it shows whether a
+        # winner has moved. The sample shares names with the node's modes, where the
+        # fp16 Triton kernel is called "hand"
         for key, sample_mode in (("fp16", "hand"),):
             scores = {}
             for (index, mode_name, label), ms in samples.items():

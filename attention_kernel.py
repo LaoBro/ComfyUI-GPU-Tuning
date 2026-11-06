@@ -11,8 +11,6 @@ Only plain multi-head attention without a mask is handled; everything else
 falls back to the upstream kernel.
 """
 
-import logging
-
 import torch
 import triton
 import triton.language as tl
@@ -112,31 +110,11 @@ def _launch(q, k, v, out, scale, config):
 # measured on gfx906 (none crashed); the list stays short because every entry
 # costs a JIT compile the first time it runs.
 CANDIDATES = ((64, 16, 4, 2), (64, 32, 4, 2), (32, 16, 4, 2), (64, 8, 4, 2))
-DEFAULT_CONFIG = (BLOCK_M, BLOCK_N, NUM_WARPS, NUM_STAGES)
 
 
 def config_text(config):
     """(block_m, block_n, warps, stages) -> "64x16w4s2", the manifest's key."""
     return f"{config[0]}x{config[1]}w{config[2]}s{config[3]}"
-
-
-def config_from_text(text):
-    """The inverse of config_text, or None when the text is not a usable tile.
-
-    Tiles come from a hand-editable TOML file, so a block of 0 has to be
-    rejected here rather than divided by in the grid.
-    """
-    try:
-        tile, _, tail = str(text).partition("w")
-        block_m, block_n = (int(value) for value in tile.split("x"))
-        warps, _, stages = tail.partition("s")
-        config = (block_m, block_n, int(warps), int(stages))
-    except (TypeError, ValueError):
-        return None
-    return config if min(config) > 0 else None
-
-
-_selected = {}
 
 
 def _time_call(fn, runs=2):
@@ -151,40 +129,10 @@ def _time_call(fn, runs=2):
     return start.elapsed_time(end) / runs
 
 
-def _time(config, q, k, v, out, scale, runs=2):
-    return _time_call(lambda: _launch(q, k, v, out, scale, config), runs)
-
-
-def benchmark_tiles(q, k, v, softmax_scale=None):
-    """(config, ms) for the best candidate tile on this shape, or (None, None).
-
-    Called once per session and head dim by the tuning patch when the device is
-    not one the tiles were measured on; keying on the shape would re-sweep
-    whenever the prompt changes the KV length, which costs more than the choice
-    is worth.
-    """
-    out = torch.empty_like(q)
-    scale = _scale(softmax_scale, q.shape[-1])
-    best, best_ms = None, None
-    for config in CANDIDATES:
-        try:
-            ms = _time(config, q, k, v, out, scale)
-        except Exception as exc:
-            logging.warning("gfx906: attention tile %s failed to compile (%s), skipped", config, exc)
-            continue
-        if best_ms is None or ms < best_ms:
-            best, best_ms = config, ms
-    return best, best_ms
-
-
-def use_config(config, head_dim):
-    _selected[head_dim] = config
-
-
 def attention_fwd(q, k, v, softmax_scale=None):
     """q, k, v: [B, S, H, D] fp16, contiguous. Returns [B, S, H, D] fp16."""
     out = torch.empty_like(q)
-    config = _selected.get(q.shape[-1]) or (DEFAULT_CONFIG_D64 if q.shape[-1] == 64 else DEFAULT_CONFIG)
+    config = DEFAULT_CONFIG_D64 if q.shape[-1] == 64 else DEFAULT_CONFIG
     _launch(q, k, v, out, _scale(softmax_scale, q.shape[-1]), config)
     return out
 
