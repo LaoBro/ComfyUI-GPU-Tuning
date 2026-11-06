@@ -389,10 +389,13 @@ def linear_dequant(x, qdata, s_rel, s_channel, bias, out_dtype, group_size,
     rows = _row_block(m)
     lut = codebook.float().reshape(-1).contiguous() if codebook is not None else None
     out = torch.empty((m, n), device=x.device, dtype=out_dtype)
-    # The fp16-activation kernel takes x unconverted, so it has to be tried before
-    # the cast it skips. It is opt-in because it resolves the 16 levels in fp16.
-    if (x.dtype == torch.float16 and not convrot_groupsize
-            and hip_w4a16.enabled() and hip_w4a16.f16_enabled()):
+    # The fp16 feed takes x unconverted, so it has to be tried before the cast it
+    # skips. Without a codebook it runs by default: the uniform `code - 8` grid is
+    # exact in fp16, so that tier gains speed and nothing else changes. A codebook
+    # rounds its 16 levels to fp16 (~2.5e-4), which is opt-in through
+    # COMFY_GFX906_W4A16_F16ACT.
+    if (hip_w4a16.enabled() and x.dtype == torch.float16 and not convrot_groupsize
+            and (codebook is None or hip_w4a16.f16_enabled())):
         if hip_w4a16.linear_dequant_h(x, qdata, s_rel, s_channel, bias, out, group_size, lut):
             return out
     if convrot_groupsize:

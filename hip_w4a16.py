@@ -6,11 +6,13 @@ stay packed in registers and resolve through a 16-entry fp32 table in LDS. Three
 entries by row count and dtype -- m=1 decode (3.6-4.4x Triton, 185-274 GB/s
 against a 631-776 GB/s plane), m=2..8 with fp32 activations sharing one decoded
 dword (1.6-5.3x), and a third that takes fp16 activations and does the math with
-v_dot2_f32_f16 for any m=1..8 (4.1-8.7x) which is opt-in because it rounds the 16
-levels to fp16. m > 8, convrot and any other mismatch fall back to Triton.
+v_dot2_f32_f16 for any m=1..8 (4.1-8.7x). That feed is the default unless the
+checkpoint carries a codebook, because the uniform `code - 8` grid is exact in
+fp16; a codebook rounds its 16 levels (~2.5e-4) so it needs
+COMFY_GFX906_W4A16_F16ACT=1. m > 8, convrot and any other mismatch fall back to Triton.
 
 COMFY_GFX906_W4A16_HIP=off restores the Triton kernel for an A/B run;
-COMFY_GFX906_W4A16_F16ACT=1 turns on the fp16-activation multi-row kernel.
+COMFY_GFX906_W4A16_F16ACT=1 also lets a codebook checkpoint use that feed.
 
 The stream is read at call time: torch.cuda.graph() switches current_stream to its
 capture stream, so a cached handle would leave the launch out of the graph.
@@ -84,8 +86,9 @@ def enabled():
 
 
 def f16_enabled():
-    """The fp16-activation kernel is off by default: it rounds the 16 codebook levels
-    to fp16, which is a ~2e-4 systematic relative error rather than rounding noise."""
+    """Whether a checkpoint *with* a codebook may use the fp16 feed. Without one the
+    grid is exact in fp16 and the caller uses that feed regardless; with one it rounds
+    the 16 levels, a ~2.5e-4 systematic relative error rather than rounding noise."""
     return os.getenv("COMFY_GFX906_W4A16_F16ACT", "0").strip().lower() in ("1", "on", "true", "yes")
 
 
@@ -162,10 +165,10 @@ def linear_dequant(x, qdata, s_rel, s_channel, bias, out, group_size, codebook):
 
 def linear_dequant_h(x, qdata, s_rel, s_channel, bias, out, group_size, codebook):
     """The fp16-activation kernel: products resolved by v_dot2_f32_f16 off a packed
-    fp16 level table, which needs 30-59 VGPRs instead of 94-240 and therefore runs two
-    to four blocks per CU. Takes fp16 x, 1..8 rows, and is opt-in because a
-    codebook's 16 levels round to fp16 (2e-4 relative; the uniform code - 8 grid is
-    exact and gains nothing but speed).
+    fp16 level table, which needs 29-59 VGPRs instead of 94-240 and therefore runs two
+    to four blocks per CU. Takes fp16 x and 1..8 rows. The uniform `code - 8` grid is
+    exact in fp16 so it costs nothing numerically; a codebook's 16 levels round to
+    fp16 (~2.5e-4 relative), which is why the caller gates that case.
     """
     lib = _load()
     rows = x.shape[0]

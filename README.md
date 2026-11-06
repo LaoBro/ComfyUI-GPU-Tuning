@@ -129,11 +129,12 @@ m=2..8 为 11-45 → 18-238 GB/s（1.6-5.3x）；与 Triton 路径的差在 fp32
 舍入内（归一化 ≤3.0e-7），fp16 输出另含 1 ulp 舍入（≤4.9e-4）。
 `COMFY_GFX906_W4A16_HIP=off` 回退 Triton；m>8、fp16 激活的多行批等不合形状的批
 仍走 Triton（多行内核按 fp32 激活在 LDS 里摆 M 行，见 docs/HIP_KERNELS.md 附录）。
-`COMFY_GFX906_W4A16_F16ACT=1` 把 m=1..8 全换成 fp16 激活 + `v_dot2_f32_f16` 的内核：
-4.1-8.7x over Triton（单行 1.05-1.20x，多行 1.08-4.89x），且不要求 fp32 转换。默认关，
-因为它把 16 个格点退到 fp16：fp32 输出归一化 1.6-2.6e-4、rms 2.1-2.8e-4，而**均匀格点
-（`code-8`）与无损版同级（~2e-7）**，所以只有带 codebook 的检查点会看到差别；fp16 输出
-档最大约 1.5 ulp。开启前按 `--sampling off` 重验生文 md5。
+fp16 激活 + `v_dot2_f32_f16` 的内核（`w4a16_gemv_h`）现在**是均匀格点（无 codebook）
+检查点的默认 feed**：3.4-7.2x over Triton（204-291 GB/s），数值与无损版同级（fp32 输出
+2.4e-7、fp16 输出 1 ulp），因为 `code-8` 的 16 个值在 fp16 里精确可表示。带 codebook 的
+检查点会看到格点退到 fp16（fp32 输出归一化 1.6-2.6e-4、rms 2.1-2.8e-4，fp16 输出约
+1.5 ulp），所以那一档要 `COMFY_GFX906_W4A16_F16ACT=1` 才开，开启前按 `--sampling off`
+重验生文 md5。convrot 路径的激活是 fp32，只走无损 feed，不受这个开关影响。
 
 单条 linear 实测（合成权重，m=1，深队列下的平均墙钟）：
 
@@ -364,7 +365,7 @@ m ≤ 1 的解码仍走 GEMV；m < 128 直接回落 Triton（128 行 tile 在更
 | `COMFY_GFX906_GRAPH` | `1` | textgen 分项基准旋钮：权重常驻时的逐块 CUDA graph（也跟随 CLIP 节点的 `textgen` 开关） |
 | `COMFY_GFX906_ROTATE` | `1` | 解码激活旋转的 HIP butterfly 内核；`off` 回落到 Triton 做 A/B。fp16 输入下 HIP 以 fp32 累加，量化激活更准但与 Triton 不等价 |
 | `COMFY_GFX906_W4A16_HIP` | `1` | te=default 4-bit 反量化 GEMV 的 HIP 内核（`arch/gfx906/kernels/w4a16.cu`，m=1 与 m=2..8 两个入口）；`off` 回落到 Triton 的 `dequant_w4a16_kernel` 做 A/B。m>8 或不合形状的批仍走 Triton |
-| `COMFY_GFX906_W4A16_F16ACT` | `0` | 4-bit 反量化 GEMV 改用 fp16 激活 + `v_dot2_f32_f16`（`w4a16_gemv_h`，m=1..8）：比 fp32 激活版快 1.05-4.89x，整体 4.1-8.7x over Triton，寄存器 29-59。代价只有 16 个格点退到 fp16（fp32 输出归一化 1.6-2.6e-4；均匀格点 `code-8` 无额外误差，fp16 输出档约 1.5 ulp）。开启前按 `--sampling off` 重验生文 md5 |
+| `COMFY_GFX906_W4A16_F16ACT` | `0` | 只管**带 codebook** 的检查点是否用 fp16 激活 + `v_dot2_f32_f16` 的 feed（`w4a16_gemv_h`，m=1..8，比无损 feed 快 1.05-4.89x）；代价是 16 个格点退到 fp16（fp32 输出归一化 1.6-2.6e-4、fp16 输出约 1.5 ulp），开启前按 `--sampling off` 重验生文 md5。无 codebook 的检查点不看这个开关，默认就走该 feed（均匀格点在 fp16 里精确） |
 
 ## 已知边界
 

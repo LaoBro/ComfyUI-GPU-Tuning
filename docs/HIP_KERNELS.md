@@ -218,7 +218,7 @@ load 阶段只会增加 VGPR 和私有拷贝，实测是负结果。
 | 融合注意力 `hip_attn.cu` | 5.1-5.6 TMAC/s（4 波天花板的 75-78%），比 int8 快 1.3-1.6x | 128 Q 行 x 64 keys、256 线程、1 block/CU、32+64 fp32 累加器、XOR swizzled LDS 恰好 64 KB |
 | 大 m int8 GEMM `int8_gemm.cu` | 10.04 TMAC/s，节点级 1.10-1.16x | 128x128 tile、TM8/TN8 = 64 int32 累加器、BK=32、chunk-major LDS、211 VGPR 无 spill |
 | 激活旋转 `rotate.cu` | fp32 档约 12x（graph 内 23.6 → 2.0 us/call），端到端 38.4 → 51.6 tok/s | radix-4 butterfly，D=1/4/16 用 shfl_xor、D=64 走 LDS，无全局 Hadamard 流量 |
-| W4A16 解码 GEMV `w4a16.cu` | 单行解码 3.6-4.4x（48-62 → 185-274 GB/s）；多行 `w4a16_gemv_m`（m=2..8）1.6-5.3x（11-45 → 18-238 GB/s） | 一行拆 32 lane（一个 wavefront 读 8 行 x 16 B）、grid 封顶 240 块 = 960 波、每 lane 一个 uint4、16 级 fp32 codebook 放 LDS、每个 dword 一条独立累加链、**激活按 quad 行落 LDS**（先 lane-major 修 bank 冲突 1.4x，再 b128 一条指令供 4 个权重又 1.15x）、**循环倒置**（每个 chunk 只 pack 一次激活，再遍历本块的 32 个 row-group，部分和走 LDS、每块一次 shuffle，寄存器不涨）；多行版沿用这套 lane 划分，但一个 dword 解出的 8 个格点跨 M 行复用，激活按 M 行整块落 LDS。同文件第三个入口 `w4a16_gemv_h` 把激活换成 fp16、乘加换成 `v_dot2_f32_f16`（格点也退到 fp16，故 `COMFY_GFX906_W4A16_F16ACT=1` 才开，均匀格点无额外误差）：m=1..8 再快 1.05-4.89x，4.1-8.7x over Triton，寄存器从 94-240 掉到 29-59 |
+| W4A16 解码 GEMV `w4a16.cu` | 单行解码 3.6-4.4x（48-62 → 185-274 GB/s）；多行 `w4a16_gemv_m`（m=2..8）1.6-5.3x（11-45 → 18-238 GB/s） | 一行拆 32 lane（一个 wavefront 读 8 行 x 16 B）、grid 封顶 240 块 = 960 波、每 lane 一个 uint4、16 级 fp32 codebook 放 LDS、每个 dword 一条独立累加链、**激活按 quad 行落 LDS**（先 lane-major 修 bank 冲突 1.4x，再 b128 一条指令供 4 个权重又 1.15x）、**循环倒置**（每个 chunk 只 pack 一次激活，再遍历本块的 32 个 row-group，部分和走 LDS、每块一次 shuffle，寄存器不涨）；多行版沿用这套 lane 划分，但一个 dword 解出的 8 个格点跨 M 行复用，激活按 M 行整块落 LDS。同文件第三个入口 `w4a16_gemv_h` 把激活换成 fp16、乘加换成 `v_dot2_f32_f16`：m=1..8 再快 1.05-4.89x，寄存器从 94-240 掉到 29-59。**无 codebook 时它是默认**（`code-8` 在 fp16 里精确，数值与无损版同为 2.4e-7）；带 codebook 要把格点退到 fp16，故 `COMFY_GFX906_W4A16_F16ACT=1` 才开 |
 
 int8 GEMM 的波形 sweep（4032x12288x4096）：2 波 5.75、4 波 9.64、
 8 波 9.14 TMAC/s（8 波只能用 16 累加器，与 4 波不是同一个 tile）。
@@ -232,6 +232,9 @@ int8 GEMM 的波形 sweep（4032x12288x4096）：2 波 5.75、4 波 9.64、
 流量折算（int8 一字节、int4 半字节）。
 program 数够多时这张卡能吃满流式带宽（lm_head 的 int8 GEMV 连单次计时都有
 726 GB/s，深队列只会更高），所以同形状的 int8 GEMV 才是这一档的实际参照。
+均匀格点（无 codebook）一档另外算：Triton 在 m=1 是 144.5/348.1/4004 us（58-78 GB/s，
+比 codebook 档快是因为它跳过 gather），m=8 是 691/1578/18062 us；默认已落到
+`w4a16_gemv_h`，对应 39.2/103.5/1068.8 与 96.4/232.8/2663.6 us，3.4-7.2x。
 
 | 内核 | 4096x4096 @m1 | 12288x4096 @m1 | 12288x4096 @m8 |
 |---|---|---|---|
@@ -240,7 +243,7 @@ program 数够多时这张卡能吃满流式带宽（lm_head 的 int8 GEMV 连�
 | `int8_gemv.dequant_gemv_kernel`（w8a16） | 46.9 us / 358 | 87.3 us / 576 | 337.1 us / 149 |
 | `w4a8_gemv.dequant_w4a16_kernel`（w4a16 Triton） | 176.8 us / 47 | 455.3 us / 55 | 1870.7 us / 13 |
 | `w4a16.cu`（w4a16 HIP，同一 `linear_dequant` 入口；m=8 走多行内核） | 45.2 us / 185 | 119.0 us / 211 | 862.0 us / 29 |
-| `w4a16.cu` `w4a16_gemv_h`（fp16 激活 + dot2，`F16ACT=1`） | 37.9 us / 221 | 105.2 us / 239 | 234.0 us / 108 |
+| `w4a16.cu` `w4a16_gemv_h`（fp16 激活 + dot2；均匀格点默认，codebook 档要 `F16ACT=1`） | 37.9 us / 221 | 105.2 us / 239 | 234.0 us / 108 |
 
 读数：
 
@@ -332,8 +335,9 @@ program 数够多时这张卡能吃满流式带宽（lm_head 的 int8 GEMV 连�
   FMA 受限。按每条指令占用的单元折算（b128 读 1 KB 波次、b32 gather 256 B、FMA
   4 cyc/波次）：M=8 时一个 (lane, chunk, 列) 做 256 FMA + 32 gather + 64 条 b128
   激活读 + 40 shuffle，份额约 FMA 36%、激活读 47%、gather 17%，上限约 1.3 TMAC/s。
-- **fp16 激活 + `v_dot2_f32_f16` 版（`COMFY_GFX906_W4A16_F16ACT=1`，默认关）**：
-  4.1-8.7x over Triton（87-260 GB/s），比 fp32 激活版快 1.05-4.89x。但赢的原因不是
+- **fp16 激活 + `v_dot2_f32_f16` 版（`w4a16_gemv_h`）**：比 fp32 激活版快 1.05-4.89x，
+  带 codebook 时 4.1-8.7x over Triton（87-260 GB/s）。**无 codebook 就默认走这一条**
+  （均匀格点 3.4-7.2x over Triton，204-291 GB/s）；带 codebook 要 `F16ACT=1`。但赢的原因不是
   指令数减半，而是**寄存器**：`vgpr 29-59`、LDS 4-25.6 KB → M=4 有
   4 block/CU（16 波，正好是纯读探针的最优波数），M=8 有 2 block。fp32 版之所以吃到
   240 个寄存器，是因为它要把一个 dword 的 8 个格点和 8 个激活值都摊成 float 数组再
@@ -343,11 +347,12 @@ program 数够多时这张卡能吃满流式带宽（lm_head 的 int8 GEMV 连�
   （152064²，1.05x / 290）。`vgpr 29-35`、LDS 4096 B → 4 block/CU（16 波，正是纯读
   探针的最优波数）。只有 1.05-1.20x 而不是 4-8x，因为单行档卡在读通路上，把指令
   减半解决不了读。
-- 精度代价（实测）：格点退到 fp16 后，fp32 输出归一化最大 1.6-2.6e-4、rms 2.1-2.8e-4，
-  **均匀格点（`code - 8`）与无损版同级（1.1-2.0e-7）**——0..15 减 8 在 fp16 里精确可
-  表示，所以只有带 codebook 的检查点会看到差别。fp16 输出档最大 7.5e-4，约 1.5 ulp
-  （无损版是 1 ulp），因为格点误差和输出舍入叠加。开启前要按坑点那条用
-  `--sampling off` 重验生文 md5。
+- 精度（实测，540 组路由+数值复验）：**均匀格点与无损版同级**（fp32 输出归一化最大
+  2.4e-7，fp16 输出 5.0e-4 = 1 ulp，与无损版一致），因为 0..15 减 8 在 fp16 里精确可
+  表示 —— 所以这一档默认走 fp16，没有质量问题。带 codebook 时格点退到 fp16，fp32 输出
+  归一化 1.6-2.6e-4、rms 2.1-2.8e-4，fp16 输出最大 7.5e-4（约 1.5 ulp，无损版是 1 ulp），
+  因此那一档要 `F16ACT=1` 才开，开启前按坑点那条用 `--sampling off` 重验生文 md5。
+  convrot 把激活转成 fp32，只有无损 feed 收，所以它不跟这个开关走。
 - **寄存器驻留（把 lane 的激活块提到寄存器里跨列复用）已被实测否掉**：省下的 b128
   根本不在关键路径上。等 chunk 宽（1024）下 M=2/4 是 0.85-1.08x，即中性；M=8 装不下
   （要 128 个寄存器）只能把 chunk 砍到 512，结果 0.85-0.89x，比原版更慢。份额模型
