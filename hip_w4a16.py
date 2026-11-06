@@ -3,11 +3,11 @@
 Loads arch/gfx906/kernels/libgfx906_w4a16.so (built from w4a16.cu by
 tools/build_hip_attn.py) and replaces w4a8_gemv.dequant_w4a16_kernel: the nibbles
 stay packed in registers and resolve through a 16-entry fp32 table in LDS. Three
-entries by row count -- m=1 decode (3.6-4.4x Triton, 185-274 GB/s against a
-631-776 GB/s plane), m=2..8 with fp32 activations sharing one decoded dword
-(1.6-5.3x), and the same m=2..8 shape with fp16 activations through
-v_dot2_f32_f16 (5.3-8.7x) which is opt-in because it rounds the 16 levels to
-fp16. m > 8, convrot and any other mismatch fall back to Triton.
+entries by row count and dtype -- m=1 decode (3.6-4.4x Triton, 185-274 GB/s
+against a 631-776 GB/s plane), m=2..8 with fp32 activations sharing one decoded
+dword (1.6-5.3x), and a third that takes fp16 activations and does the math with
+v_dot2_f32_f16 for any m=1..8 (4.1-8.7x) which is opt-in because it rounds the 16
+levels to fp16. m > 8, convrot and any other mismatch fall back to Triton.
 
 COMFY_GFX906_W4A16_HIP=off restores the Triton kernel for an A/B run;
 COMFY_GFX906_W4A16_F16ACT=1 turns on the fp16-activation multi-row kernel.
@@ -161,14 +161,15 @@ def linear_dequant(x, qdata, s_rel, s_channel, bias, out, group_size, codebook):
 
 
 def linear_dequant_h(x, qdata, s_rel, s_channel, bias, out, group_size, codebook):
-    """The fp16-activation multi-row kernel: products resolved by v_dot2_f32_f16 off a
-    packed fp16 level table, which needs 36-59 VGPRs instead of 122-240 and therefore
-    runs two to four blocks per CU. Takes fp16 x, 2..8 rows, and is opt-in because the
-    16 levels round to fp16 (~2e-4 relative, systematic).
+    """The fp16-activation kernel: products resolved by v_dot2_f32_f16 off a packed
+    fp16 level table, which needs 30-59 VGPRs instead of 94-240 and therefore runs two
+    to four blocks per CU. Takes fp16 x, 1..8 rows, and is opt-in because a
+    codebook's 16 levels round to fp16 (2e-4 relative; the uniform code - 8 grid is
+    exact and gains nothing but speed).
     """
     lib = _load()
     rows = x.shape[0]
-    if (lib is None or rows < 2 or rows > 8 or x.dtype != torch.float16
+    if (lib is None or rows > 8 or x.dtype != torch.float16
             or not _accepted(x, qdata, s_rel, s_channel, bias, out, group_size, codebook)):
         return False
     return _launch_multi(lib.gfx906_w4a16_h, x, qdata, s_rel, s_channel, bias, out,

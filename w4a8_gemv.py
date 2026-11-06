@@ -391,7 +391,7 @@ def linear_dequant(x, qdata, s_rel, s_channel, bias, out_dtype, group_size,
     out = torch.empty((m, n), device=x.device, dtype=out_dtype)
     # The fp16-activation kernel takes x unconverted, so it has to be tried before
     # the cast it skips. It is opt-in because it resolves the 16 levels in fp16.
-    if (rows > 1 and x.dtype == torch.float16 and not convrot_groupsize
+    if (x.dtype == torch.float16 and not convrot_groupsize
             and hip_w4a16.enabled() and hip_w4a16.f16_enabled()):
         if hip_w4a16.linear_dequant_h(x, qdata, s_rel, s_channel, bias, out, group_size, lut):
             return out

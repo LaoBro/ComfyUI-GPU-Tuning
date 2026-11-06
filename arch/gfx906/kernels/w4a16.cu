@@ -1,9 +1,9 @@
 // gfx906 W4A16 decode GEMV: packed int4 weights decoded in registers, fp16
 // activations, fp32 accumulate. Three entries, all reached through
 // w4a8_gemv.linear_dequant: w4a16_gemv for the single-row te=default decode,
-// w4a16_gemv_m for m = 2..8 with fp32 activations, and w4a16_gemv_h for the same
-// m = 2..8 shape with fp16 activations and v_dot2_f32_f16 (opt-in: it rounds the
-// 16 codebook levels to fp16).
+// w4a16_gemv_m for m = 2..8 with fp32 activations, and w4a16_gemv_h for any
+// m = 1..8 with fp16 activations and v_dot2_f32_f16 (opt-in: it rounds the 16
+// codebook levels to fp16).
 //
 // Layout follows the read micro-benchmark in docs/HIP_KERNELS.md: a row is split
 // over KP=32 lanes so one wavefront's 64 lanes stream 8 rows x 16 bytes each, and
@@ -475,15 +475,16 @@ extern "C" int gfx906_w4a16_m(const void* x, const void* wq, const void* srel, c
     return hipGetLastError() == hipSuccess ? 0 : (int)hipGetLastError();
 }
 
-// Same contract as gfx906_w4a16_m, but x is the *fp16* activation rows (no
-// conversion happens here) and the levels resolve through the packed fp16 table.
+// Same contract as gfx906_w4a16_m down to m = 1, but x is the *fp16* activation
+// rows (no conversion happens here) and the levels resolve through the packed
+// fp16 table. At m = 1 this is the single-row decode with M = 1, not a padded M.
 extern "C" int gfx906_w4a16_h(const void* x, const void* wq, const void* srel, const void* sch,
                               const void* bias, void* out, const void* cb, int m, int n, int k,
                               int gs, int out_f16, int has_cb, int has_bias,
                               int64_t srel_stride, void* stream)
 {
-    if (m < 2 || m > 8 || n < 1 || k % BK || gs < 32 || gs % 32 || BK % gs) return -3;
-    const int M = m > 4 ? 8 : m > 2 ? 4 : 2;
+    if (m < 1 || m > 8 || n < 1 || k % BK || gs < 32 || gs % 32 || BK % gs) return -3;
+    const int M = m > 4 ? 8 : m > 2 ? 4 : m > 1 ? 2 : 1;
     const int groups = (n + BN - 1) / BN;
     const int grid = groups < MAX_BLOCKS ? groups : MAX_BLOCKS;
     hipStream_t st = (hipStream_t)stream;
@@ -497,7 +498,10 @@ extern "C" int gfx906_w4a16_h(const void* x, const void* wq, const void* srel, c
         if (has_cb) LAUNCHH(MM, true); else LAUNCHH(MM, false);                        \
     } while (0)
 
-    if (M == 2) DISPATCHH(2); else if (M == 4) DISPATCHH(4); else DISPATCHH(8);
+    if (M == 1) DISPATCHH(1);
+    else if (M == 2) DISPATCHH(2);
+    else if (M == 4) DISPATCHH(4);
+    else DISPATCHH(8);
 #undef DISPATCHH
 #undef LAUNCHH
     return hipGetLastError() == hipSuccess ? 0 : (int)hipGetLastError();
