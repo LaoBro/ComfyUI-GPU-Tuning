@@ -134,6 +134,15 @@ load 阶段只会增加 VGPR 和私有拷贝，实测是负结果。
 **留一个开关。** 任何手写内核都要能被单独关掉，用来 A/B、用来在本机 HIP
 不兼容时回退。开关名跟现有的 `COMFY_GFX906_*` 保持一致的风格。
 
+**本卡没有可用的 eager int8 矩阵乘。** `torch._int_mm` 在本机的 hipblasLt 上（缺
+`TensileLibrary_lazy_gfx906.dat`）m=1/16/64/1024 全部抛 `HIPBLAS_STATUS_INVALID_VALUE`，
+所以 comfy-kitchen 的 triton 后端在这里不是「可选加速」。`COMFY_GFX906_TRITON_BACKEND=off`
+只该用于 A/B 本包没覆盖的操作（4096x4096：`quantize_int8_rowwise` 113.7→381.3 us、
+`dequantize_per_tensor_fp8` 666.9→863.4 us）。本包在 triton 和 eager 两个后端的
+`int8_linear` 上都装了同一层路由（GEMV → HIP int8 GEMM → triton 内核兜底），所以这个
+开关不改变 int8 线性的落点，也不会让 2..127 行的批掉进 eager 报错 —— 那一档既不在
+GEMV（只接 m=1）也不在 HIP GEMM（`MIN_ROWS=128`）里。
+
 ## 参考资料
 
 - **本仓库的实测记录**：`gfx906fix/hip_attn_v2/NOTES.md`（融合注意力全过程、

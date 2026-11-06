@@ -104,6 +104,7 @@ _state = {
     "te_patched": False,
     "te_attention": "default",
     "triton_backend": None,
+    "triton_refused_logged": False,
     "replaced_backend": None,
     "default_int8_configs": None,
     "w4a8": None,
@@ -873,29 +874,15 @@ def te_plain_gemv(module, x, compute_dtype=None, want_requant=False, weight_only
     return out.view(*x.shape[:-1], out.shape[-1])
 
 
-def patch_int8_tile_switch():
-    """Pick the int8 tile per call.
+def _raw_int8_linear(module):
+    """The kitchen int8_linear behind our wrapper, or None when it is absent."""
+    fn = getattr(module, "int8_linear", None)
+    if fn is None:
+        return None
+    return getattr(fn, "_gfx906_previous", fn)
 
-    The dispatch resolves the backend function by name on every call, and the
-    registered backend is the package module (which re-exports the kernel
-    function), not the quantization submodule, so both are wrapped.
-    """
-    try:
-        import comfy_kitchen.backends.triton as triton_backend
-        from comfy_kitchen.backends.triton import quantization
-    except ImportError:
-        return False
-    previous = getattr(triton_backend, "int8_linear", None)
-    if previous is None:
-        return False
-    if getattr(previous, "_gfx906_tile_switch", False):
-        return True
 
-    _state["gemv_module"] = load_int8_gemv()
-    _state["gemv_model"] = feature_on("gemv")
-    gemm_module = _hip_int8_gemm()
-    _state["hip_gemm_module"] = gemm_module if (gemm_module is not None and gemm_module.available()) else None
-
+def _routed_int8_linear(previous):
     def int8_linear(x, weight, weight_scale, bias=None, out_dtype=torch.bfloat16, convrot=False,
                     convrot_groupsize=256, input_act=None, input_act_weight=None,
                     input_act_eps=0.0, residual=None, residual_scale=None):
@@ -917,8 +904,48 @@ def patch_int8_tile_switch():
                         input_act, input_act_weight, input_act_eps, residual, residual_scale)
 
     int8_linear._gfx906_tile_switch = True
-    triton_backend.int8_linear = int8_linear
-    quantization.int8_linear = int8_linear
+    int8_linear._gfx906_previous = previous
+    return int8_linear
+
+
+def patch_int8_tile_switch():
+    """Put this pack's kernels in front of every int8_linear dispatch can pick.
+
+    The dispatch resolves the backend function by name on every call, and the
+    registered backend is the package module (which re-exports the kernel
+    function), not the quantization submodule, so both are wrapped. The triton
+    and the eager backend both get it: COMFY_GFX906_TRITON_BACKEND=off moves
+    dispatch to eager, and int8 linear has to keep serving the same shapes
+    either way. The last resort is the triton kernel in both states because
+    eager's torch._int_mm has no working hipblasLt path on gfx906, so reaching
+    it would only be to fail.
+    """
+    try:
+        import comfy_kitchen.backends.triton as triton_backend
+        from comfy_kitchen.backends.triton import quantization as triton_quantization
+    except ImportError:
+        triton_backend = triton_quantization = None
+    try:
+        import comfy_kitchen.backends.eager as eager_backend
+        from comfy_kitchen.backends.eager import quantization as eager_quantization
+    except ImportError:
+        eager_backend = eager_quantization = None
+    targets = [m for m in (triton_backend, triton_quantization, eager_backend, eager_quantization) if m]
+    if not targets:
+        return False
+    previous = _raw_int8_linear(triton_backend) or _raw_int8_linear(eager_backend)
+    if previous is None:
+        return False
+
+    _state["gemv_module"] = load_int8_gemv()
+    _state["gemv_model"] = feature_on("gemv")
+    gemm_module = _hip_int8_gemm()
+    _state["hip_gemm_module"] = gemm_module if (gemm_module is not None and gemm_module.available()) else None
+
+    for target in targets:
+        current = getattr(target, "int8_linear", None)
+        if current is not None and not getattr(current, "_gfx906_tile_switch", False):
+            target.int8_linear = _routed_int8_linear(previous)
     return True
 
 
@@ -1328,6 +1355,21 @@ def patch_convrot():
     return True
 
 
+def triton_backend_requested():
+    """Whether the comfy-kitchen triton backend should be selectable.
+
+    Unset env + a plain start enables it, which is what the pack has always
+    done; an explicit env value is the A/B knob (eager vs triton for the ops
+    this pack does not cover), and it wins over the command line. With nothing
+    in the env, --disable-triton-backend is a refusal we no longer override.
+    """
+    want = flag_value(os.getenv("COMFY_GFX906_TRITON_BACKEND", ""))
+    if want is not None:
+        return want
+    from comfy.cli_args import args
+    return not args.disable_triton_backend
+
+
 def enable_triton_backend():
     """comfy/quant_ops.py disables the comfy-kitchen triton backend at import
     unless --enable-triton-backend was passed, so turn it back on from here.
@@ -1338,6 +1380,14 @@ def enable_triton_backend():
 
     if registry.is_available("triton"):
         return True
+    if not triton_backend_requested():
+        if not _state.get("triton_refused_logged"):
+            _state["triton_refused_logged"] = True
+            logging.info("gfx906: comfy-kitchen triton backend left off (COMFY_GFX906_TRITON_BACKEND "
+                         "or --disable-triton-backend); kitchen dispatch uses eager for every op this "
+                         "pack does not cover, and eager int8 matmul has no working hipblasLt path on "
+                         "gfx906")
+        return False
     try:
         import triton  # noqa: F401
     except ImportError:
@@ -2271,7 +2321,10 @@ def status():
         w4a8_line = "w4a8 n/a"
     lines = [
         f"arch {_state['arch']}",
-        f"comfy-kitchen triton backend {triton_backend_active()}",
+        f"comfy-kitchen triton backend "
+        + ("on" if triton_backend_active() else
+           "off (COMFY_GFX906_TRITON_BACKEND / --disable-triton-backend; int8 linear keeps this "
+           "pack's kernels, every other kitchen op runs eager)"),
         tile_line,
         small_line,
         gemm_line,
