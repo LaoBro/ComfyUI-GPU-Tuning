@@ -12,7 +12,9 @@ fp16; a codebook rounds its 16 levels (~2.5e-4) so it needs
 COMFY_GFX906_W4A16_F16ACT=1. m > 8, convrot and any other mismatch fall back to Triton.
 
 COMFY_GFX906_W4A16_HIP=off restores the Triton kernel for an A/B run;
-COMFY_GFX906_W4A16_F16ACT=1 also lets a codebook checkpoint use that feed.
+COMFY_GFX906_W4A16_F16ACT=1 also lets a codebook checkpoint use that feed;
+COMFY_GFX906_W4A16_VALU=off restores the tab[16] feed for an A/B run; the
+VALU-built levels are the default for m = 2..4 (m > 4 keeps the table).
 
 The stream is read at call time: torch.cuda.graph() switches current_stream to its
 capture stream, so a cached handle would leave the launch out of the graph.
@@ -21,8 +23,15 @@ import ctypes
 import glob
 import logging
 import os
+import sys
 
 import torch
+
+try:
+    from .kernels import registry as kreg
+except ImportError:                                   # imported as a top-level module
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from kernels import registry as kreg
 
 _LIB = None
 _PROBED = False
@@ -61,7 +70,8 @@ def _load():
         lib = ctypes.CDLL(_SO)
         # An .so built before one of these entries leaves that attribute None and
         # the caller falls back for the shapes it needs.
-        for name in ("gfx906_w4a16", "gfx906_w4a16_m", "gfx906_w4a16_h"):
+        for name in ("gfx906_w4a16", "gfx906_w4a16_m", "gfx906_w4a16_h",
+                     "gfx906_w4a16_mu"):
             try:
                 fn = getattr(lib, name)
                 fn.restype = ctypes.c_int
@@ -90,6 +100,21 @@ def f16_enabled():
     grid is exact in fp16 and the caller uses that feed regardless; with one it rounds
     the 16 levels, a ~2.5e-4 systematic relative error rather than rounding noise."""
     return os.getenv("COMFY_GFX906_W4A16_F16ACT", "0").strip().lower() in ("1", "on", "true", "yes")
+
+
+def valu_enabled():
+    """Explicit env > `feature.w4a16_valu` in the arch manifest > off.
+
+    The measurement gate is tier-3: an unmeasured card keeps the tab[16] feed,
+    one bench run turns VALU on where it won. gfx906 ships measured data, so it
+    is on there. `linear_dequant` still sends m > 4 to the table entry: that
+    shape spills at 256 VGPR and the VALU levels cost more than they save.
+    """
+    explicit = os.getenv("COMFY_GFX906_W4A16_VALU")
+    if explicit is not None and explicit.strip():
+        return explicit.strip().lower() not in ("0", "off", "false", "no")
+    table = kreg.runtime_manifest()
+    return table is not None and table.default_impl("feature.w4a16_valu") == "on"
 
 
 def _accepted(x, qdata, s_rel, s_channel, bias, out, group_size, codebook):
@@ -146,7 +171,10 @@ def linear_dequant(x, qdata, s_rel, s_channel, bias, out, group_size, codebook):
         # it an fp16 row set would read past the plane. m=1 keeps its own fp16 path.
         if x.dtype != torch.float32:
             return False
-        return _launch_multi(lib.gfx906_w4a16_m, x, qdata, s_rel, s_channel, bias, out,
+        entry = lib.gfx906_w4a16_m
+        if codebook is None and lib.gfx906_w4a16_mu is not None and valu_enabled():
+            entry = lib.gfx906_w4a16_mu
+        return _launch_multi(entry, x, qdata, s_rel, s_channel, bias, out,
                              group_size, codebook)
     if lib.gfx906_w4a16 is None:
         return False

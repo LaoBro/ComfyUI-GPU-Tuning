@@ -136,6 +136,14 @@ fp16 激活 + `v_dot2_f32_f16` 的内核（`w4a16_gemv_h`）现在**是均匀格
 1.5 ulp），所以那一档要 `COMFY_GFX906_W4A16_F16ACT=1` 才开，开启前按 `--sampling off`
 重验生文 md5。convrot 路径的激活是 fp32，只走无损 feed，不受这个开关影响。
 
+均匀格点（无 codebook）、fp32 激活的 m=2..4 多行解码现在**默认**把 `tab[16]` 的格点 gather
+换成 `v_cvt_f32_ubyteN`：一个权重 dword 的 8 个 nibble 先在 VALU 里变成 fp32
+格点，不再每权重读一次 LDS 表。深队列实测（graph replay，fp32 out，us/call）
+4096²@m2 58.7→56.8、12288×4096@m2 135.7→131.5、4096²@m4 137.7→128.4、
+12288×4096@m4 301.3→289.1（快 3-7%），m=8 的 481.9/866.4 → 481.0/866.4 打平；
+6 组形状 × fp32/fp16 输出全部逐位一致。`COMFY_GFX906_W4A16_VALU=off` 回落表格做 A/B。
+M=8 自动回落：它本来就在 256 VGPR / spill 53，8 个 asm 输出的活跃区间再压上去会慢 9%。
+
 单条 linear 实测（合成权重，m=1，深队列下的平均墙钟）：
 
 | 形状 | 分块 GEMM | GEMV | 带宽 |
@@ -329,7 +337,7 @@ m ≤ 1 的解码仍走 GEMV；m < 128 直接回落 Triton（128 行 tile 在更
 
 | 设备 | 生效范围 |
 |---|---|
-功能分三类：**常开**（prefix KV、KV decode、llama、TE GEMV、TE int8）、**可选开关**（qkv、qwen35）、**测量门**（int8 tile、attention、w4a8、deltanet、vae、convrot、gemv——没跑过 bench 就是关，跑过之后由本机/出厂 manifest 决定开或关）。
+功能分三类：**常开**（prefix KV、KV decode、llama、TE GEMV、TE int8）、**可选开关**（qkv、qwen35）、**测量门**（int8 tile、attention、w4a8、deltanet、vae、convrot、gemv、w4a16 VALU 格点——没跑过 bench 就是关，跑过之后由本机/出厂 manifest 决定开或关）。
 
 | 设备 | 生效范围 |
 |---|---|
@@ -367,6 +375,7 @@ m ≤ 1 的解码仍走 GEMV；m < 128 直接回落 Triton（128 行 tile 在更
 | `COMFY_GFX906_ROTATE` | `1` | 解码激活旋转的 HIP butterfly 内核；`off` 回落到 Triton 做 A/B。fp16 输入下 HIP 以 fp32 累加，量化激活更准但与 Triton 不等价 |
 | `COMFY_GFX906_W4A16_HIP` | `1` | te=default 4-bit 反量化 GEMV 的 HIP 内核（`arch/gfx906/kernels/w4a16.cu`，m=1 与 m=2..8 两个入口）；`off` 回落到 Triton 的 `dequant_w4a16_kernel` 做 A/B。m>8 或不合形状的批仍走 Triton |
 | `COMFY_GFX906_W4A16_F16ACT` | `0` | 只管**带 codebook** 的检查点是否用 fp16 激活 + `v_dot2_f32_f16` 的 feed（`w4a16_gemv_h`，m=1..8，比无损 feed 快 1.05-4.89x）；代价是 16 个格点退到 fp16（fp32 输出归一化 1.6-2.6e-4、fp16 输出约 1.5 ulp），开启前按 `--sampling off` 重验生文 md5。无 codebook 的检查点不看这个开关，默认就走该 feed（均匀格点在 fp16 里精确） |
+| `COMFY_GFX906_W4A16_VALU` | 空 | **测量门**：缺省时由 `feature.w4a16_valu`（本机/出厂 manifest）决定，出厂表为 `on`；显式 `on`/`off` 覆盖它。均匀格点（无 codebook）的 m=2..4 GEMV 用 `v_cvt_f32_ubyteN` 在 VALU 里构造 16 个格点，替掉 `tab[16]` 的 LDS gather；逐位一致，实测快 3-7%（数字见上文与 docs/HIP_KERNELS.md）。M=8 自动回落表格路径（该形状已 spill），带 codebook 的检查点不看这个开关。`bench.py --w4a16-valu --write` 可重新测并改写判定 |
 | `COMFY_GFX906_TRITON_BACKEND` | 空 | comfy-kitchen 的 triton 后端是否让 dispatch 选：空=跟随启动参数（`--disable-triton-backend` 就不开），`on`/`off` 覆盖它。`off` 让本包没覆盖的 kitchen 操作回落 eager，便于 A/B（实测 4096x4096 上 `quantize_int8_rowwise` 113.7→381.3 us、`dequantize_per_tensor_fp8` 666.9→863.4 us）；int8 linear 不受影响——两个后端的 `int8_linear` 都包了本包的路由，兜底始终是 triton 内核，因为 eager 的 `torch._int_mm` 在本卡每个 m 都抛 `HIPBLAS_STATUS_INVALID_VALUE` |
 
 ## 已知边界

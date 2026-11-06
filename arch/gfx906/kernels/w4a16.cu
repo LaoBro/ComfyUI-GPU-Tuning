@@ -1,9 +1,10 @@
 // gfx906 W4A16 decode GEMV: packed int4 weights decoded in registers, fp16
-// activations, fp32 accumulate. Three entries, all reached through
+// activations, fp32 accumulate. Four entries, all reached through
 // w4a8_gemv.linear_dequant: w4a16_gemv for the single-row te=default decode,
-// w4a16_gemv_m for m = 2..8 with fp32 activations, and w4a16_gemv_h for any
+// w4a16_gemv_m for m = 2..8 with fp32 activations, w4a16_gemv_h for any
 // m = 1..8 with fp16 activations and v_dot2_f32_f16 (opt-in: it rounds the 16
-// codebook levels to fp16).
+// codebook levels to fp16), and w4a16_gemv_mu, the uniform-grid multi-row feed
+// that builds the levels with v_cvt_f32_ubyteN instead of gathering tab[16].
 //
 // Layout follows the read micro-benchmark in docs/HIP_KERNELS.md: a row is split
 // over KP=32 lanes so one wavefront's 64 lanes stream 8 rows x 16 bytes each, and
@@ -41,6 +42,27 @@ __device__ __forceinline__ float srel_decode(uint8_t b)
     const int e = (b >> 3) & 0xF;
     const float man = (float)(b & 7) * 0.125f;
     return e > 0 ? __builtin_exp2f((float)(e - 7)) * (1.0f + man) : man * __builtin_exp2f(-6.0f);
+}
+
+// Building the four levels of a nibble plane with v_cvt_f32_ubyteN: each byte
+// of `even`/`odd` already holds one 0..15 code, so extract + int->float is one
+// instruction instead of v_bfe + v_add + v_cvt. float(code) - 8 is exact.
+__device__ __forceinline__ void uniform_levels_ubyte(uint32_t even, uint32_t odd, float* lv)
+{
+    float e[4], o[4];
+    asm("v_cvt_f32_ubyte0 %0, %1" : "=v"(e[0]) : "v"(even));
+    asm("v_cvt_f32_ubyte1 %0, %1" : "=v"(e[1]) : "v"(even));
+    asm("v_cvt_f32_ubyte2 %0, %1" : "=v"(e[2]) : "v"(even));
+    asm("v_cvt_f32_ubyte3 %0, %1" : "=v"(e[3]) : "v"(even));
+    asm("v_cvt_f32_ubyte0 %0, %1" : "=v"(o[0]) : "v"(odd));
+    asm("v_cvt_f32_ubyte1 %0, %1" : "=v"(o[1]) : "v"(odd));
+    asm("v_cvt_f32_ubyte2 %0, %1" : "=v"(o[2]) : "v"(odd));
+    asm("v_cvt_f32_ubyte3 %0, %1" : "=v"(o[3]) : "v"(odd));
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        lv[2 * j] = e[j] - 8.0f;
+        lv[2 * j + 1] = o[j] - 8.0f;
+    }
 }
 
 // One weight dword = 8 nibbles, byte j holding k = 8w + 2j in its low nibble and
@@ -174,7 +196,7 @@ w4a16_gemv(const void* __restrict__ xsrc, const uint32_t* __restrict__ wq,
 // column. w4a16_gemv_h below trades that for fp16 activations.
 #define WORDS (ROWK / 8)                  // weight dwords per lane per chunk
 
-template <int M, bool CB, bool OUT_F16, bool HAS_BIAS>
+template <int M, bool CB, bool OUT_F16, bool HAS_BIAS, bool UBYTE>
 __global__ void __launch_bounds__(NT, 1)
 w4a16_gemv_m(const float* __restrict__ x, const uint32_t* __restrict__ wq,
              const uint8_t* __restrict__ srel, const float* __restrict__ sch,
@@ -191,8 +213,11 @@ w4a16_gemv_m(const float* __restrict__ x, const uint32_t* __restrict__ wq,
     const __half* bias_h = (const __half*)bias;
     const float* bias_f = (const float*)bias;
 
-    if (tid < 16) tab[tid] = CB ? cb[tid] : (float)tid - 8.0f;
-    __syncthreads();
+    constexpr bool USE_UBYTE = UBYTE && !CB;
+    if constexpr (!USE_UBYTE) {
+        if (tid < 16) tab[tid] = CB ? cb[tid] : (float)tid - 8.0f;
+        __syncthreads();
+    }
 
     const int gi_total = (groups - blockIdx.x + gridDim.x - 1) / gridDim.x;
     for (int gb = 0; gb < gi_total; gb += GB) {
@@ -228,10 +253,14 @@ w4a16_gemv_m(const float* __restrict__ x, const uint32_t* __restrict__ wq,
                     const uint32_t even = t.w[i] & 0x0F0F0F0F;
                     const uint32_t odd = (t.w[i] >> 4) & 0x0F0F0F0F;
                     float lv[8];
+                    if constexpr (USE_UBYTE) {
+                        uniform_levels_ubyte(even, odd, lv);
+                    } else {
 #pragma unroll
-                    for (int j = 0; j < 4; ++j) {
-                        lv[2 * j] = tab[(even >> (8 * j)) & 0xFF];
-                        lv[2 * j + 1] = tab[(odd >> (8 * j)) & 0xFF];
+                        for (int j = 0; j < 4; ++j) {
+                            lv[2 * j] = tab[(even >> (8 * j)) & 0xFF];
+                            lv[2 * j + 1] = tab[(odd >> (8 * j)) & 0xFF];
+                        }
                     }
                     const int k0 = part * 4 + (i * 2) * QUAD;
 #pragma unroll
@@ -438,10 +467,11 @@ extern "C" int gfx906_w4a16(const void* x, const void* wq, const void* srel, con
 
 // m rows of activations against the same weight plane. M is m rounded up to 2/4/8
 // so the row loop unrolls; the phantom rows stage zeros and are dropped at the store.
-extern "C" int gfx906_w4a16_m(const void* x, const void* wq, const void* srel, const void* sch,
-                              const void* bias, void* out, const void* cb, int m, int n, int k,
-                              int gs, int out_f16, int has_cb, int has_bias,
-                              int64_t srel_stride, void* stream)
+template <bool UBYTE>
+static int launch_w4a16_m(const void* x, const void* wq, const void* srel, const void* sch,
+                          const void* bias, void* out, const void* cb, int m, int n, int k,
+                          int gs, int out_f16, int has_cb, int has_bias,
+                          int64_t srel_stride, void* stream)
 {
     if (m < 2 || m > 8 || n < 1 || k % BK || gs < 32 || gs % 32 || BK % gs) return -3;
     const int M = m > 4 ? 8 : m > 2 ? 4 : 2;
@@ -450,7 +480,7 @@ extern "C" int gfx906_w4a16_m(const void* x, const void* wq, const void* srel, c
     hipStream_t st = (hipStream_t)stream;
     const float* cbw = (const float*)cb;
 #define LAUNCHM(MM, CB, OF, HB)                                                      \
-    w4a16_gemv_m<MM, CB, OF, HB><<<grid, NT, 0, st>>>((const float*)x,               \
+    w4a16_gemv_m<MM, CB, OF, HB, UBYTE><<<grid, NT, 0, st>>>((const float*)x,          \
         (const uint32_t*)wq, (const uint8_t*)srel, (const float*)sch, bias, out,     \
         cbw, m, n, k, gs, srel_stride)
 #define DISPATCHM(MM, CB, IOF)                                                       \
@@ -474,6 +504,30 @@ extern "C" int gfx906_w4a16_m(const void* x, const void* wq, const void* srel, c
 #undef DISPATCHM
 #undef LAUNCHM
     return hipGetLastError() == hipSuccess ? 0 : (int)hipGetLastError();
+}
+
+extern "C" int gfx906_w4a16_m(const void* x, const void* wq, const void* srel, const void* sch,
+                               const void* bias, void* out, const void* cb, int m, int n, int k,
+                               int gs, int out_f16, int has_cb, int has_bias,
+                               int64_t srel_stride, void* stream)
+{
+    return launch_w4a16_m<false>(x, wq, srel, sch, bias, out, cb, m, n, k, gs,
+                                 out_f16, has_cb, has_bias, srel_stride, stream);
+}
+
+// Uniform-grid feed: levels come from v_cvt_f32_ubyteN instead of tab[16] gathers.
+// M=8 is already at 256 VGPR with spills; holding eight asm-produced levels live
+// across the FMA chain costs another ~9% there, so that shape keeps the table.
+extern "C" int gfx906_w4a16_mu(const void* x, const void* wq, const void* srel, const void* sch,
+                                const void* bias, void* out, const void* cb, int m, int n, int k,
+                                int gs, int out_f16, int has_cb, int has_bias,
+                                int64_t srel_stride, void* stream)
+{
+    if (m > 4)
+        return launch_w4a16_m<false>(x, wq, srel, sch, bias, out, cb, m, n, k, gs,
+                                     out_f16, has_cb, has_bias, srel_stride, stream);
+    return launch_w4a16_m<true>(x, wq, srel, sch, bias, out, cb, m, n, k, gs,
+                                out_f16, has_cb, has_bias, srel_stride, stream);
 }
 
 // Same contract as gfx906_w4a16_m down to m = 1, but x is the *fp16* activation

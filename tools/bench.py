@@ -7,7 +7,7 @@
     ... --site w4a8.m1 --shapes 4096x4096@m1,4096x4096@m8
 
     # everything one card needs: GEMV backends, int8 GEMM tiles, attention tiles,
-    # DeltaNet / VAE / ConvRot against their real fallbacks
+    # DeltaNet / VAE / ConvRot / W4A16 VALU against their real fallbacks
     ... --all
 
     # write it back (local override, does not touch the shipped file)
@@ -19,8 +19,8 @@
 --all is what fills a card's measurement gates: after one run the int8 linear
 list holds a single tile, attention has a tile per head dim and a measured
 kernel mode, the GEMV sites have a winner per shape, and every feature whose
-fastest form differs per card (gemv, w4a8, deltanet, vae, convrot, vision) has an
-on/off record against its real fallback.
+fastest form differs per card (gemv, w4a8, deltanet, vae, convrot, w4a16_valu,
+vision) has an on/off record against its real fallback.
 
 The pipeline per shape is fixed, in this order:
 
@@ -119,6 +119,11 @@ VAE_SITE = "vae.decode"
 VAE_SHAPES = "512x64,512x128"
 CONVROT_SITE = "convrot.mode"
 CONVROT_SHAPES = "1x4096,128x4096"
+# Uniform-grid W4A16 multi-row GEMV: tab[16] LDS gather vs VALU-built levels.
+# m > 4 is left out: the kernel routes those rows to the table itself (M=8
+# already spills), so they carry no signal about the gate.
+W4A16_VALU_SITE = "w4a16.valu"
+W4A16_VALU_SHAPES = "4096x4096@m2,4096x4096@m4,12288x4096@m2,12288x4096@m4"
 # Qwen3.5 image tower patch projection: patches x embed dim. 3024x1152 is what a
 # 1160x679 image gives the 9B; the rest are a small and a large image.
 VISION_SITE = "vision.patch_embed"
@@ -193,6 +198,11 @@ def parse_args():
                         help="also time depth-1 Conv3d: torch vs the conv2d squeeze vs kitchen")
     parser.add_argument("--convrot", action="store_true",
                         help="also time ConvRot activation prep: kitchen rotation vs ours")
+    parser.add_argument("--w4a16-valu", action="store_true",
+                        help="also time the uniform-grid W4A16 multi-row feed with and without "
+                             "VALU-built levels; writes feature.w4a16_valu")
+    parser.add_argument("--w4a16-valu-shapes", default=W4A16_VALU_SHAPES,
+                        help="NxK@mM list for the W4A16 VALU benchmark (2 <= m <= 4)")
     parser.add_argument("--vision", action="store_true",
                         help="also time the image tower patch projection: shipped conv3d vs the GEMM")
     parser.add_argument("--qwen35", action="store_true",
@@ -205,7 +215,7 @@ def parse_args():
                         help="prefill length used for the comparison")
     parser.add_argument("--all", action="store_true",
                         help="the whole table in one run: --tile + --attention + --deltanet + "
-                             "--vae + --convrot + --vision + --qwen35 + the GEMV sites")
+                             "--vae + --convrot + --w4a16-valu + --vision + --qwen35 + the GEMV sites")
     parser.add_argument("--deltanet-shapes", default=DELTANET_SHAPES,
                         help="BxHVxDKxDVxS list for the DeltaNet decode benchmark")
     parser.add_argument("--deltanet-prefill-shapes", default=DELTANET_PREFILL_SHAPES,
@@ -1236,6 +1246,103 @@ def run_convrot_site(args, today):
     return records, defaults
 
 
+def run_w4a16_valu_site(args, today):
+    """Time the uniform-grid W4A16 multi-row GEMV with and without VALU levels.
+
+    `table` gathers the 16 levels from tab[16] in LDS, `valu` builds them with
+    v_cvt_f32_ubyteN. Both go through hip_w4a16.linear_dequant, so the ratio is
+    the pure cost of the gather. Deep-queue timing matters here: the gain is
+    3-7%, which a single-launch event interval swamps (docs/HIP_KERNELS.md).
+    The verdict becomes feature.w4a16_valu; the shape rows are evidence.
+    """
+    import hip_w4a16 as hip
+
+    lib = hip._load()
+    if lib is None or lib.gfx906_w4a16_mu is None:
+        print("\n  w4a16 valu: HIP W4A16 kernel unavailable, skipped")
+        return {}, {}
+
+    def deep_ms(fn):
+        for _ in range(args.warmup):
+            fn()
+        torch.cuda.synchronize()
+        start, end = torch.cuda.Event(True), torch.cuda.Event(True)
+        start.record()
+        for _ in range(max(200, args.iters * 40)):
+            fn()
+        end.record()
+        torch.cuda.synchronize()
+        return start.elapsed_time(end) / max(200, args.iters * 40)
+
+    group = args.w4a8_group
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    records, ratios = {}, {}
+    saved = os.environ.get("COMFY_GFX906_W4A16_VALU")
+    try:
+        for item in args.w4a16_valu_shapes.split(","):
+            size, _, mtext = item.strip().partition("@m")
+            n, _, k = size.partition("x")
+            n, k, m = int(n), int(k), int(mtext or 2)
+            key = f"{n}x{k}@m{m}"
+            if k % 1024 or k % group or not 2 <= m <= 4:
+                print(f"\n  {key} skipped: need k divisible by 1024 and {group}, 2 <= m <= 4")
+                continue
+            qdata = torch.randint(0, 256, (n, k // 2), device="cuda", dtype=torch.uint8,
+                                  generator=gen)
+            s_rel = (torch.rand(n, k // group, device="cuda", dtype=torch.float32, generator=gen)
+                     * 14.5 + 1.0).to(torch.float8_e4m3fn).to(torch.float32).contiguous()
+            s_channel = torch.rand(n, device="cuda", dtype=torch.float32,
+                                   generator=gen) * 0.01 + 1e-3
+            x = torch.randn(m, k, device="cuda", dtype=torch.float32, generator=gen)
+            expected = x @ refs.w4a8_weight(qdata, s_rel, s_channel, group, None).T
+            out = torch.empty((m, n), device="cuda", dtype=torch.float32)
+            s8 = s_rel.to(torch.float8_e4m3fn)
+            print(f"\n  {key} (uniform grid, fp32 activations)")
+
+            times, errors = {}, {}
+            for name, mode in (("table", "off"), ("valu", "on")):
+                os.environ["COMFY_GFX906_W4A16_VALU"] = mode
+
+                def call():
+                    return hip.linear_dequant(x, qdata, s8, s_channel, None, out, group, None)
+
+                try:
+                    if not call():
+                        raise RuntimeError("linear_dequant declined the shape")
+                    torch.cuda.synchronize()
+                except Exception as exc:            # noqa: BLE001 - a HIP launch may fail here
+                    print(f"    {name:<8} unavailable: {type(exc).__name__}: {exc}")
+                    continue
+                error = refs.rel(out, expected)
+                if error > args.max_rel:
+                    print(f"    {name:<8} REJECTED: rel {error:.2e} > {args.max_rel:.0e}")
+                    continue
+                errors[name] = error
+                times[name] = deep_ms(call)
+                print(f"    {name:<8} {times[name] * 1000:8.1f} us  rel {error:.1e}")
+            if "table" not in times or "valu" not in times:
+                continue
+            ratios[key] = times["valu"] / times["table"]
+            records.setdefault(W4A16_VALU_SITE, {})[key] = manifest_write.render(
+                key, min(times, key=times.get), times, rel=errors[min(times, key=times.get)],
+                date=today, note="uniform grid, fp32 activations, deep queue")
+    finally:
+        if saved is None:
+            os.environ.pop("COMFY_GFX906_W4A16_VALU", None)
+        else:
+            os.environ["COMFY_GFX906_W4A16_VALU"] = saved
+
+    defaults = {}
+    if ratios:
+        gain = 1.0 - statistics.median(ratios.values())
+        defaults["feature.w4a16_valu"] = "on" if gain >= args.min_gain else "off"
+        print(f"\n  w4a16 valu: VALU {gain:+.1%} against the table, "
+              f"feature.w4a16_valu={defaults['feature.w4a16_valu']}")
+    else:
+        print("\n  w4a16 valu: nothing comparable measured, leaving feature.w4a16_valu alone")
+    return records, defaults
+
+
 def target_path(args, arch):
     if args.out:
         return Path(args.out).expanduser()
@@ -1333,7 +1440,8 @@ def main():
 
     want_tile = args.tile or (args.all and not tile_unused)
     want_attn = args.attention or (args.all and not attn_unused)
-    if want_tile or want_attn:
+    want_w4a16_valu = args.w4a16_valu or args.all
+    if want_tile or want_attn or want_w4a16_valu:
         ensure_hip_kernels()
     if args.all and (tile_unused or attn_unused):
         parts = [name for name, skip in (("tile", tile_unused), ("attention", attn_unused)) if skip]
@@ -1363,6 +1471,10 @@ def main():
         defaults.update(choices)
     if args.convrot or args.all:
         records, choices = run_convrot_site(args, today)
+        written.update(records)
+        defaults.update(choices)
+    if want_w4a16_valu:
+        records, choices = run_w4a16_valu_site(args, today)
         written.update(records)
         defaults.update(choices)
     if args.qwen35 or args.all:

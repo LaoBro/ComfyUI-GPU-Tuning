@@ -434,6 +434,20 @@ def load_w4a8_gemv():
         return None
 
 
+def load_hip_w4a16():
+    """Import the W4A16 HIP loader, which owns the VALU measurement gate."""
+    try:
+        from . import hip_w4a16
+        return hip_w4a16
+    except ImportError:
+        pass
+    try:
+        import hip_w4a16
+        return hip_w4a16
+    except ImportError:
+        return None
+
+
 def load_manifest():
     """The measurement-manifest module, or None when the package is incomplete."""
     try:
@@ -2280,6 +2294,11 @@ def status():
     hip_gemm = _state.get("hip_gemm_module")
     gemm_line = ("int8 gemm hip " + ("on" if _state.get("int8_gemm_enabled", True) else "off")
                  + f" ({_state.get('hip_gemm_calls', 0)} calls)") if hip_gemm is not None else "int8 gemm hip n/a"
+    w4a16 = load_hip_w4a16()
+    valu_line = ("w4a16 VALU levels " + ("on" if w4a16.valu_enabled() else "off")
+                 + (" (env)" if os.getenv("COMFY_GFX906_W4A16_VALU") else
+                    " (measured)" if measured_state() == "measured" else "")) \
+        if w4a16 is not None else "w4a16 VALU levels n/a"
     prefix_patched = _state.get("prefix_kv_patched")
     if not prefix_patched:
         prefix_line = "prefix kv n/a"
@@ -2329,6 +2348,7 @@ def status():
         small_line,
         gemm_line,
         f"convrot {_state['convrot_mode'] or 'off'}",
+        valu_line,
         f"qkv {'one int8 gemm' if _state.get('qkv') else 'off'}"
         + (f", {_state['qkv_calls']} fused / {_state.get('qkv_fallbacks', 0)} fallback"
            if _state.get("qkv_calls") or _state.get("qkv_fallbacks") else ""),

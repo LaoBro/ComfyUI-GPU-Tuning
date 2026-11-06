@@ -73,6 +73,18 @@ default_grade = "measured"
 default = "on"
 default_grade = "measured"
 
+# Uniform-grid W4A16 multi-row GEMV: VALU-built levels beat the tab[16] LDS gather
+# on this card. The kernel itself keeps the table for m > 4 (M=8 spills at 256 VGPR).
+[sites."feature.w4a16_valu"]
+default = "on"
+default_grade = "measured"
+
+[sites."w4a16.valu".shapes]
+"4096x4096@m2" = { impl = "valu", ms = { table = 0.0737387, valu = 0.057049 }, rel = 2.99e-07, grade = "measured", date = "2026-11-07", note = "uniform grid, fp32 activations, deep queue" }
+"4096x4096@m4" = { impl = "valu", ms = { table = 0.139042, valu = 0.130002 }, rel = 3.78e-07, grade = "measured", date = "2026-11-07", note = "uniform grid, fp32 activations, deep queue" }
+"12288x4096@m2" = { impl = "valu", ms = { table = 0.137921, valu = 0.131256 }, rel = 2.12e-06, grade = "measured", date = "2026-11-07", note = "uniform grid, fp32 activations, deep queue" }
+"12288x4096@m4" = { impl = "valu", ms = { table = 0.307734, valu = 0.289908 }, rel = 2.04e-06, grade = "measured", date = "2026-11-07", note = "uniform grid, fp32 activations, deep queue" }
+
 [sites."feature.te_dequant"]
 default = "on"
 default_grade = "measured"

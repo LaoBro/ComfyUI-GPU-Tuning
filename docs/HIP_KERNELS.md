@@ -257,6 +257,41 @@ int8 GEMM 的波形 sweep（4032x12288x4096）：2 波 5.75、4 波 9.64、
 配置 sweep：128 累加器 spill 364 B、BK=64 spill 376 B，只有 TM8/TN8
 不 spill。bank conflict 是首版 3.4 TMAC/s 的全部原因。
 
+### 均匀格点的 VALU 化（`w4a16_gemv_m` / `gfx906_w4a16_mu`）
+
+这一格是 fp32 激活的多行解码（`w4a8_gemv.linear_dequant` 先把 x 转成 fp32）；
+fp16 激活走 `w4a16_gemv_h`，不受影响。均匀格点（无 codebook）的 16 个 level
+就是 `code - 8`，在 fp32 里精确，所以不必查 LDS 表：`v_cvt_f32_ubyteN` 一条指令
+把权重 dword 每个字节里的 nibble 取出并转成 fp32，8 条 asm 就够一个 dword 的
+8 个格点，`float(code) - 8` 再减一次，同时消掉 `tab[16]` 的表初始化和那条
+barrier。**逐位一致**，不需要重验 md5。
+
+深队列 graph replay（fp32 out，us/call，本机 gfx906）：
+
+| 形状 | 表格 | VALU | 比值 |
+|---|---|---|---|
+| 4096x4096 @m2 gs128 | 58.70 | 56.80 | 0.968 |
+| 12288x4096 @m2 gs128 | 135.70 | 131.50 | 0.969 |
+| 4096x4096 @m4 gs256 | 137.74 | 128.45 | 0.933 |
+| 12288x4096 @m4 gs256 | 301.31 | 289.13 | 0.960 |
+| 4096x4096 @m8 gs128 | 481.87 | 480.95 | 0.998 |
+| 12288x4096 @m8 gs128 | 866.39 | 866.41 | 1.000 |
+
+6 组形状 × fp32/fp16 输出全部 `torch.equal` 为真，对 fp32 参考的 relL2 与表格路径
+相同（3e-7 ~ 1.1e-6）。**进测量门**：`feature.w4a16_valu` 决定缺省开关，出厂
+gfx906 表为 `on`，没跑过 bench 的卡为 `off`；`COMFY_GFX906_W4A16_VALU=on/off`
+显式覆盖。`bench.py --w4a16-valu --write` 重测四个 m=2..4 形状并改写判定与
+`w4a16.valu` 记录（3% 的 `--min-gain` 门槛，深队列计时）：本机 VALU 比表格快
+6.1%（中位数）。带 codebook 的检查点仍走表格。m>4 在入口处回落表格：M=8 本来
+就是 256 VGPR / spill 53，8 个 asm 输出的活跃区间再压上去要慢 9%。
+
+判定要点，别按指令数下结论：`asm volatile` 版只有 585 条指令（表格 614、
+plain VALU 601，是三者最少），却最慢（m8 +15%）——`volatile` 把 8 条转换钉成
+一整块，编译器无法插进 FMA 链隐藏延迟；去掉 `volatile` 才拿到上面的收益。
+LDS gather 本来就被 FMA 发射掩盖，赢的是**调度**不是字节数。fp16 点积那条
+（`w4a16_gemv_h`）反过来：格点要转 fp16 而 `v_cvt_pk_f16_f32` 在 gfx906 不存在，
+VALU 链净增 90 条指令，慢 5-8%，已删。
+
 ## 深队列下的 decode GEMV 余量
 
 内核本身的耗时：300 次连续提交、只在两端同步，convrot 关，`w8a16` / `w4a16` 的激活
@@ -295,11 +330,9 @@ program 数够多时这张卡能吃满流式带宽（lm_head 的 int8 GEMV 连�
   循环倒置把 pack 从「每 8 行一次」摊到「每 chunk 一次、供 32 个 row-group 复用」，
   pack 相位从 44-46% 掉到 7-25%，同一进程内配对 A/B 实测 **1.19-1.45x**（原因见下面
   相位一节，比按份额折算的 1.3-1.8x 少）。
-  剩下的 2.3-4.3x 里，最后一次每权重的 LDS 读是 codebook gather：换到 VALU（`v_perm_b32`
-  解析 int8 格点 + `v_cvt_f32_i32_sdwa BYTE_n`，ISA 笔记确认这两条在 gfx906 都有）
-  能把 LDS:global 从 5:1 压到 1:1，代价是 level 回到 int8 格点（~4e-3），要么刻意
-  对齐精度要么按坑点重验 md5。这一条最终是用 fp16 格点表 + `v_dot2_f32_f16` 落地的
-  （见下一节，`F16ACT` 开关），VALU 解析那条仍未试。**每 lane 在飞 load 数已试并被否**：预取下一块的
+  剩下的 2.3-4.3x 里，最后一次每权重的 LDS 读是 codebook gather。`F16ACT` 那条
+  已经用 fp16 格点表 + `v_dot2_f32_f16` 落地；VALU 解析后来也试了，结论见下面
+  「均匀格点的 VALU 化」。**每 lane 在飞 load 数已试并被否**：预取下一块的
   uint4（+4 VGPR）没有收益，k=12288（12 个块）反而慢 17%。
 - Triton 侧的替代方案已经量过并否掉（fp16 大 dot 慢 1.6-7 倍，PORTING.md 附录 E），
   而「nibble 留在字里 + packed fp16 成对点积」（`v_dot2_f32_f16`，两端本来就是
@@ -410,6 +443,8 @@ program 数够多时这张卡能吃满流式带宽（lm_head 的 int8 GEMV 连�
 | 注意力 PV 换成 fp16 累加（`v_pk_fma_f16`，64 个累加器减到 32） | 没落地，动手前先被微基准否掉：4 波 6.28 对 dot2 7.11 TMAC/s（指令数同为 2 MAC/条，发射率更低），还要多一次 P 广播、丢掉键内两两归约；且 LDS 65536 B 已把占用率钉在 1 block/CU，省下的寄存器换不来波数 |
 | 多行内核把激活块提到寄存器里跨列复用（省掉每列一次 b128 读） | 中性偏负：等 chunk 宽 0.85-1.08x，M=8 还得把 chunk 砍到 512 才装得下，0.85-0.89x。份额模型预测 2.3 TMAC/s，实测更慢 —— 那些 LDS 读被 dot2 发射掩盖了，不在关键路径上 |
 | `tl.reduce(combine_fn=v_dot4)` 用满累加操作数 | 表达不了：reduce 的叶子值必须是待归约元素本身，`(w, a)` 双流喂进 c 槽会把权重原值当部分和加上。只剩先 `dot4(w,a,0)` 再求和，即现状。累加链在 HIP 里才免费（`int8_gemm.cu` 的 `__builtin_amdgcn_sdot4`） |
+| `w4a16_gemv_h` 用 VALU 构造 fp16x2 格点替掉 `tab2` gather | 逐位一致但**慢 5-8%**（m1 1.03、m8 1.08）：消掉 16 次 LDS 读，换来 32 条 `v_cvt_f32_i32` + 33 条 `v_cvt_f16_f32` + 30 条加减的串行链（465→555 条指令）。`v_cvt_pk_f16_f32` 在 gfx906 不存在，链短不了；LDS gather 本来被 dot2 发射掩盖。已删除 |
+| 同上，但格点用 `v_cvt_f32_ubyteN`（`w4a16_gemv_m`，fp32 FMA 路径） | 585 条指令，是三种形态里**最少**的，却最慢（m8 +15%）：`asm volatile` 把 8 条转换钉成一块，编译器无法把它们插进 FMA 链隐藏延迟。去掉 `volatile` 后 m2/m4 快 3-7%、m8 仍慢 9% —— M=8 本来就在 256 VGPR/spill 53，8 个 asm 输出的活跃区间再压上去。按 m≤4 门控后**默认开**（见上面「均匀格点的 VALU 化」）|
 
 这些「不要做」的结论和 gfx906 的 LDS/VGPR 预算绑得很紧；换一张卡，
 结论可能完全反过来。

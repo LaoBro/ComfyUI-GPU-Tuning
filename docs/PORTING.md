@@ -190,6 +190,7 @@ prefix KV 复用、profiler（常开）；qkv（1.6 GB 常驻，默认关）、q
 | `deltanet_prefill` | `feature` 决定 | 与 core 的逐行 UT 变换比，mild/coherent 两档取最差 rel |
 | `qwen35` | B 类，不由 bench 写 | `--qwen35` 只出证据 |
 | `convrot` | 不安装 | kitchen matmul 旋转 vs butterfly vs fused，写 `feature.convrot` + `convrot.mode` |
+| `w4a16_valu` | 走 `tab[16]` 表格 | 均匀格点 m=2..4 的表格 gather vs VALU 格点，深队列计时，写 `feature.w4a16_valu` + `w4a16.valu` |
 | `vae` | 不安装 | depth-1 Conv3d 三方计时，写 `feature.vae` |
 | `image_tower` | 包装器总装，默认看 `feature.vision` | patch 投影三种走法，写 `vision.patch_embed` |
 | `qkv` | 默认关 | 纯权衡，不归测量门 |
