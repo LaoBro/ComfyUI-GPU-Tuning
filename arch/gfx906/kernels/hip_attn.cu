@@ -114,17 +114,21 @@ attn_fwd_kernel(const __half* __restrict__ q, const __half* __restrict__ k,
 
     const int ntiles = (SK + NK - 1) / NK;
     __syncthreads();
-    if (ntiles > 0) load_k(0);
 
     for (int kt = 0; kt < ntiles; ++kt) {
         __syncthreads();                       // previous PV is done with Ks (P) and Vt
         load_v(kt);
+        // K is loaded where it is consumed: holding it one tile ahead measured 6.7%
+        // slower here and at 4608x256 (23.35 -> 21.87 ms, output bitwise identical),
+        // and is neutral at d=64. docs/HIP_KERNELS.md rules out both candidate
+        // explanations -- neither the tile-top barrier nor prefetch depth is what the
+        // ~40% tail costs -- so this is a measured placement, not a theory.
+        load_k(kt);
 #pragma unroll
         for (int i = 0; i < KCH; ++i) {
             const int chunk = kseg * KCH + i;
             *(u4*)(Ks + krow * HDT + ((chunk ^ (krow & 7)) * 8)) = kreg[i];
         }
-        if (kt + 1 < ntiles) load_k(kt + 1);
         {
 #pragma unroll
             for (int t = 0; t < VWPT; ++t) {
