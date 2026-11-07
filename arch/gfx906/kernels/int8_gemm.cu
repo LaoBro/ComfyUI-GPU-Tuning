@@ -17,7 +17,7 @@
 #include <hip/hip_bfloat16.h>
 #include <stdint.h>
 
-#define BK 32
+#define BK 64
 #ifndef GM
 #define GM 32
 #endif
@@ -34,17 +34,14 @@
 #define BBYTES (BK / BPT)
 #define NCH (BK / 16)
 
-using u4 = uint4;
-using u2 = uint2;
+// store_a/store_b stage whole 16-byte chunk planes with uint4 stores.
+static_assert(ABYTES % 16 == 0 && BBYTES % 16 == 0, "per-thread K bytes must be whole chunk planes");
 
 __device__ __forceinline__ int dot4(uint32_t a, uint32_t b, int c) {
     return __builtin_amdgcn_sdot4(a, b, c, 0);
 }
 __host__ __device__ __forceinline__ int imin(int a, int b) { return a < b ? a : b; }
 __host__ __device__ __forceinline__ int cdiv(int a, int b) { return (a + b - 1) / b; }
-__device__ __forceinline__ uint32_t pick(const u4& v, int k) {
-    return k == 0 ? v.x : k == 1 ? v.y : k == 2 ? v.z : v.w;
-}
 
 // Grouped tile order (Triton's group_size_m).
 static __host__ __device__ void tile_index(int pid, int tiles_m, int tiles_n, int gm,
@@ -67,7 +64,7 @@ __device__ __forceinline__ hip_bfloat16 to_out<hip_bfloat16>(float v) {
     return hip_bfloat16(v);
 }
 
-template <typename OutT>
+template <typename OutT, bool ALIGNED_K>
 __global__ void __launch_bounds__(NT, LBPB)
 int8_gemm_kernel(const int8_t* __restrict__ x8, const float* __restrict__ xs,
                  const int8_t* __restrict__ w8, const float* __restrict__ ws, int ws_scalar,
@@ -87,21 +84,17 @@ int8_gemm_kernel(const int8_t* __restrict__ x8, const float* __restrict__ xs,
     const int brow = threadIdx.x / BPT, bq = threadIdx.x % BPT;
     const int aseg = aq * ABYTES, bseg = bq * BBYTES;
 
-    // one row's ABYTES bytes live in ABYTES/16 different chunk planes, so the
-    // store is per 4 bytes with the chunk decoded from the byte offset
+    // A thread's ABYTES bytes span ABYTES/16 whole chunk planes, so stage each
+    // plane with one uint4 store instead of ABYTES/4 scattered 4-byte stores.
     auto store_a = [&](int buf, const uint32_t* src) {
 #pragma unroll
-        for (int i = 0; i < ABYTES / 4; ++i) {
-            const int pos = aseg + i * 4;
-            *(uint32_t*)&As[buf][pos / 16][arow][pos % 16] = src[i];
-        }
+        for (int i = 0; i < ABYTES / 16; ++i)
+            *(uint4*)&As[buf][aseg / 16 + i][arow][0] = ((const uint4*)src)[i];
     };
     auto store_b = [&](int buf, const uint32_t* src) {
 #pragma unroll
-        for (int i = 0; i < BBYTES / 4; ++i) {
-            const int pos = bseg + i * 4;
-            *(uint32_t*)&Bs[buf][pos / 16][brow][pos % 16] = src[i];
-        }
+        for (int i = 0; i < BBYTES / 16; ++i)
+            *(uint4*)&Bs[buf][bseg / 16 + i][brow][0] = ((const uint4*)src)[i];
     };
 
     const int nk = cdiv(K, BK);
@@ -109,7 +102,9 @@ int8_gemm_kernel(const int8_t* __restrict__ x8, const float* __restrict__ xs,
     auto load_a = [&](int kt, uint32_t* dst) {
         const int gr = imin(m0 + arow, M - 1);
         const int8_t* p = x8 + (int64_t)gr * K + kt * BK + aq * ABYTES;
-        if (kt * BK + aq * ABYTES + ABYTES <= K) {
+        // ALIGNED_K (K % BK == 0) drops the tail masking entirely: the tail path
+        // is dead code there and costs ~6% in the hot loop otherwise.
+        if (ALIGNED_K || kt * BK + aq * ABYTES + ABYTES <= K) {
 #pragma unroll
             for (int i = 0; i < ABYTES / 4; ++i) dst[i] = ((const uint32_t*)p)[i];
         } else {
@@ -124,7 +119,7 @@ int8_gemm_kernel(const int8_t* __restrict__ x8, const float* __restrict__ xs,
     auto load_b = [&](int kt, uint32_t* dst) {
         const int gr = imin(n0 + brow, N - 1);
         const int8_t* p = w8 + (int64_t)gr * K + kt * BK + bq * BBYTES;
-        if (kt * BK + bq * BBYTES + BBYTES <= K) {
+        if (ALIGNED_K || kt * BK + bq * BBYTES + BBYTES <= K) {
 #pragma unroll
             for (int i = 0; i < BBYTES / 4; ++i) dst[i] = ((const uint32_t*)p)[i];
         } else {
@@ -156,20 +151,27 @@ int8_gemm_kernel(const int8_t* __restrict__ x8, const float* __restrict__ xs,
             load_a(kt + 1, pa);
             load_b(kt + 1, pb);
         }
-#pragma unroll
+        // Read operands from LDS one k-dword at a time, the TN B dwords reused
+        // across all TM rows, so only TN+1 operand registers are live instead of
+        // a u4[TM]+u4[TN] array. With the s loop unrolled 2x this lands at 124
+        // VGPR / 2 blocks/CU (8 waves); the b128-array form needed 211 VGPR and
+        // ran at 4 waves. Full unroll or __launch_bounds__(.,2) both spill the 64
+        // accumulators, so keep LBPB=1 and let the allocator fit naturally.
         for (int half = 0; half < NCH; ++half) {
-            u4 a[TM], b[TN];
+#pragma unroll 2
+            for (int s = 0; s < 4; ++s) {
+                uint32_t b[TN];
 #pragma unroll
-            for (int i = 0; i < TM; ++i) a[i] = *(const u4*)&As[buf][half][r0 + i][0];
+                for (int j = 0; j < TN; ++j)
+                    b[j] = *(const uint32_t*)&Bs[buf][half][tx + TSTRIDE * j][s * 4];
 #pragma unroll
-            for (int j = 0; j < TN; ++j) b[j] = *(const u4*)&Bs[buf][half][tx + TSTRIDE * j][0];
-#pragma unroll
-            for (int s = 0; s < 4; ++s)
-#pragma unroll
-                for (int i = 0; i < TM; ++i)
+                for (int i = 0; i < TM; ++i) {
+                    const uint32_t a = *(const uint32_t*)&As[buf][half][r0 + i][s * 4];
 #pragma unroll
                     for (int j = 0; j < TN; ++j)
-                        acc[i][j] = dot4(pick(a[i], s), pick(b[j], s), acc[i][j]);
+                        acc[i][j] = dot4(a, b[j], acc[i][j]);
+                }
+            }
         }
         if (kt + 1 < nk) {
             store_a(buf ^ 1, pa);
@@ -195,21 +197,30 @@ int8_gemm_kernel(const int8_t* __restrict__ x8, const float* __restrict__ xs,
     }
 }
 
+template <typename OutT>
+static void launch_int8(const void* x8, const void* xs, const void* w8, const void* ws,
+                        int ws_scalar, const void* bias, void* out, int M, int N, int K,
+                        int tiles, hipStream_t st) {
+    if (K % BK == 0)
+        int8_gemm_kernel<OutT, true><<<tiles, NT, 0, st>>>(
+            (const int8_t*)x8, (const float*)xs, (const int8_t*)w8, (const float*)ws, ws_scalar,
+            (const float*)bias, (OutT*)out, M, N, K);
+    else
+        int8_gemm_kernel<OutT, false><<<tiles, NT, 0, st>>>(
+            (const int8_t*)x8, (const float*)xs, (const int8_t*)w8, (const float*)ws, ws_scalar,
+            (const float*)bias, (OutT*)out, M, N, K);
+}
+
 extern "C" int gfx906_int8_gemm(const void* x8, const void* xs, const void* w8,
                                 const void* ws, int ws_scalar, const void* bias, void* out,
                                 int M, int N, int K, int out_bf16, void* stream) {
     if (M <= 0 || N <= 0 || K <= 0) return -2;
     const int tiles = cdiv(M, BM) * cdiv(N, BN);
     hipStream_t st = (hipStream_t)stream;
-    if (out_bf16) {
-        int8_gemm_kernel<hip_bfloat16><<<tiles, NT, 0, st>>>(
-            (const int8_t*)x8, (const float*)xs, (const int8_t*)w8, (const float*)ws, ws_scalar,
-            (const float*)bias, (hip_bfloat16*)out, M, N, K);
-    } else {
-        int8_gemm_kernel<__half><<<tiles, NT, 0, st>>>(
-            (const int8_t*)x8, (const float*)xs, (const int8_t*)w8, (const float*)ws, ws_scalar,
-            (const float*)bias, (__half*)out, M, N, K);
-    }
+    if (out_bf16)
+        launch_int8<hip_bfloat16>(x8, xs, w8, ws, ws_scalar, bias, out, M, N, K, tiles, st);
+    else
+        launch_int8<__half>(x8, xs, w8, ws, ws_scalar, bias, out, M, N, K, tiles, st);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : (int)e;
 }
