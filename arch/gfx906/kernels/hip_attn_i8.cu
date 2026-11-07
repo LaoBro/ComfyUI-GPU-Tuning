@@ -259,7 +259,7 @@ attn_i8_kernel(const int8_t* __restrict__ q, const float* __restrict__ qs,
 #pragma unroll
                 for (int c = 0; c < TK; ++c) mx = __builtin_fmaxf(mx, pv[c] * vsk[c]);
                 mx = wave_max3(mx);
-                invp = mx > 0.f ? 255.f / mx : 0.f;
+                invp = mx > 0.f ? 255.f * __builtin_amdgcn_rcpf(mx) : 0.f;
                 sp = mx * (1.f / 255.f);
             } else {
                 invp = (beta > 1e-30f) ? 255.f / beta : 0.f;
