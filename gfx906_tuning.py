@@ -99,6 +99,7 @@ _state = {
     "attn_cast": None,
     "attn_kernel": None,
     "attn_backend_fn": None,
+    "attn_wrapper": None,
     "attn_fp16": True,
     "te_int8": False,
     "te_patched": False,
@@ -128,6 +129,11 @@ _state = {
     "w4a8_module": None,
     "w4a8_calls": 0,
     "amax_guard": True,
+    "int8_attn_enabled": False,
+    "int8_attn_rotate": 128,
+    "int8_attn_patched": False,
+    "qwen21_int8_cache": False,
+    "qwen21_int8_patched": False,
     "int8_tile_enabled": True,
     "small_batch_enabled": True,
     "tile_measured": False,
@@ -180,6 +186,19 @@ def textgen_summary():
         for name in TEXTGEN_ITEMS)
 
 
+def _int8_rotate_env(default=128):
+    """COMFY_GFX906_INT8_ATTN_ROTATE: 0/off, or a Hadamard group (32/64/128)."""
+    raw = os.getenv("COMFY_GFX906_INT8_ATTN_ROTATE", "").strip().lower()
+    if raw in ("", "auto", "default"):
+        return default
+    if raw in ("0", "off", "none"):
+        return 0
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
 def _init_env_settings():
     """Diagnostics that have no node switch, read once by apply().
 
@@ -200,6 +219,9 @@ def _init_env_settings():
                               for item in os.getenv("COMFY_GFX906_FORCE", "").replace(",", " ").split()
                               if item.strip()}
     _state["te_dequant_env"] = os.getenv("COMFY_GFX906_TE_DEQUANT", "").strip().lower()
+    _state["int8_attn_enabled"] = env_flag("COMFY_GFX906_INT8_ATTN", "0")
+    _state["int8_attn_rotate"] = _int8_rotate_env()
+    _state["qwen21_int8_cache"] = env_flag("COMFY_GFX906_QWEN21_INT8_CACHE", "0")
 
 
 def arch_name():
@@ -1315,6 +1337,7 @@ def patch_attention():
 
     wrapped = attention.wrap_attn(gfx906_attention)
     wrapped.container_function = gfx906_attention_containers
+    _state["attn_wrapper"] = wrapped
     _swap_optimized_attention(fallback, wrapped)
     attention.optimized_attention = wrapped
     attention.optimized_attention_masked = wrapped
@@ -1322,6 +1345,134 @@ def patch_attention():
     _state["attention"] = True
     _state["replaced_backend"] = getattr(fallback, "__name__", "?")
     return True
+
+
+def patch_int8_attention():
+    """Serve comfy-kitchen's INT8 attention contract with the gfx906 kernel.
+
+    The contract is "fp16 [B,H,S,D] in, quantize, INT8 dot, fp16 out": core's
+    attention_comfy_kitchen_int8 calls prequantize_int8_attention +
+    int8_attention_from_prequantized, and minimax's VAE calls int8_attention
+    directly. On gfx906 comfy-kitchen answers False for both, so those models
+    silently lose the path. Replacing the four comfy_kitchen entry points keeps
+    the callers unchanged; the kernel that runs is hip_attn_i8 (int8 Q/K/V and
+    scales, 8-bit P, fp32 softmax).
+
+    Accuracy is the reason this is opt-in: the measured diffl2 against the fp16
+    inputs is 5.4e-3 on the score/P side and 1.1-1.3e-2 on the output, against
+    2.5e-4 for the fused fp16 kernel. `int8_attn_rotate` trades a matmul for
+    outlier headroom; the switch is live, and with it off every call goes to the
+    regular optimized attention instead (never to SDPA unless nothing else is
+    installed).
+    """
+    import comfy_kitchen
+
+    mod = _hip_int8_attention()
+    if mod is None or not mod.available():
+        return False
+    _state["int8_attn_module"] = mod
+    if getattr(comfy_kitchen, "_gfx906_int8_attn", False):
+        return True
+
+    class _Packed:
+        __slots__ = ("q8", "qs", "k8", "ks", "vq", "vs", "scale", "dtype", "fallback")
+
+    def _ready(q, k, v, mask):
+        if mask is not None or q.dim() != 4:
+            return False
+        if q.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            return False
+        b, hq, sq, d = q.shape
+        if d not in (64, 128) or sq <= 0 or k.dim() != 4 or k.shape[2] <= 0:
+            return False
+        if hq % k.shape[1] or k.shape[3] != d:
+            return False
+        return (k.shape[0] == b and v.shape[0] == b and v.shape[1] == k.shape[1]
+                and v.shape[2] == k.shape[2] and v.shape[3] == d)
+
+    def _delegate(q, k, v, mask, scale):
+        """Run the call the way it ran before this patch claimed the contract.
+
+        Masked calls go to attention_pytorch: the contract hands masks over in
+        [B, H, S, S] shape, which attention_basic/sub_quad do not accept.
+        """
+        from comfy.ldm.modules import attention
+
+        heads = q.shape[1]
+        kwargs = {"mask": mask, "skip_reshape": True, "skip_output_reshape": True}
+        if scale is not None:
+            kwargs["scale"] = scale
+        wrapper = _state.get("attn_wrapper")
+        # never delegate back into the int8 function itself: selecting it as the
+        # attention backend would otherwise loop through this same shim
+        if (mask is None and wrapper is not None
+                and _state.get("attn_backend_fn") is not attention.attention_comfy_kitchen_int8):
+            return wrapper(q, k, v, heads, **kwargs)
+        return attention.attention_pytorch(q, k, v, heads, **kwargs)
+
+    def prequantize(q, k, v, *, scale=None, attn_mask=None):
+        p = _Packed()
+        p.scale = scale
+        p.dtype = q.dtype
+        p.fallback = None
+        if not _state.get("int8_attn_enabled", False) or not _ready(q, k, v, attn_mask):
+            p.fallback = (q, k, v, attn_mask)
+            return p
+        # the kernel's layout is [B, S, H, D]; the contract's is [B, H, S, D]
+        qt = q.transpose(1, 2).contiguous()
+        kt = k.transpose(1, 2).contiguous()
+        vt = v.transpose(1, 2).contiguous()
+        rot = _state.get("int8_attn_rotate", 128)
+        p.q8, p.qs = mod.quantize_qk(qt, rot)
+        p.k8, p.ks = mod.quantize_qk(kt, rot)
+        p.vq, p.vs = mod.quantize_v(vt)
+        return p
+
+    def from_prequantized(p):
+        if p.fallback is not None:
+            q, k, v, mask = p.fallback
+            _state["int8_attn_fallbacks"] = _state.get("int8_attn_fallbacks", 0) + 1
+            return _delegate(q, k, v, mask, p.scale)
+        _state["int8_attn_calls"] = _state.get("int8_attn_calls", 0) + 1
+        out = mod.attention_fwd(p.q8, p.qs, p.k8, p.ks, p.vq, p.vs, p.scale)
+        out = out.transpose(1, 2).contiguous()
+        return out if out.dtype == p.dtype else out.to(p.dtype)
+
+    def int8_attention(q, k, v, *, scale=None, attn_mask=None):
+        return from_prequantized(prequantize(q, k, v, scale=scale, attn_mask=attn_mask))
+
+    def is_available(device=None):
+        return _state.get("int8_attn_module") is not None
+
+    comfy_kitchen.prequantize_int8_attention = prequantize
+    comfy_kitchen.int8_attention_from_prequantized = from_prequantized
+    comfy_kitchen.int8_attention = int8_attention
+    comfy_kitchen.int8_attention_is_available = is_available
+    comfy_kitchen._gfx906_int8_attn = True
+
+    # core reads this constant when it loads a checkpoint's attention config and
+    # when it registers the backend name; minimax's VAE imported a copy by value
+    from comfy.ldm.modules import attention as attn
+
+    attn.COMFY_KITCHEN_INT8_ATTENTION_IS_AVAILABLE = True
+    attn.register_attention_function("comfy_kitchen_int8", attn.attention_comfy_kitchen_int8)
+    for module in list(sys.modules.values()):
+        if getattr(module, "COMFY_KITCHEN_INT8_ATTENTION_IS_AVAILABLE", None) is False:
+            module.COMFY_KITCHEN_INT8_ATTENTION_IS_AVAILABLE = True
+    _state["int8_attn_patched"] = True
+    return True
+
+
+def _hip_int8_attention():
+    """The INT8-input attention module, or None when it is not built."""
+    try:
+        from . import hip_attn_i8
+    except ImportError:
+        try:
+            import hip_attn_i8
+        except ImportError:
+            return None
+    return hip_attn_i8
 
 
 def patch_convrot():
@@ -1425,7 +1576,7 @@ def configure(attention=None, convrot=None, profile=None, text_encoder=None,
               fp16=None, text_attention=None, contiguous=None, qkv=None,
               vae=None, gemv=None, textgen=None, prefix_kv=None, text_gemv=None, w4a8=None,
               amax_guard=None, int8_tile=None, small_batch=None, image_tower=None,
-              int8_gemm=None):
+              int8_gemm=None, int8_attn=None, int8_attn_rotate=None, qwen21_int8_cache=None):
     """Runtime settings, used by the GFX906 nodes.
 
     Every argument is three-state: None/"default" keeps the built-in default
@@ -1469,6 +1620,16 @@ def configure(attention=None, convrot=None, profile=None, text_encoder=None,
         _state["vae_enabled"] = resolve_flag(vae, feature_on("vae"))
     if int8_gemm is not None:
         _state["int8_gemm_enabled"] = resolve_flag(int8_gemm, True)
+    if int8_attn is not None:
+        # default keeps the startup value; the switch decides per call, so a
+        # checkpoint that loaded its int8 attention config can be turned off live
+        _state["int8_attn_enabled"] = resolve_flag(int8_attn, _state.get("int8_attn_enabled", False))
+    if int8_attn_rotate is not None:
+        raw = str(int8_attn_rotate).strip().lower()
+        if raw in ("off", "0", "none"):
+            _state["int8_attn_rotate"] = 0
+        elif raw in ("32", "64", "128"):
+            _state["int8_attn_rotate"] = int(raw)
     if image_tower is not None and _state["vision_patched"]:
         # "default" keeps the boot decision (manifest verdict, or a FORCE opt-in)
         _state["vision_enabled"] = resolve_flag(image_tower, _state["vision_enabled"])
@@ -1483,6 +1644,9 @@ def configure(attention=None, convrot=None, profile=None, text_encoder=None,
         _state["textgen_override"] = flag_value(textgen)
     if prefix_kv is not None:
         _state["prefix_kv_enabled"] = resolve_flag(prefix_kv, True)
+    if qwen21_int8_cache is not None:
+        _state["qwen21_int8_cache"] = resolve_flag(
+            qwen21_int8_cache, _state.get("qwen21_int8_cache", False))
     if text_gemv is not None:
         _state["text_gemv_enabled"] = resolve_flag(text_gemv, True)
     if w4a8 is not None:
@@ -2003,6 +2167,86 @@ def patch_prefix_kv():
     return True
 
 
+def patch_qwen21_int8_cache():
+    """Run the Qwen-Image 2.1 int8 prefix cache through the int8 attention kernel.
+
+    The cache already stores K/V as convrot int8 with one scale per token, but
+    the shipped read path dequantizes both to fp16 before every block. This
+    keeps them int8: take() stops dequantizing, the current step's Q/K/V are
+    rotated and quantized with the same H64 in one fused pass (attn_quant.cu),
+    V is packed four keys per word straight out of both sources, the kernel
+    folds the cached per-token V scales into P, and the output is rotated once
+    more (H is symmetric, so the same transform undoes it). Nothing pays for
+    the extra precision the cache never had.
+
+    Measured at 4058 prefix + 4032 target tokens, 32 heads, d128: 50.6 ms per
+    block shipped vs 37.4 ms here (1.35x), output diffl2 1.1e-2 against the
+    fp16-on-dequant reference (2.6e-4). Opt-in: the switch is live.
+    """
+    import comfy.ldm.qwen_image21.model as qwen
+    import comfy.model_management
+    import comfy.utils
+    from comfy.ldm.wan.model_animate2 import PoseBranchCache
+
+    mod = _hip_int8_attention()
+    if mod is None or not mod.available() or not mod.rotation_ready():
+        return False
+    if getattr(PoseBranchCache, "_gfx906_int8_cache", False):
+        return True
+
+    original_take = PoseBranchCache.take
+
+    def take(self, i, device, dtype, batch_size):
+        params = self.slot["params"][i] if self.slot is not None else None
+        shape = self.slot["shape"] if self.slot is not None else None
+        usable = (params is not None and shape is not None and len(shape) == 5
+                  and shape[4] in (64, 128) and getattr(params, "convrot", False)
+                  and getattr(params, "convrot_groupsize", 0) == 64)
+        if not (_state.get("qwen21_int8_cache") and self.dtype == "int8" and usable):
+            return original_take(self, i, device, dtype, batch_size)
+        if i not in self._pending:
+            self.prefetch(i, device, dtype)
+        t, stream = self._pending.pop(i)
+        comfy.model_management.sync_stream(device, stream)
+        params = params.to_device(t.device)
+        kv8 = t.reshape(shape)
+        scale = params.scale.reshape(shape[0], 2, shape[2], shape[3]).float()
+        _state["qwen21_take"] = (i, kv8, scale)
+        _state["qwen21_take_calls"] = _state.get("qwen21_take_calls", 0) + 1
+        return comfy.utils.repeat_to_batch_size(kv8, batch_size)
+
+    PoseBranchCache.take = take
+    PoseBranchCache._gfx906_int8_cache = True
+
+    previous_prefix = qwen.prefix_cached_attention
+
+    def prefix_cached_attention(prefix_k, prefix_v, transformer_options={}):
+        taken = _state.pop("qwen21_take", None)
+        if (taken is not None and _state.get("qwen21_int8_cache")
+                and prefix_k.dtype == torch.int8):
+            kv8, scale = taken[1], taken[2]
+            if (kv8.shape[0] == prefix_k.shape[0] and kv8.shape[2] == prefix_k.shape[1]
+                    and kv8.shape[3] == prefix_k.shape[2] and kv8.shape[4] == prefix_k.shape[3]):
+                return _int8_cache_attention(kv8, scale)
+        return previous_prefix(prefix_k, prefix_v, transformer_options)
+
+    def _int8_cache_attention(kv8, scale):
+        def attn(q, k, v, heads, preferred_attention=None):
+            q_t, k_t, v_t = q.take(), k.take(), v.take()
+            out = mod.cache_attention(q_t.contiguous(), k_t.contiguous(), v_t.contiguous(),
+                                      kv8, scale)
+            _state["qwen21_int8_calls"] = _state.get("qwen21_int8_calls", 0) + 1
+            b, st, h, d = q_t.shape
+            if out.dtype != q_t.dtype:
+                out = out.to(q_t.dtype)
+            return out.reshape(b, st, h * d)
+        return attn
+
+    qwen.prefix_cached_attention = prefix_cached_attention
+    _state["qwen21_int8_patched"] = True
+    return True
+
+
 def patch_vae():
     """Run depth-1 Conv3d as Conv2d.
 
@@ -2172,6 +2416,7 @@ def apply():
         _state["gemv_module"] = _install("int8 gemv", load_int8_gemv)
     _state["gemv_model"] = feature_on("gemv")
     _install("prefix kv", patch_prefix_kv)
+    _install("qwen21 int8 cache", patch_qwen21_int8_cache)
     # before any prompt runs: the queue thread binds execute_async when a prompt
     # starts, so a hook installed later would only report from the next one
     _install("prompt hook", _patch_prompt_end)
@@ -2226,6 +2471,7 @@ def apply():
     # installs on every AMD; NVIDIA keeps core's attention.
     if on_amd:
         _install("attention", patch_attention)
+        _install("int8 attention", patch_int8_attention)
     logging.info(
         "gfx906 tuning active: int8 linear %s%s%s, convrot %s, vae %s, qkv %s, attention %s%s%s%s, "
         "text encoder %s + lm_head, encoder attention %s, textgen %s",
@@ -2353,6 +2599,10 @@ def status():
         + (f", {_state['qkv_calls']} fused / {_state.get('qkv_fallbacks', 0)} fallback"
            if _state.get("qkv_calls") or _state.get("qkv_fallbacks") else ""),
         prefix_line,
+        (f"qwen21 int8 cache {'on' if _state.get('qwen21_int8_cache') else 'off'}"
+         + (f", {_state.get('qwen21_int8_calls', 0)} calls" if _state.get("qwen21_int8_calls") else "")
+         + ("" if _state.get("qwen21_int8_cache") else " (fp16 dequant path)"))
+        if _state.get("qwen21_int8_patched") else "qwen21 int8 cache n/a",
         gemv_line,
         text_gemv_line,
         w4a8_line,
@@ -2367,6 +2617,12 @@ def status():
         f"text encoder {'int8' if _state['te_int8'] else 'default (dequantize per call)'}"
         + f", lm_head {'int8' if _state.get('logits_patched') and _state['te_int8'] else 'default'}"
         + f", encoder attention {_state['te_attention']}",
+        f"int8 attention "
+        + ("on" if _state.get("int8_attn_enabled") else "off")
+        + (f", rotate {_state.get('int8_attn_rotate', 128)}" if _state.get("int8_attn_enabled") else "")
+        + (f", {_state.get('int8_attn_calls', 0)} calls / {_state.get('int8_attn_fallbacks', 0)} fallback"
+           if _state.get("int8_attn_calls") or _state.get("int8_attn_fallbacks") else "")
+        if _state.get("int8_attn_patched") else "int8 attention n/a",
         f"image tower {'weight dtype + patch gemm' if _state['vision_enabled'] else 'shipped path'}",
         f"resident graph {'on' if _state.get('resident_graph') else 'off'}",
     ]

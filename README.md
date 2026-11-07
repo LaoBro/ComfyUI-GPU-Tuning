@@ -55,8 +55,15 @@ KV cache 容量级拷贝、launch 开销，这些在别的卡上一样存在。�
 - **int8 tile 注入**：`int8_tile` 关闭时恢复上游 autotune 列表，不再注入 gfx906 tile；
   `small_batch` 单独控制 `m≤8` 的窄 tile 切换。
 - **prefix KV 复用**：`prefix_kv` 关闭时 `prefix_cached_attention` 回到 `torch.cat`。
+- **int8 前缀缓存**：`qwen21_int8_cache` 让 Qwen-Image 2.1 的 int8 缓存 K/V 保持
+  int8 直接进注意力内核（原路径每块反量化成 fp16）：4058+4032 token、32 head、
+  d128 实测 51.2 → 34.2 ms/块（1.50x），输出 relL2 1.1e-2。默认关。
 - **TE GEMV**：`text_gemv` 控制文本编码器的直调 int8 GEMV 与未量化小投影的 `torch.mv`。
 - **4-bit w4a8**：`w4a8` 控制 4-bit 权重的 decode GEMV 与 prefill 现解 int8。
+- **int8 注意力**：`int8_attn` 让 comfy-kitchen 的 int8 注意力契约（checkpoint 标记
+  `comfy_kitchen_int8` 的模型、int8 minimax VAE）跑本包的 int8 输入内核（默认关：
+  输出 relL2 1.1–1.3e-2，fp16 内核 2.5e-4）；`int8_attn_rotate` 是它的量化旋转
+  精度开关（0/64/128）。
 - **文本生成组**：`textgen` 一次控制 `deltanet`、`kvdecode`、`llama`、`qwen35` 四项；
   `default` 时仍按各自环境变量独立生效。
 - **amax 保护**：`amax_guard` 控制注意力输入溢出时是否放弃 fp16 转换。

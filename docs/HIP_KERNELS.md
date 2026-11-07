@@ -447,6 +447,122 @@ V 寄存器预取慢 5%、d64 重排到 2 block/CU 不动（见下条）——�
      （0.74 对 0.23 ms），因为它自己的 BLOCK_M=64。
   3. fp32 输入或 amax 保护触发 —— hand/int8 同样要求 fp16，只有 gemm 收。
 
+## 输入就是 int8 的注意力内核（`hip_attn_i8.cu`，2026-11）
+
+前面几节否掉的是「把 fp16 激活**临时**量化成 int8 再算注意力」：多一遍量化、
+P 只有 8 bit、对扩散不划算。这条是另一件事：**调用方手里已经是 int8**，内核算
+不动点、只做 dequant 到累加器。ComfyUI 里真实存在这种输入的两处：
+
+1. `comfy_kitchen.int8_attention` 契约（checkpoint 里 `attention: comfy_kitchen_int8`、
+   minimax VAE 的 int8 decoder）。它自己也是 fp16 进、内部量化，但量化在一次调用里
+   只发生一次，不是「量化了却不算」。
+2. Qwen-Image 2.1 的 int8 前缀缓存：`PoseBranchCache` 以 convrot int8 + 每 token
+   scale 存 K/V，现在读出来先 dequantize 再走 fp16 注意力。
+
+契约（[`hip_attn_i8.py`](../hip_attn_i8.py)）：Q/K 为 `[B,S,H,D]` int8 + 每 (token,head)
+fp32 scale；V 打包成 `[B,H,SKP/4,D]` int32（一个字 4 个连续 key，按 head dim 一列），
+scale 每 (head,dim)；V 在 SK 方向补到 64 的倍数，补出来的 key 被 softmax 掩掉。
+
+内核沿用 fp16 版的 64-key tile 和 lane 映射（`lane&7` = 行、`lane>>3` = key 组、
+`xor 8/16/32` 归约），但：
+
+- QK 是 `v_dot4_i32_i8`（`__builtin_amdgcn_sdot4`），16 字节 LDS 读喂 128 个 dot4，
+  是 fp16 版同样读数下 MAC 的两倍；分数出来后乘 `q_scale*k_scale*sm_scale`。
+- PV 的 P 是 0..255 的 uint8（比例尺 `beta/255`，不需要跨 lane 求 max），V 以
+  `int8^0x80` 存成 uint8，用 `v_dot4_u32_u8` 相乘，再按行减 `128*sum(P8)` 精确
+  去掉偏置——V 的 8 个 bit 全保留，P 不用把 V 的 scale 折进来。
+- PV 的 lane 维度改成 `4j+32i` 而不是连续 16 维：8 个 lane 读同一个 key quad 时
+  正好铺满 32 个 bank，连续切片会让 8 个 lane 挤在两个 bank 组上。
+- **一个 block 的行数是一个模板参数**：`TQ` 行/lane、`NQ = 32*TQ` 行/block。
+  默认 `TQ=2`（64 行）：d128 = 128 VGPR / 25 KB LDS / **2 block/CU、8 波**，
+  d64 = 115 VGPR / 12.8 KB；`TQ=4`（128 行）是 240 VGPR / 33 KB / 1 block，
+  留作 A/B。
+
+8 波这件事和 int8 GEMM 一样是「砍寄存器」砍出来的，但过程多两个教训：
+
+- 先把两个主循环（QK 的 s、PV 的 k4）的展开从 2 降到 1，d128 的自然占用从 255
+  降到 183；再让编译器按 2 block 分配（128 VGPR）只剩 5-6 B 的估算 spill，
+  反汇编里**没有一条 scratch/flat 指令**——它是重算而不是落内存，所以不疼。
+- **单行/单 quad 的循环不能降展开**：把 softmax 的按行循环、PV 的 q4 循环也降到
+  unroll 1 后，寄存器数字更好看（98-110 VGPR、无 spill），实测却慢 2-3 倍。
+  这些循环里的 `accq[t]`/`accp[t]` 是按循环变量索引的，必须全展开。
+
+实测（`tools/verify_int8_attn.py`、`tools/bench_int8_attn.py`）：
+
+| 项 | 数值 |
+|---|---|
+| 对「同一批 int8 张量」的 fp32 参考 relL2 | 5.4e-3（P 8 bit 的底，不是内核误差） |
+| 对原始 fp32 输入 relL2 | 1.1-1.3e-2（fp16 内核 2.5e-4，约 50x） |
+| 有离群通道（q/k 第 0 维 ×40）relL2，rotate off / 64 / 128 | 5.3e-2 / 3.3e-2 / **1.5e-2** |
+| 内核本身 vs `hip_attn`（1024² h16 d128 / 256×1024 h8 d128 / 512² h20 d64 / 4096×256 d128） | **1.42x / 2.22x / 1.69x / 1.52x**（4 波版 1.20 / 1.60 / 1.26 / 1.33） |
+| 同上，前缀缓存形状 4032×8090 h2 d128（fp16 4.65 ms） | 1.30x（4 波）→ 实测同批数据 8 波更快，见下节缓存表 |
+| 含 torch 端量化打包的总时间 | 0.73x / 0.71x / 0.61x（形状同上） |
+
+8 波对 4 波的形状扫描（kernel 单独计时）：77×77 d128 **1.50x**、256×256 d128 1.47x、
+2048×2560 d128 1.20x、4032×8090 d128 1.05x、1024×1024 d64 1.13x、4096×4096 d64 1.12x、
+512×512 d128 0.99x。**到不了 GEMM 的 1.6x**，原因很清楚：GEMM 几乎只有 dot 一种指令，
+注意力里 softmax/P 量化/载入约占 15%，它们不随波数变快；而且 `NQ` 减半让 K/V 全局
+重读翻倍，键越长越吃亏（4032×8090 只剩 1.05x）。
+
+误差开关就是量化侧的 Hadamard 旋转（`int8_attn_rotate`，0/64/128；默认 128）：
+它只改数值分布不改点积，离群通道上能省 3.4x 误差；高斯数据上看不出差别，因为
+没有离群值。
+
+接入点（`patch_int8_attention`）：替换 `comfy_kitchen.int8_attention`、
+`prequantize_int8_attention`、`int8_attention_from_prequantized`、
+`int8_attention_is_available` 四个入口，同时点亮 `attention.py` 的可用常量并注册
+`comfy_kitchen_int8` 后端名。checkpoint 的 `ComfyAttention` 配置和 minimax VAE
+都不改代码就能走新内核。默认**关**（`COMFY_GFX906_INT8_ATTN=1` 或节点开关打开）；
+关着时这些调用照旧走 `optimized_attention`，不会退化成 SDPA。
+
+尚未覆盖：带 mask 的调用（转给 `attention_pytorch`）、D=256（转给同一条回退）、
+comfy_kitchen 的 K 平移（softmax 不变的减 key）。Qwen-Image 2.1 缓存的直读已经接上，
+见下一节。
+
+## Qwen-Image 2.1 int8 前缀缓存：直读 int8（2026-11）
+
+`PoseBranchCache` 在 `dtype="int8"` 时本来就把 K/V 存成 convrot int8 + 每 token
+scale，但 `take()` 每块都把它反量化成 fp16 再拼当前步。这条路径让缓存行保持 int8：
+
+- `take()` 不再反量化，返回 `[B,2,S,H,D]` int8 与两份 `[B,S,H]` scale；
+- 当前步的 Q/K/V 用 `attn_quant.cu` 一次遍历完成「H64 蝶形旋转 + 每行 absmax +
+  int8」（与缓存同一个 H：`_build_hadamard` 的 h4 = a+b==3 约定，实测量化结果逐位相同）；
+- V 用同一个 kernel 从两个来源（缓存前缀 + 当前步）直接打包成 4 key/字，
+  前缀长度不是 4 的倍数时跨界的那个 quad 也不会错位；
+- 缓存的 V scale 是每 token 的，内核把它折进 P（`vkey` 模式：P 的 scale 取该行
+  `max(p*vscale)`，PV 后不减 per-dim scale），所以 V 的 8 bit 全保留；
+- **K 从两个来源读**：缓存前缀（`[B,2,SP,H,D]` 的第 0 个平面，按批步长
+  `2*SP*H` 行寻址——缓存把 K/V 叠在一个轴上，所以它的 K 平面不是批连续的）+
+  当前步 `[B,ST,H,D]`。这样每块不再把 16.6 MB 的前缀 K 拷进拼接缓冲；两个 scale
+  平面用同一个步长，V 平面只是起点晚 `SP*H` 个元素；
+- 输出在旋转基里，最后用同一个 H 再转回来（H 对称且正交，转两次等于单位阵，
+  实测 fp16 往返误差 1e-3）。
+
+实测（`tools/verify_qwen21_int8_cache.py`，缓存用 `put()` 的原样调用构造）：
+
+| 项 | 数值 |
+|---|---|
+| 输出 relL2 对「反量化缓存 + fp16 当前步」参考 | 1.0-1.1e-2（同一参考上 fp16 内核 2.6e-4） |
+| 4058 前缀 + 4032 目标、32 head、d128 | shipped 51.2-51.3 ms/块 → **34.1-34.3 ms/块（1.50x）** |
+
+每块的分解（同一形状，TQ=2/8 波）：注意力内核 32.1 ms（93%，8.32 TMAC/s）、
+Q/K/V 旋转+量化 1.03 ms、V 打包 0.75 ms、输出反旋转 0.31 ms。改成双 K 源省下的
+拷贝是 0.067 ms/块（16.6 MB，32 块约 2.1 ms/步），同时在途显存少约 34 MB——在
+1.50x 里看不出来，但它把这部分开销从「每块一次全量拷贝」变成了零。
+
+两个容易踩的点，都是实测出来的：
+
+1. **SK 与缓冲长度不是一回事**。内核按 `[B,SK,H,D]` 寻址并按 SK 掩码；传进去的 K
+   如果是补到 64 的缓冲（`SKP`），b>0 的批次会整体错位，而且补出来的 key 会被当成
+   真实 key（score=0）稀释 softmax——b=1 时看起来完全正常，b=2 时误差 0.8。
+2. **只有打包后的 V 需要补齐**；K 和两个 scale 数组都按真实长度分配。
+3. **K 的行索引用 HKV，不是 H**。改成双 K 源时把 `key*HKV + hk` 写成了
+   `key*H + hk`，Qwen-Image 2.1（没有 GQA）完全看不出来，直到契约路径的
+   GQA 用例（h=4/hkv=2）报出 1.75 才暴露。批次步长同理是 `2*SP*HKV`。
+
+开关 `qwen21_int8_cache`（默认关，`COMFY_GFX906_QWEN21_INT8_CACHE=1` 可开），
+关闭时 `take()` 与原路径逐位一致；补丁只改读路径，`put()`（缓存写入）不动。
+
 ## 试过但没采用的路径
 
 | 尝试 | 结果 |

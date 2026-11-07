@@ -14,7 +14,9 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 KERNELS = os.path.join(ROOT, "arch", "gfx906", "kernels")
-TARGETS = [("hip_attn.cu", "libgfx906_attn.so"), ("int8_gemm.cu", "libgfx906_int8.so"),
+TARGETS = [("hip_attn.cu", "libgfx906_attn.so"), ("hip_attn_i8.cu", "libgfx906_attn_i8.so"),
+           ("attn_quant.cu", "libgfx906_attn_quant.so"),
+           ("int8_gemm.cu", "libgfx906_int8.so"),
            ("rotate.cu", "libgfx906_rotate.so"), ("w4a16.cu", "libgfx906_w4a16.so")]
 STAGE = "/tmp/hip_rocm"
 

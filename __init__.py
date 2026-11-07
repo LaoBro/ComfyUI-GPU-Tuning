@@ -91,6 +91,17 @@ class Gfx906ModelSettings(io.ComfyNode):
                                        "on the measured prefill shapes. default uses it when "
                                        "the shipped libgfx906_int8.so loads; off forces the Triton path. Decode "
                                        "(m<=1) still uses the GEMV."),
+                io.Combo.Input("int8_attn", options=list(TRISTATE), default="default",
+                               tooltip="Run comfy_kitchen's INT8 attention contract (models whose checkpoint marks "
+                                       "attention as comfy_kitchen_int8, and the int8 minimax VAE) on the HIP "
+                                       "int8-input kernel: Q/K int8 with per-token scales, V int8 4-keys-per-word "
+                                       "with per-dim scales, 8-bit P, fp32 softmax. Measured output diffl2 1.1-1.3e-2 "
+                                       "(fp16 kernel: 2.5e-4), so default is off; on is opt-in, off runs the "
+                                       "regular optimized attention for those calls."),
+                io.Combo.Input("int8_attn_rotate", options=["default", "off", "64", "128"], default="default",
+                               tooltip="Hadamard rotation applied to Q and K before INT8 quantization on the int8 "
+                                       "attention path. It costs one matmul and bounds per-row outliers without "
+                                       "changing dot products; off is the same math with no rotation."),
                 io.Combo.Input("qkv", options=list(TRISTATE), default="default",
                                tooltip="One int8 GEMM for q/k/v instead of three (Qwen-Image 2.1): -81 ms "
                                        "of a 5.24 s step (1.5%), bit-exact. The merged weights stay resident "
@@ -106,6 +117,13 @@ class Gfx906ModelSettings(io.ComfyNode):
                                tooltip="Merge the prefix cache K/V into a reused buffer with copy_ instead of "
                                        "torch.cat (Qwen-Image 2.1). default keeps it on; off "
                                        "restores the shipped torch.cat path."),
+                io.Combo.Input("qwen21_int8_cache", options=list(TRISTATE), default="default",
+                               tooltip="Keep the Qwen-Image 2.1 int8 prefix cache's K/V in int8 and run the "
+                                       "attention on the int8 kernel: the shipped path dequantizes both to fp16 "
+                                       "once per block. Measured 51.2 -> 34.2 ms per block at "
+                                       "4058+4032 tokens, 32 heads, d128 (1.50x), output diffl2 1.1e-2 "
+                                       "against the fp16-on-dequant reference (2.6e-4). default is off; off "
+                                       "keeps the fp16 path."),
                 io.Combo.Input("profile", options=list(TRISTATE), default="default",
                                tooltip="Print the tuning status once and per-call timings when each prompt finishes."),
             ],
@@ -114,13 +132,16 @@ class Gfx906ModelSettings(io.ComfyNode):
 
     @classmethod
     def execute(cls, model, attention: str, contiguous: str, fp16: str, amax_guard: str,
-                convrot: str, int8_tile: str, small_batch: str, int8_gemm: str, qkv: str, vae: str,
-                gemv: str, prefix_kv: str, profile: str) -> io.NodeOutput:
+                convrot: str, int8_tile: str, small_batch: str, int8_gemm: str, int8_attn: str,
+                int8_attn_rotate: str, qkv: str, vae: str,
+                gemv: str, prefix_kv: str, qwen21_int8_cache: str, profile: str) -> io.NodeOutput:
         apply()
         configure(attention=attention, fp16=fp16, convrot=convrot,
                   profile=profile, contiguous=contiguous, qkv=qkv,
                   vae=vae, gemv=gemv, prefix_kv=prefix_kv, amax_guard=amax_guard,
-                  int8_tile=int8_tile, small_batch=small_batch, int8_gemm=int8_gemm)
+                  int8_tile=int8_tile, small_batch=small_batch, int8_gemm=int8_gemm,
+                  int8_attn=int8_attn, int8_attn_rotate=int8_attn_rotate,
+                  qwen21_int8_cache=qwen21_int8_cache)
         return io.NodeOutput(model)
 
 
