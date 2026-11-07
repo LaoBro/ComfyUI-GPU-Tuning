@@ -1,24 +1,36 @@
-"""Build the node's HIP kernels (attention, int8 GEMM, activation rotation, W4A16 GEMV).
+"""Build the node's GPU kernels for this platform and target.
 
-The HIP toolchain lives in the ComfyUI venv (torch's ROCm wheel), not in a
-system ROCm install, so the SDK is staged into /tmp where clang expects it.
-Re-running is cheap: an up-to-date .so is left alone unless --force is given.
+One library per (target, logical name) goes into arch/<target>/kernels/. The
+loader derives the same filename from the running target, so a checkout can
+carry libraries built on several platforms side by side. Linux keeps the
+shipped names (libgfx906_attn.so); Windows uses gfx906_attn.dll.
+
+On Linux the HIP toolchain lives in the ComfyUI venv (torch's ROCm wheel), not
+in a system ROCm install, so the SDK is staged into a temp dir where clang
+expects it. Windows resolves the SDK through HIP_PATH instead. Re-running is
+cheap: an up-to-date library is left alone unless --force is given.
 """
 
 import argparse
 import glob
 import os
+import re
 import shutil
 import subprocess
 import sys
+import sysconfig
+import tempfile
+from pathlib import Path
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-KERNELS = os.path.join(ROOT, "arch", "gfx906", "kernels")
-TARGETS = [("hip_attn.cu", "libgfx906_attn.so"), ("hip_attn_i8.cu", "libgfx906_attn_i8.so"),
-           ("attn_quant.cu", "libgfx906_attn_quant.so"),
-           ("int8_gemm.cu", "libgfx906_int8.so"),
-           ("rotate.cu", "libgfx906_rotate.so"), ("w4a16.cu", "libgfx906_w4a16.so")]
-STAGE = "/tmp/hip_rocm"
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+from kernels import runtime                                          # noqa: E402
+
+TARGETS = [("hip_attn.cu", "attn"), ("hip_attn_i8.cu", "attn_i8"),
+           ("attn_quant.cu", "attn_quant"), ("int8_gemm.cu", "int8"),
+           ("rotate.cu", "rotate"), ("w4a16.cu", "w4a16")]
+STAGE = os.path.join(tempfile.gettempdir(), "hip_rocm")
+EXPORT_RE = re.compile(r'extern\s+"C"\s+int\s+(\w+)\s*\(')
 
 
 def find_hipcc():
@@ -32,9 +44,10 @@ def find_hipcc():
 
 def stage_sdk():
     """Link the SDK into the layout clang's ROCm driver looks for."""
+    if runtime.WINDOWS:
+        return None                       # the HIP SDK exposes HIP_PATH instead
     sdk = None
-    for path in glob.glob(os.path.join(sys.prefix, "lib", "python*", "site-packages",
-                                       "_rocm_sdk_core")):
+    for path in glob.glob(os.path.join(sysconfig.get_paths()["purelib"], "_rocm_sdk_core")):
         sdk = path
         break
     if sdk is None:
@@ -55,33 +68,59 @@ def stage_sdk():
     return STAGE
 
 
-def missing():
-    """Kernel libraries not built yet."""
-    return [output for _, output in TARGETS if not os.path.exists(os.path.join(KERNELS, output))]
+def missing(arch="gfx906"):
+    """Libraries not built yet for this target."""
+    directory = runtime.kernel_dir(arch)
+    return [runtime.library_name(arch, name) for _, name in TARGETS
+            if not (directory / runtime.library_name(arch, name)).exists()]
 
 
 def build(arch="gfx906", force=False):
+    if not re.fullmatch(r"[A-Za-z0-9_]+", arch):
+        print(f"invalid target: {arch}", file=sys.stderr)
+        return 1
     hipcc = find_hipcc()
     if hipcc is None:
         print("hipcc not found; run this with the ComfyUI venv python", file=sys.stderr)
         return 1
     rocm = stage_sdk()
-    for source, output in TARGETS:
-        src, so = os.path.join(KERNELS, source), os.path.join(KERNELS, output)
-        if not os.path.exists(src):
-            print(f"missing source: {src}", file=sys.stderr)
-            return 1
-        if not force and os.path.exists(so) and os.path.getmtime(so) >= os.path.getmtime(src):
-            print(f"up to date: {so}")
-            continue
-        cmd = [hipcc, "-O3", "-std=c++17", f"--offload-arch={arch}",
-               "-shared", "-fPIC", src, "-o", so, "-lamdhip64"]
-        if rocm:
-            cmd[4:4] = [f"--rocm-path={rocm}"]
-            cmd += [f"-L{os.path.join(rocm, 'lib')}"]
-        print(" ".join(cmd))
-        subprocess.run(cmd, check=True)
-        print(f"built {so}")
+    directory = runtime.kernel_dir(arch)
+    directory.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as tmp:
+        for source, name in TARGETS:
+            src = directory / source
+            out = directory / runtime.library_name(arch, name)
+            if not src.exists():
+                print(f"missing source: {src}", file=sys.stderr)
+                return 1
+            if not force and out.exists() and out.stat().st_mtime >= src.stat().st_mtime:
+                print(f"up to date: {out}")
+                continue
+            cmd = [hipcc, "-O3", "-std=c++17", f"--offload-arch={arch}"]
+            if rocm:
+                cmd.append(f"--rocm-path={rocm}")
+            cmd.append("-shared")
+            if not runtime.WINDOWS:
+                cmd.append("-fPIC")
+            cmd += [str(src), "-o", str(out)]
+            if runtime.WINDOWS:
+                symbols = EXPORT_RE.findall(src.read_text())
+                if not symbols:
+                    print(f'no extern "C" entry points in {src}', file=sys.stderr)
+                    return 1
+                def_path = Path(tmp) / f"{arch}_{name}.def"
+                def_path.write_text("EXPORTS\n" + "\n".join(f"    {s}" for s in symbols) + "\n")
+                hip_path = os.getenv("HIP_PATH")
+                if hip_path:
+                    cmd.append(f"-L{os.path.join(hip_path, 'lib')}")
+                cmd += [f"-Wl,/DEF:{def_path}", "-lamdhip64"]
+            else:
+                cmd.append("-lamdhip64")
+            if rocm:
+                cmd.append(f"-L{os.path.join(rocm, 'lib')}")
+            print(" ".join(cmd))
+            subprocess.run(cmd, check=True)
+            print(f"built {out}")
     return 0
 
 

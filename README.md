@@ -316,7 +316,7 @@ CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`imag
 
 `tools/bench.py --attention` / `--tile` 在 `.so` 缺失时自己跑这个构建（约 4 秒），因为少了它们那两个站点只是静默少一行最快的数据。节点启动不构建任何东西。
 
-产物是 gfx906-only 的 `libgfx906_attn.so` / `libgfx906_int8.so` / `libgfx906_rotate.so`（代码对象标志 `gfx906, xnack any, sramecc any`）；换卡时加载器按 `gcnArchName` 直接跳过，不会把别的卡带崩。
+产物按目标/平台命名，放在 `arch/<目标>/kernels/`：Linux 是 `lib<目标>_<名字>.so`（gfx906 的即上列三个），Windows 是 `<目标>_<名字>.dll`。代码对象按目标绑定（gfx906 那份的标志是 `gfx906, xnack any, sramecc any`）；加载器按当前 `gcnArchName` 拼出对应名字，找不到就跳过，不会把别的卡带崩。
 
 ### int8 线性的大 m 路径
 

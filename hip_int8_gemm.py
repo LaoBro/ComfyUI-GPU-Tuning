@@ -1,6 +1,6 @@
 """gfx906 HIP int8 GEMM for the large-row int8_linear path.
 
-Loads arch/gfx906/kernels/libgfx906_int8.so (built from int8_gemm.cu by
+Loads the `int8` library for this target (built from int8_gemm.cu by
 tools/build_hip_attn.py). One block per CU with a 128x128 tile and 64 int32
 accumulators: 4 waves/CU is the measured peak, see the kernel header.
 
@@ -11,34 +11,20 @@ node's fused convrot rotation), so only the GEMM itself differs.
 """
 
 import ctypes
-import glob
-import logging
-import os
 
 import torch
 
+try:
+    from .kernels import runtime
+except ImportError:                                   # imported as a top-level module
+    from kernels import runtime
+
 _LIB = None
 _PROBED = False
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_SO = os.path.join(_HERE, "arch", "gfx906", "kernels", "libgfx906_int8.so")
 
 # The 128-row tile wastes rows below this; measured parity up to 32 rows and a
 # win from 128 (see gfx906fix/hip_attn_v2/NOTES.md).
 MIN_ROWS = 128
-
-
-def _open_hip_runtime():
-    try:
-        return ctypes.CDLL("libamdhip64.so.7", mode=ctypes.RTLD_GLOBAL)
-    except OSError:
-        pass
-    root = os.path.dirname(os.path.dirname(torch.__file__))
-    for path in glob.glob(os.path.join(root, "_rocm_sdk_core", "lib", "libamdhip64.so*")):
-        try:
-            return ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
-        except OSError:
-            continue
-    return None
 
 
 def _load():
@@ -46,23 +32,13 @@ def _load():
     if _PROBED:
         return _LIB
     _PROBED = True
-    if torch.version.hip is None or not torch.cuda.is_available() or not os.path.exists(_SO):
+    lib = runtime.load("int8", "HIP int8 gemm")
+    if lib is None:
         return None
-    if not torch.cuda.get_device_properties(0).gcnArchName.startswith("gfx906"):
-        return None
-    if _open_hip_runtime() is None:
-        logging.info("gfx906: libamdhip64 not found, HIP int8 gemm stays off")
-        return None
-    try:
-        lib = ctypes.CDLL(_SO)
-        lib.gfx906_int8_gemm.restype = ctypes.c_int
-        lib.gfx906_int8_gemm.argtypes = ([ctypes.c_void_p] * 4 + [ctypes.c_int, ctypes.c_void_p,
-                                                                 ctypes.c_void_p]
-                                         + [ctypes.c_int] * 4 + [ctypes.c_void_p])
-    except OSError as exc:
-        logging.warning("gfx906: %s did not load (%s); rebuild it for this HIP runtime with "
-                        "tools/build_hip_attn.py --force", os.path.basename(_SO), exc)
-        return None
+    lib.gfx906_int8_gemm.restype = ctypes.c_int
+    lib.gfx906_int8_gemm.argtypes = ([ctypes.c_void_p] * 4 + [ctypes.c_int, ctypes.c_void_p,
+                                                             ctypes.c_void_p]
+                                     + [ctypes.c_int] * 4 + [ctypes.c_void_p])
     _LIB = lib
     return lib
 

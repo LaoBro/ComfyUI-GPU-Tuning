@@ -1,6 +1,6 @@
 """gfx906 HIP W4A16 decode GEMV: packed int4 weights, unquantised activations.
 
-Loads arch/gfx906/kernels/libgfx906_w4a16.so (built from w4a16.cu by
+Loads the `w4a16` library for this target (built from w4a16.cu by
 tools/build_hip_attn.py) and replaces w4a8_gemv.dequant_w4a16_kernel: the nibbles
 stay packed in registers and resolve through a 16-entry fp32 table in LDS. Three
 entries by row count and dtype -- m=1 decode (3.6-4.4x Triton, 185-274 GB/s
@@ -20,38 +20,20 @@ The stream is read at call time: torch.cuda.graph() switches current_stream to i
 capture stream, so a cached handle would leave the launch out of the graph.
 """
 import ctypes
-import glob
-import logging
 import os
 import sys
 
 import torch
 
 try:
-    from .kernels import registry as kreg
+    from .kernels import registry as kreg, runtime
 except ImportError:                                   # imported as a top-level module
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from kernels import registry as kreg
+    from kernels import registry as kreg, runtime
 
 _LIB = None
 _PROBED = False
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_SO = os.path.join(_HERE, "arch", "gfx906", "kernels", "libgfx906_w4a16.so")
 BK = 1024                     # k elements per staged chunk, must divide the row
-
-
-def _open_hip_runtime():
-    try:
-        return ctypes.CDLL("libamdhip64.so.7", mode=ctypes.RTLD_GLOBAL)
-    except OSError:
-        pass
-    root = os.path.dirname(os.path.dirname(torch.__file__))
-    for path in glob.glob(os.path.join(root, "_rocm_sdk_core", "lib", "libamdhip64.so*")):
-        try:
-            return ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
-        except OSError:
-            continue
-    return None
 
 
 def _load():
@@ -59,30 +41,20 @@ def _load():
     if _PROBED:
         return _LIB
     _PROBED = True
-    if torch.version.hip is None or not torch.cuda.is_available() or not os.path.exists(_SO):
+    lib = runtime.load("w4a16", "HIP W4A16 GEMV")
+    if lib is None:
         return None
-    if not torch.cuda.get_device_properties(0).gcnArchName.startswith("gfx906"):
-        return None
-    if _open_hip_runtime() is None:
-        logging.info("gfx906: libamdhip64 not found, HIP W4A16 GEMV stays off")
-        return None
-    try:
-        lib = ctypes.CDLL(_SO)
-        # An .so built before one of these entries leaves that attribute None and
-        # the caller falls back for the shapes it needs.
-        for name in ("gfx906_w4a16", "gfx906_w4a16_m", "gfx906_w4a16_h",
-                     "gfx906_w4a16_mu"):
-            try:
-                fn = getattr(lib, name)
-                fn.restype = ctypes.c_int
-                fn.argtypes = ([ctypes.c_void_p] * 7 + [ctypes.c_int] * 7
-                               + [ctypes.c_int64, ctypes.c_void_p])
-            except AttributeError:
-                setattr(lib, name, None)
-    except OSError as exc:
-        logging.warning("gfx906: %s did not load (%s); rebuild it for this HIP runtime with "
-                        "tools/build_hip_attn.py --force", os.path.basename(_SO), exc)
-        return None
+    # A library built before one of these entries leaves that attribute None and
+    # the caller falls back for the shapes it needs.
+    for name in ("gfx906_w4a16", "gfx906_w4a16_m", "gfx906_w4a16_h",
+                 "gfx906_w4a16_mu"):
+        try:
+            fn = getattr(lib, name)
+            fn.restype = ctypes.c_int
+            fn.argtypes = ([ctypes.c_void_p] * 7 + [ctypes.c_int] * 7
+                           + [ctypes.c_int64, ctypes.c_void_p])
+        except AttributeError:
+            setattr(lib, name, None)
     _LIB = lib
     return lib
 

@@ -12,38 +12,20 @@ this side of the ABI.
 """
 
 import ctypes
-import glob
-import logging
-import os
 
 import torch
+
+try:
+    from .kernels import runtime
+except ImportError:                                   # imported as a top-level module
+    from kernels import runtime
 
 _LIB = None
 _LIBQ = None
 _PROBED = False
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_SO = os.path.join(_HERE, "arch", "gfx906", "kernels", "libgfx906_attn_i8.so")
-_SOQ = os.path.join(_HERE, "arch", "gfx906", "kernels", "libgfx906_attn_quant.so")
 
 # group sizes the quantization helper can rotate by (Hadamard, power of two)
 ROTATE_MODES = (0, 32, 64, 128, 256)
-
-
-def _open_hip_runtime():
-    """Make libamdhip64's symbols global so the extension resolves at load."""
-    try:
-        return ctypes.CDLL("libamdhip64.so.7", mode=ctypes.RTLD_GLOBAL)
-    except OSError:
-        pass
-    roots = [os.path.dirname(os.path.dirname(torch.__file__))]
-    for root in roots:
-        hits = glob.glob(os.path.join(root, "_rocm_sdk_core", "lib", "libamdhip64.so*"))
-        for path in hits:
-            try:
-                return ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
-            except OSError:
-                continue
-    return None
 
 
 def _load():
@@ -51,41 +33,27 @@ def _load():
     if _PROBED:
         return _LIB
     _PROBED = True
-    if torch.version.hip is None or not torch.cuda.is_available() or not os.path.exists(_SO):
+    lib = runtime.load("attn_i8", "INT8 attention")
+    if lib is None:
         return None
-    if not torch.cuda.get_device_properties(0).gcnArchName.startswith("gfx906"):
-        return None
-    if _open_hip_runtime() is None:
-        logging.info("gfx906: libamdhip64 not found, INT8 attention stays off")
-        return None
-    try:
-        lib = ctypes.CDLL(_SO)
-        lib.gfx906_attn_i8_fwd.restype = ctypes.c_int
-        lib.gfx906_attn_i8_fwd.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_longlong] + [
-            ctypes.c_void_p] * 6 + [ctypes.c_int] * 9 + [ctypes.c_float, ctypes.c_void_p]
-    except OSError as exc:
-        logging.warning("gfx906: %s did not load (%s); rebuild it for this HIP runtime with "
-                        "tools/build_hip_attn.py --force", os.path.basename(_SO), exc)
-        return None
+    lib.gfx906_attn_i8_fwd.restype = ctypes.c_int
+    lib.gfx906_attn_i8_fwd.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_longlong] + [
+        ctypes.c_void_p] * 6 + [ctypes.c_int] * 9 + [ctypes.c_float, ctypes.c_void_p]
     _LIB = lib
-    if os.path.exists(_SOQ):
-        try:
-            q = ctypes.CDLL(_SOQ)
-            q.gfx906_rot_quant.restype = ctypes.c_int
-            q.gfx906_rot_quant.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-                                           ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
-            q.gfx906_rot_f16.restype = ctypes.c_int
-            q.gfx906_rot_f16.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int,
-                                         ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
-            q.gfx906_rot_pack_v.restype = ctypes.c_int
-            q.gfx906_rot_pack_v.argtypes = [ctypes.c_void_p, ctypes.c_longlong, ctypes.c_longlong,
-                                            ctypes.c_void_p, ctypes.c_longlong, ctypes.c_longlong,
-                                            ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-                                            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
-            _LIBQ = q
-        except OSError as exc:
-            logging.warning("gfx906: %s did not load (%s), the int8 prefix cache path stays off",
-                            os.path.basename(_SOQ), exc)
+    q = runtime.load("attn_quant", "the int8 prefix cache path")
+    if q is not None:
+        q.gfx906_rot_quant.restype = ctypes.c_int
+        q.gfx906_rot_quant.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                                       ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+        q.gfx906_rot_f16.restype = ctypes.c_int
+        q.gfx906_rot_f16.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int,
+                                     ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+        q.gfx906_rot_pack_v.restype = ctypes.c_int
+        q.gfx906_rot_pack_v.argtypes = [ctypes.c_void_p, ctypes.c_longlong, ctypes.c_longlong,
+                                        ctypes.c_void_p, ctypes.c_longlong, ctypes.c_longlong,
+                                        ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+        _LIBQ = q
     return lib
 
 

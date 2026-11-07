@@ -31,16 +31,19 @@ radix-4 butterfly 拿到约 12 倍，靠的是消掉 8 次串行全局读和 O(G
    硬件上限还有多远必须用深队列（连续提交几百次、只在两端同步），见坑点。
 2. **写 `.cu`**。用 `extern "C"` 平铺 ABI：`void*` 指针加 `int` 尺寸
    加 `void* stream`，返回 `int` 错误码。不做 torch 扩展，用 ctypes 直接调。
-3. **构建**。把源文件加进 `tools/build_hip_attn.py` 的 `TARGETS`，复用同一套
-   hipcc 参数。产物是某个 `gcnArchName` 专用的代码对象，别的架构要各自编译。
-4. **写 loader**。照 `hip_attention.py` / `hip_int8_gemm.py` / `hip_rotate.py`：
-   检查 `torch.version.hip`、CUDA 可用、`gcnArchName`、`.so` 存在；用
-   `RTLD_GLOBAL` 打开 `libamdhip64`；加载失败打一条 WARNING 并给出重编命令，
-   返回 `None` 让调用方回落。
+3. **构建**。把源文件加进 `tools/build_hip_attn.py` 的 `TARGETS`（逻辑名，不带
+   平台前缀），用 `--arch <目标>` 指定 `gcnArchName`。产物落在
+   `arch/<目标>/kernels/`，文件名由 `kernels/runtime.py` 的 `library_name()` 决定：
+   Linux 是 `lib<目标>_<名字>.so`，Windows 是 `<目标>_<名字>.dll`。一份 checkout
+   因此可以同时放几个平台/架构的产物。代码对象按目标绑定，别的架构要各自编译。
+   Windows 由构建脚本生成 `.def` 导出 `extern "C"` 入口并链接 `amdhip64.lib`。
+4. **写 loader**。照 `hip_attention.py`：调 `kernels/runtime.py` 的 `load(名字)`，
+   它按当前平台/架构定位产物、预载运行时、加载失败打 WARNING 并返回 `None` 让调用方
+   回落；loader 只设 `argtypes` 和形状校验。不要把架构名或库文件名写进 loader。
 5. **接入站点**。在 `BackendRegistry` 加一个 Candidate，或在调用点分派。
    一定要留一条自动回落路径（Triton / core），再给一个能关掉的开关。
 6. **验收**：数值等价（见坑点）、A/B 计时、开关 `off` 能复现旧行为、
-   `.so` 缺失 / 加载失败 / 形状不符时节点照常启动。
+   产物缺失 / 加载失败 / 形状不符时节点照常启动。
 
 ## 常见坑点
 
