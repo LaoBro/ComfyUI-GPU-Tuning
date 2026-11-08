@@ -57,6 +57,12 @@ default_grade = "measured"
 default = "on"
 default_grade = "measured"
 
+# Non-quantized fp16 linear: the self-written v_dot2 GEMM beats rocBLAS on big
+# aligned shapes (SDXL UNet linear is 66% of forward; ~1.18x end-to-end measured).
+[sites."feature.f16_gemm"]
+default = "on"
+default_grade = "measured"
+
 [sites."vae.decode".shapes]
 "c512x64" = { impl = "conv2d", ms = { conv2d = 0.628644, torch = 2.7541 }, grade = "measured", date = "2026-11-05", note = "depth-1 conv3d, fp16, padding 0" }
 "c512x128" = { impl = "conv2d", ms = { conv2d = 2.42322, torch = 7.90901 }, grade = "measured", date = "2026-11-05", note = "depth-1 conv3d, fp16, padding 0" }

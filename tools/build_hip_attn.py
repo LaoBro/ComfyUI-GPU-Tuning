@@ -28,7 +28,8 @@ from kernels import runtime                                          # noqa: E40
 
 TARGETS = [("hip_attn.cu", "attn"), ("hip_attn_i8.cu", "attn_i8"),
            ("attn_quant.cu", "attn_quant"), ("int8_gemm.cu", "int8"),
-           ("rotate.cu", "rotate"), ("w4a16.cu", "w4a16")]
+           ("rotate.cu", "rotate"), ("w4a16.cu", "w4a16"),
+           ("fp16_gemm.cu", "fp16")]
 STAGE = os.path.join(tempfile.gettempdir(), "hip_rocm")
 EXPORT_RE = re.compile(r'extern\s+"C"\s+int\s+(\w+)\s*\(')
 

@@ -1154,6 +1154,49 @@ def _hip_int8_gemm():
     return hip_int8_gemm
 
 
+def _hip_f16_gemm():
+    """The gfx906 HIP fp16 GEMM module, or None when it is not built."""
+    try:
+        from . import hip_f16_gemm
+    except ImportError:
+        try:
+            import hip_f16_gemm
+        except ImportError:
+            return None
+    return hip_f16_gemm
+
+
+def patch_f16_linear():
+    """Run big aligned fp16 nn.Linear calls on the gfx906 GEMM, delegate the rest.
+
+    Installed on comfy.ops.disable_weight_init.Linear.forward, which
+    manual_cast.Linear inherits, so it covers the non-quantized model layers.
+    A call with LoRA weight/bias functions, a non-fp16 or unaligned shape, or a
+    decode GEMV falls through to the original rocBLAS path.
+    """
+    import comfy.ops
+
+    mod = _hip_f16_gemm()
+    if mod is None or not mod.available():
+        return False
+    cls = comfy.ops.disable_weight_init.Linear
+    if getattr(cls.forward, "_gfx906_f16", False):
+        return True
+    orig = cls.forward
+
+    def forward(self, *args, **kwargs):
+        comfy.ops.run_every_op()
+        if args and not self.weight_function and not self.bias_function:
+            out = mod.linear(args[0], self.weight, self.bias)
+            if out is not None:
+                return out
+        return orig(self, *args, **kwargs)
+
+    forward._gfx906_f16 = True
+    cls.forward = forward
+    return True
+
+
 def _hip_attention():
     """The gfx906 HIP attention extension module, or None when it is not built."""
     try:
@@ -2395,6 +2438,11 @@ def apply():
             _install("int8 tile reset", restore_int8_defaults)
     # tier-3 features: on only where the manifest says so -- the shipped table
     # for measured archs, or a local bench run. env overrides per value.
+    # non-quantized fp16 linear: big aligned GEMMs beat rocBLAS on the measured
+    # arch; COMFY_GFX906_F16_GEMM forces it on/off for A/B.
+    if env_flag("COMFY_GFX906_F16_GEMM", "1" if feature_on("f16_gemm") else "0"):
+        _state["f16_gemm_enabled"] = True
+        _install("f16 gemm", patch_f16_linear)
     if feature_on("convrot"):
         _install("convrot", patch_convrot)
     if feature_on("vae"):

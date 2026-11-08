@@ -278,6 +278,47 @@ unroll 2，分配器自然落在 124 VGPR → 2 block/CU（8 波），15.76 TMAC
 散写改成 2 次 uint4（中性，但指令更少）。至此与参考包对齐形状持平（0.99x），
 非对齐 M（如 4032）参考包退到通用 tile64（7.20 TMAC/s），本内核仍有 15.91（2.21x）。
 
+### 自研 fp16 GEMM（`fp16_gemm.cu` / `gfx906_f16_gemm`）
+
+非量化 SDXL 的线性层占 UNet 前向的 69%（其中大且对齐的占 66%），全走 rocBLAS。
+把 int8 那套寄存器预算方法直接迁到 `v_dot2_f32_f16`：128x128 tile、64 个 fp32
+累加器、操作数驻 LDS 逐 k-pair 即时读（W 的 TN 个 dword 跨 TM 行复用）、s 循环
+unroll 2、uint4 整块写、`ALIGNED_K` 特化——一次落到 **124 VGPR / 0 spill /
+2 block/CU（8 波）**。契约取 `C = x @ W^T + bias`（W 为 `[N,K]`），正好匹配
+`nn.Linear`，权重免转置。dot2 用 `__builtin_amdgcn_fdot2`（非 volatile，编译器
+可调度；操作数 bitcast 成 `_Float16` 二维向量）。
+
+对 rocBLAS 逐形状 1.0–1.6x（L3 投影 1.28x、L2 FFN1 1.60x；最大的 L3 FFN1
+1024x1280x10240 只有 1.08x，是上限瓶颈）。接入缝是
+`comfy.ops.disable_weight_init.Linear.forward`（`manual_cast.Linear` 继承它），
+`hip_f16_gemm.linear` 带守卫：fp16、`M>=128`、`K%32`、`N%64`、无 LoRA
+weight/bias function，否则回落 rocBLAS（decode GEMV 与非对齐形状不接）。
+`feature.f16_gemm` 出厂 on，`COMFY_GFX906_F16_GEMM` 可 A/B。**SDXL UNet 端到端
+实测 609 → 515.6 ms = 1.18x**（无外部依赖；参考包同形状约 1.22x）。数值 rel 对
+F.linear ~2e-5、对 fp64 2.1e-4（fp16 舍入），生图 md5 仍按惯例 `--sampling off` 复验。
+
+与参考包的剩余差距（~0.93x，已归因，C++ 内收不回）：逐形状 ours/ref 稳定在
+0.89–0.95x，连 4096 个 block 的大方阵也一样，所以**不是网格/tile 占用，是内循环
+效率**。指令构成（每 dot2）：自研 total 12.56 / waitcnt 0.617 / 非dot VALU 6.27 /
+分支 1.125，参考（127 VGPR 手写 asm）total 2.13 / waitcnt 0.078 / VALU 0.73 /
+分支 0.012。差距来自卷循环的分支+地址运算+编译器保守 waitcnt。两个展开实验都
+否了：全展开 s → 156 VGPR 掉到 4 波，反而 0.8x（占用率比循环开销更值钱）；
+half 也 unroll 2 → 128 VGPR/8 波但性能与卷着几乎相同（1.0x）。即 hipcc 无法在
+8 波下手写出参考那种 waitcnt 布局与软件流水。要追平需手写 GCN asm（独立工程量），
+折算到 SDXL 端到端只约 1.18→1.23x（~4%），ROI 低，暂不做。
+
+inline-asm 原型已做（HIP 完全支持，机制都验证过）：`register float acc asm("vN")`
+钉累加器 + `"+v"` 操作数（clang 支持 64+ 个，无 GCC 的 30 上限）+ `(uint32_t)
+(uintptr_t)&shared[...]` 喂 `ds_read` 的 LDS 地址。两个坑：clobber 不回写 pinned
+寄存器（要用 `"+v"` 操作数）；输出 temp 与输入 base 共用寄存器会提前覆盖 base
+（要 early-clobber `"=&v"`）。修对后数值 rel ~1e-5、107 VGPR/8 波、wait/dot 降到
+0.089（接近参考 0.078）、全展开无分支——**静态指标全面优于 C++，动态却 0.94x 更慢**。
+原因：朴素「全读→`s_waitcnt lgkmcnt(0)`→全算」每次创建满 LDS 延迟气泡；参考用
+倒数 waitcnt（3/2/1/0）让首批操作数一到就开算、计算与后续读重叠，再加 b128 宽读
+（我们用 b32）和 16x4 tile 的操作数寄存器复用。**教训：wait 指令少 ≠ 快，必须靠
+交错隐藏延迟。** 追平参考等于复刻它的整套流水+寄存器布局，ROI 仍低，原型 generator
+留在 /tmp/gen_fp16_asm.py，生产仍用 C++ 版。
+
 ### 均匀格点的 VALU 化（`w4a16_gemv_m` / `gfx906_w4a16_mu`）
 
 这一格是 fp32 激活的多行解码（`w4a8_gemv.linear_dequant` 先把 x 转成 fp32）；
