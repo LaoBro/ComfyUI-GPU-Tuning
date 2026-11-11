@@ -1,6 +1,6 @@
 """Sweep int8 GEMM tiles on this GPU and print the winners.
 
-    python custom_nodes/ComfyUI-gfx906-Tuning/tools/tile_sweep.py
+    python custom_nodes/ComfyUI-GPU-Tuning/tools/tile_sweep.py
     python ... --m 1,2,8,128,4032 --shapes 4096x4096,4096x12288
     python ... --candidate block_m=128,block_n=128,block_k=64,group_size_m=8,warps=8,stages=3
 
@@ -9,7 +9,7 @@ exactly one candidate in the list at a time, so autotune compiles and measures
 only that tile. Results are per (shape, m), plus one suggested large tile
 (m > 8) and one small tile (m <= 8).
 
-Pass --emit to print the two COMFY_GFX906_*_TILE_CONFIG startup variables and a
+Pass --emit to print the two COMFY_GPU_TUNE_*_TILE_CONFIG startup variables and a
 ready-to-paste INT8_TILE_TABLE entry for another card.
 """
 
@@ -79,7 +79,7 @@ def parse_args():
 
 
 def default_candidates(kernels):
-    from gfx906_tuning import INT8_SMALL_STAGES, INT8_SMALL_WARPS, INT8_STAGES, INT8_TILE, INT8_TILE_SMALL, INT8_WARPS
+    from gpu_tuning import INT8_SMALL_STAGES, INT8_SMALL_WARPS, INT8_STAGES, INT8_TILE, INT8_TILE_SMALL, INT8_WARPS
 
     items = []
     for config in kernels[0].configs:
@@ -198,7 +198,7 @@ def main():
         print("no CUDA/ROCm device")
         return 1
 
-    import gfx906_tuning as tuning
+    import gpu_tuning as tuning
 
     tuning.enable_triton_backend()
     kernels = list(tuning._int8_kernels())
@@ -237,9 +237,9 @@ def main():
 
     if args.emit:
         print("\nstartup variables (node defaults stay 'default'):")
-        print(f'COMFY_GFX906_TILE_CONFIG="{large_key}"')
+        print(f'COMFY_GPU_TUNE_TILE_CONFIG="{large_key}"')
         if small_key is not None:
-            print(f'COMFY_GFX906_SMALL_TILE_CONFIG="{small_key}"')
+            print(f'COMFY_GPU_TUNE_SMALL_TILE_CONFIG="{small_key}"')
         print("TILE_CONFIG makes this card 'measured' (single config, no autotune).")
         print("SMALL_TILE_CONFIG alone only changes the candidate / forced small tile.")
         print("\nTo store both for this card instead of exporting variables, run")

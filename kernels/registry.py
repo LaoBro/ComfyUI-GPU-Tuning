@@ -60,7 +60,7 @@ def safe_install(label, fn, *args, **kwargs):
     except Exception as exc:                                    # noqa: BLE001 - filtered below
         if not is_downgradable(exc):
             raise
-        logger.warning("gfx906: %s not available on this device (%s: %s), keeping the fallback",
+        logger.warning("gpu-tune: %s not available on this device (%s: %s), keeping the fallback",
                        label, type(exc).__name__, exc)
         return FAILED
 
@@ -83,7 +83,7 @@ def runtime_manifest():
 
     Imported lazily so a worker without the manifest package still starts, and
     cached because the file does not change while ComfyUI runs.
-    COMFY_GFX906_MEASURED=off skips it entirely: that is the escape hatch when a
+    COMFY_GPU_TUNE_MEASURED=off skips it entirely: that is the escape hatch when a
     table turns out wrong for a driver whose fingerprint we did not catch.
     """
     global _runtime_manifest, _runtime_loaded
@@ -93,14 +93,14 @@ def runtime_manifest():
     try:
         import os
 
-        if os.getenv("COMFY_GFX906_MEASURED", "1").strip().lower() in ("0", "off", "false", "no"):
-            logger.info("gfx906: measured table off (COMFY_GFX906_MEASURED), falling back to probes")
+        if os.getenv("COMFY_GPU_TUNE_MEASURED", "1").strip().lower() in ("0", "off", "false", "no"):
+            logger.info("gpu-tune: measured table off (COMFY_GPU_TUNE_MEASURED), falling back to probes")
             return None
         from . import manifest as manifest_module
 
         _runtime_manifest = manifest_module.load_runtime()
     except Exception as exc:                                # noqa: BLE001 - never block a start
-        logger.warning("gfx906: measurement manifest unavailable: %s: %s", type(exc).__name__, exc)
+        logger.warning("gpu-tune: measurement manifest unavailable: %s: %s", type(exc).__name__, exc)
         _runtime_manifest = None
     return _runtime_manifest
 
@@ -120,7 +120,7 @@ def site_candidates(site, base, arch=None):
         if cand.name in taken:
             # a discovered file must not shadow one the site already declares:
             # two candidates under one name would share a memoised availability
-            logger.warning("gfx906: %s: dropping arch kernel %r, the site already declares "
+            logger.warning("gpu-tune: %s: dropping arch kernel %r, the site already declares "
                            "that name", site, cand.name)
             continue
         taken.add(cand.name)
@@ -202,7 +202,7 @@ class BackendRegistry:
             try:
                 return candidate.loader() is not None
             except Exception as exc:                            # noqa: BLE001
-                logger.warning("gfx906: %s %s could not be loaded: %s: %s",
+                logger.warning("gpu-tune: %s %s could not be loaded: %s: %s",
                                self.site, candidate.name, type(exc).__name__, exc)
                 return False
         if mode == MODE_ON:
@@ -212,7 +212,7 @@ class BackendRegistry:
         try:
             return bool(candidate.probe())
         except Exception as exc:                                # noqa: BLE001
-            logger.info("gfx906: %s %s probe failed on this device: %s: %s",
+            logger.info("gpu-tune: %s %s probe failed on this device: %s: %s",
                         self.site, candidate.name, type(exc).__name__, exc)
             return False
 
@@ -228,7 +228,7 @@ class BackendRegistry:
         # Cannot happen while the last candidate is portable, but a site that
         # breaks that rule should run *something* rather than crash a load.
         self._resolved = self.candidates[-1].name
-        logger.warning("gfx906: %s has no available candidate, using %s",
+        logger.warning("gpu-tune: %s has no available candidate, using %s",
                        self.site, self._resolved)
         return self._resolved
 
@@ -268,7 +268,7 @@ class BackendRegistry:
             try:
                 name = table.lookup(self.site, n, k, m, self.min_grade)
             except Exception as exc:                        # noqa: BLE001
-                logger.warning("gfx906: %s table lookup failed (%s: %s), ignoring the table",
+                logger.warning("gpu-tune: %s table lookup failed (%s: %s), ignoring the table",
                                self.site, type(exc).__name__, exc)
                 self._auto_manifest = False
                 self._manifest = None

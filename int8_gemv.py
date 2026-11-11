@@ -117,7 +117,7 @@ def load_hip_rotate():
 
 
 def _hip_rotate_enabled():
-    return os.getenv("COMFY_GFX906_ROTATE", "1").strip().lower() not in ("0", "off", "false", "no")
+    return os.getenv("COMFY_GPU_TUNE_ROTATE", "1").strip().lower() not in ("0", "off", "false", "no")
 
 
 def rotate(x, groupsize):
@@ -127,7 +127,7 @@ def rotate(x, groupsize):
     rotated = torch.empty_like(x)
     gmax = torch.empty((rows, ngroups), device=x.device, dtype=torch.float32)
     # HIP butterfly: no Hadamard matrix traffic, ~12x on the fp32 decode path.
-    # COMFY_GFX906_ROTATE=off restores the Triton kernel for A/B. On fp16 x the
+    # COMFY_GPU_TUNE_ROTATE=off restores the Triton kernel for A/B. On fp16 x the
     # HIP kernel accumulates in fp32, so its quantized activation is more
     # accurate but not bit-identical to the Triton path.
     if _hip_rotate_enabled():
@@ -278,7 +278,7 @@ def _probe_asm():
 _REGISTRY = kreg.BackendRegistry(
     "int8_gemv.m1",
     kreg.site_candidates("int8_gemv.m1", [
-        kreg.Candidate("asm", kind="asm", env="COMFY_GFX906_INT8_GEMV_ASM",
+        kreg.Candidate("asm", kind="asm", env="COMFY_GPU_TUNE_INT8_GEMV_ASM",
                        probe=_probe_asm, priority=50, requires=("v_dot4_i32_i8",)),
         kreg.Candidate("triton", kind="portable"),
     ]),
@@ -340,7 +340,7 @@ def linear(x, weight, weight_scale, bias, out_dtype, groupsize):
     rotation and uses the row max of the raw activation.
 
     Backend: v_dot4 asm when it compiles here, otherwise the int32 tl.sum kernel.
-    COMFY_GFX906_INT8_GEMV_ASM=auto/on/off selects it; a measurement for this
+    COMFY_GPU_TUNE_INT8_GEMV_ASM=auto/on/off selects it; a measurement for this
     shape in arch/<gcn>/manifest.toml overrides the probe order.
     """
     try:

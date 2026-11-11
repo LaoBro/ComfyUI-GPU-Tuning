@@ -304,7 +304,7 @@ w4a16_gemv_m(const float* __restrict__ x, const uint32_t* __restrict__ wq,
 }
 
 // fp16 activation variant, the default feed unless the checkpoint carries a codebook
-// (COMFY_GFX906_W4A16_F16ACT=1 allows it there too). Same
+// (COMFY_GPU_TUNE_W4A16_F16ACT=1 allows it there too). Same
 // shape as w4a16_gemv_m, but the staged activations are fp16 and the math is
 // v_dot2_f32_f16. That breaks the cap the fp32 variant hits: a quad row now holds
 // 8 k per lane, so one ds_read_b128 feeds four dot2 = eight MACs instead of four

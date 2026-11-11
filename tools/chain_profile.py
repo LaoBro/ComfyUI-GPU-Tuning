@@ -17,7 +17,7 @@ Rows are self time, a region's total minus the regions nested directly inside
 it, so the table adds up instead of counting a block's attention twice.
 
     cd /home/liu/ComfyUI-0.39.0
-    .venv/bin/python custom_nodes/ComfyUI-gfx906-Tuning/tools/chain_profile.py \
+    .venv/bin/python custom_nodes/ComfyUI-GPU-Tuning/tools/chain_profile.py \
         --clip qwen3.5-9b.safetensors --max-length 64
 
     ... --clip X --image photo.jpg                  # the image tower joins the chain
@@ -27,7 +27,7 @@ it, so the table adds up instead of counting a block's attention twice.
     ... --clip X --list-classes                     # the census, to pick --wrap names
 
 The four textgen items have no configure() entry; A/B them with the env
-switches that apply() reads: COMFY_GFX906_DELTANET, _KVDECODE, _LLAMA,
+switches that apply() reads: COMFY_GPU_TUNE_DELTANET, _KVDECODE, _LLAMA,
 _QWEN35.
 
 ComfyUI flags pass through (--disable-cuda-graphs, --highvram). Library use
@@ -222,7 +222,7 @@ def main():
 
     tuning = None
     if args.pack == "on":
-        import gfx906_tuning as tuning
+        import gpu_tuning as tuning
 
         tuning.apply()
         overrides = dict(item.partition("=")[::2] for item in args.set)

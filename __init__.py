@@ -1,4 +1,4 @@
-"""ComfyUI node pack: runtime tuning for gfx906 (MI50 / MI60 / Radeon VII).
+"""ComfyUI node pack: runtime tuning for AMD GPUs, measured on gfx906 (MI50 / MI60 / Radeon VII).
 
 Applies the patches on startup so an unmodified ComfyUI gets the tuned int8
 linear tiles, the butterfly convrot rotation and the fp16 attention kernel.
@@ -19,7 +19,7 @@ from typing_extensions import override
 
 from comfy_api.latest import ComfyExtension, io
 
-from .gfx906_tuning import (
+from .gpu_tuning import (
     ATTENTION_KERNELS,
     CONVROT_MODES,
     TRISTATE,
@@ -33,15 +33,15 @@ from .profiler import install as install_profiler
 from .profiler import watch as watch_profiler
 
 
-class Gfx906ModelSettings(io.ComfyNode):
+class GpuTuningModelSettings(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
         return io.Schema(
-            node_id="Gfx906ModelSettings",
-            display_name="GFX906 Model Settings",
+            node_id="GpuTuningModelSettings",
+            display_name="GPU Tuning Model Settings",
             category="advanced/debug",
             description=(
-                "Runtime settings for the gfx906 tuning pack. Values take effect on the next execution, "
+                "Runtime settings for the GPU Tuning pack. Values take effect on the next execution, "
                 "no restart needed. Wire it between the model loader and the sampler. Every switch is "
                 "three-state: default keeps the built-in default, on/off overrides it."
             ),
@@ -80,7 +80,7 @@ class Gfx906ModelSettings(io.ComfyNode):
                                        "kitchen autotune list. default keeps the injected tiles; off "
                                        "restores the stock list. The m<=8 narrow tile has its own switch."),
                 io.Combo.Input("small_batch", options=list(TRISTATE), default="default",
-                               tooltip="gfx906: switch the int8 kernel to the 16x32x64 narrow tile when m<=8 "
+                               tooltip="On gfx906: switch the int8 kernel to the 16x32x64 narrow tile when m<=8 "
                                        "(text decode / MTP verify), and back to 128x256x32 for larger batches. "
                                        "Other AMD: add the narrow tile as an autotune candidate and let that "
                                        "card decide. default keeps the built-in split; needs int8_tile on. "
@@ -145,15 +145,15 @@ class Gfx906ModelSettings(io.ComfyNode):
         return io.NodeOutput(model)
 
 
-class Gfx906ClipSettings(io.ComfyNode):
+class GpuTuningClipSettings(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
         return io.Schema(
-            node_id="Gfx906ClipSettings",
-            display_name="GFX906 CLIP Settings",
+            node_id="GpuTuningClipSettings",
+            display_name="GPU Tuning CLIP Settings",
             category="advanced/debug",
             description=(
-                "Text-encoder settings for the gfx906 tuning pack. Sits in the CLIP chain, between the "
+                "Text-encoder settings for the GPU Tuning pack. Sits in the CLIP chain, between the "
                 "loader and the text encode; applies to every text encoder in the process. The on/off "
                 "switches are three-state: default keeps the built-in default; text_encoder "
                 "and text_attention use default as an explicit choice instead."
@@ -190,7 +190,7 @@ class Gfx906ClipSettings(io.ComfyNode):
                 io.Combo.Input("textgen", options=list(TRISTATE), default="default",
                                tooltip="Text-generation patches: DeltaNet decode kernels, folded KV decode, "
                                        "llama RMSNorm/RoPE caching and the Qwen3.5 compute classes. default "
-                                       "the four COMFY_GFX906_DELTANET/KVDECODE/LLAMA/QWEN35 knobs "
+                                       "the four COMFY_GPU_TUNE_DELTANET/KVDECODE/LLAMA/QWEN35 knobs "
                                        "individually; on/off "
                                        "switches all four together without a reload."),
             ],
@@ -206,16 +206,16 @@ class Gfx906ClipSettings(io.ComfyNode):
         return io.NodeOutput(clip)
 
 
-class Gfx906TuningExtension(ComfyExtension):
+class GpuTuningExtension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
-        return [Gfx906ModelSettings, Gfx906ClipSettings]
+        return [GpuTuningModelSettings, GpuTuningClipSettings]
 
 
-async def comfy_entrypoint() -> Gfx906TuningExtension:
+async def comfy_entrypoint() -> GpuTuningExtension:
     apply()
     watch_profiler(report_lines)
     hooks = install_profiler()
     if hooks:
-        logging.info("gfx906 profiler hooks: %s (report printed when each prompt finishes)", ", ".join(hooks))
-    return Gfx906TuningExtension()
+        logging.info("gpu-tune profiler hooks: %s (report printed when each prompt finishes)", ", ".join(hooks))
+    return GpuTuningExtension()

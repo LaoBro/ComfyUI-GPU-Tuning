@@ -3,7 +3,7 @@
 Run it with the ComfyUI interpreter, on the machine that has the GPU:
 
     /home/liu/ComfyUI-0.39.0/.venv/bin/python \
-        custom_nodes/ComfyUI-gfx906-Tuning/tools/verify_backends.py
+        custom_nodes/ComfyUI-GPU-Tuning/tools/verify_backends.py
 
 Three things are checked, in order of how much they can lie to you:
 
@@ -86,8 +86,8 @@ def selection(w4a8, int8, legacy):
 
     envs = [None, "", "auto", "on", "asm", "1", "off", "triton", "0", "nonsense"]
     for module, env_name, name, want_fn in (
-        (w4a8, "COMFY_GFX906_W4A8_ASM", "w4a8", lambda e: legacy.legacy_w4a8(e, hip, w4a8_asm, [])[0]),
-        (int8, "COMFY_GFX906_INT8_GEMV_ASM", "int8_gemv", lambda e: legacy.legacy_int8(e, int8_asm, [])[0]),
+        (w4a8, "COMFY_GPU_TUNE_W4A8_ASM", "w4a8", lambda e: legacy.legacy_w4a8(e, hip, w4a8_asm, [])[0]),
+        (int8, "COMFY_GPU_TUNE_INT8_GEMV_ASM", "int8_gemv", lambda e: legacy.legacy_int8(e, int8_asm, [])[0]),
     ):
         for env in envs:
             if env is None:

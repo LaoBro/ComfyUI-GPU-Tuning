@@ -1,6 +1,6 @@
 """Hadamard rotation kernels for the convrot quantization path.
 
-Kept out of gfx906_tuning so that module imports without triton: on a machine
+Kept out of gpu_tuning so that module imports without triton: on a machine
 that has no triton the pack still loads and reports why it is inactive.
 """
 

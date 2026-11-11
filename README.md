@@ -1,13 +1,13 @@
-# ComfyUI-gfx906-Tuning
+# ComfyUI-GPU-Tuning
 
-给 AMD gfx906（Vega 56/64、MI50、MI60、Radeon VII）上跑 DiT 模型和 LLM 文本生成的加速补丁包。
+给 ComfyUI 上跑 DiT 模型和 LLM 文本生成的加速补丁包：通用改写对所有卡生效，架构相关的内核按实测表分派，gfx906（Vega 56/64、MI50、MI60、Radeon VII）是第一个带完整实测表的架构。
 
 这张卡没有矩阵核心，`bf16` 是软件模拟，ComfyUI 的默认实现在它上面处处踩慢路径。
 本包在启动时给 int8 权重、注意力、VAE 换成本机实测更快的实现，**不改 ComfyUI 源码**，
 包括逐块 CUDA graph 在内的全部补丁都以运行时包装安装，不需要覆盖或备份任何 core 文件，
-`COMFY_GFX906_TUNING=off` 可整体关闭。
+`COMFY_GPU_TUNE=off` 可整体关闭。
 
-内核加速是 gfx906 专属的；**文本生成的改写不是**——m=1 走 GEMM、每层分派开销、
+随包分发的内核目前只覆盖 gfx906；**文本生成的改写不是**——m=1 走 GEMM、每层分派开销、
 KV cache 容量级拷贝、launch 开销，这些在别的卡上一样存在。所以有 kitchen 原生后端
 的设备（RDNA2+、NVIDIA）装文本生成改写组；triton 内核补丁只在 AMD 上装、由 dispatch 决定何时运行（见“兼容性”）。
 
@@ -71,9 +71,9 @@ KV cache 容量级拷贝、launch 开销，这些在别的卡上一样存在。�
 ## 安装
 
 ```bash
-# 1. ComfyUI Manager / Registry 搜 "GFX906 Tuning"
+# 1. ComfyUI Manager / Registry 搜 "GPU Tuning"
 # 2. 或 git clone 到 custom_nodes/
-git clone https://github.com/<your>/ComfyUI-gfx906-Tuning custom_nodes/ComfyUI-gfx906-Tuning
+git clone https://github.com/<your>/ComfyUI-GPU-Tuning custom_nodes/ComfyUI-GPU-Tuning
 ```
 
 不需要改动 ComfyUI 源码，也没有安装脚本；逐块 CUDA graph 的 hook 随节点在启动时安装。
@@ -83,7 +83,7 @@ comfy/text_encoders/llama.py 覆盖回去即可，根节点目录里的 .core-pa
 重启 ComfyUI，启动日志里会出现：
 
 ```
-gfx906 tuning active: int8 linear measured tile + decode gemv, convrot fused, vae conv3d->conv2d,
+gpu-tuning active: int8 linear measured tile + decode gemv, convrot fused, vae conv3d->conv2d,
 qkv off, attention hip, text encoder int8 + lm_head, encoder attention default,
 textgen deltanet on, kvdecode on, llama on, qwen35 on
 ```
@@ -122,7 +122,7 @@ GEMV 内核自己合成行 scale 并在线量化，一条 linear 从 3 次启动
 
 旋转本身也换成了 HIP radix-4 butterfly（`hip_rotate.py` + `arch/gfx906/kernels/rotate.cu`）：
 Hadamard 符号在寄存器里生成，不再逐 tile 读 256x256 矩阵。fp32 档量化激活与 Triton 逐元素一致，
-`COMFY_GFX906_ROTATE=off` 回退到 Triton 做 A/B；fp16 档按 fp32 累加，结果更准但不等价。
+`COMFY_GPU_TUNE_ROTATE=off` 回退到 Triton 做 A/B；fp16 档按 fp32 累加，结果更准但不等价。
 
 te=default 的 4-bit 解码（激活不量化、权重在寄存器内反量化）换成 HIP 内核
 （`hip_w4a16.py` + `arch/gfx906/kernels/w4a16.cu`）：nibble 不再展成 8 个 fp32 元素，
@@ -134,13 +134,13 @@ bench 的 `w4a16.m1` 站点 266.6 → 93.3 us（4096x4096@m1）、496.8 → 172.
 （12288x4096@m1），深队列下内核本身 m=1 为 48-62 → 185-274 GB/s（3.6-4.4x）、
 m=2..8 为 11-45 → 18-238 GB/s（1.6-5.3x）；与 Triton 路径的差在 fp32
 舍入内（归一化 ≤3.0e-7），fp16 输出另含 1 ulp 舍入（≤4.9e-4）。
-`COMFY_GFX906_W4A16_HIP=off` 回退 Triton；m>8、fp16 激活的多行批等不合形状的批
+`COMFY_GPU_TUNE_W4A16_HIP=off` 回退 Triton；m>8、fp16 激活的多行批等不合形状的批
 仍走 Triton（多行内核按 fp32 激活在 LDS 里摆 M 行，见 docs/HIP_KERNELS.md 附录）。
 fp16 激活 + `v_dot2_f32_f16` 的内核（`w4a16_gemv_h`）现在**是均匀格点（无 codebook）
 检查点的默认 feed**：3.4-7.2x over Triton（204-291 GB/s），数值与无损版同级（fp32 输出
 2.4e-7、fp16 输出 1 ulp），因为 `code-8` 的 16 个值在 fp16 里精确可表示。带 codebook 的
 检查点会看到格点退到 fp16（fp32 输出归一化 1.6-2.6e-4、rms 2.1-2.8e-4，fp16 输出约
-1.5 ulp），所以那一档要 `COMFY_GFX906_W4A16_F16ACT=1` 才开，开启前按 `--sampling off`
+1.5 ulp），所以那一档要 `COMFY_GPU_TUNE_W4A16_F16ACT=1` 才开，开启前按 `--sampling off`
 重验生文 md5。convrot 路径的激活是 fp32，只走无损 feed，不受这个开关影响。
 
 均匀格点（无 codebook）、fp32 激活的 m=2..4 多行解码现在**默认**把 `tab[16]` 的格点 gather
@@ -148,7 +148,7 @@ fp16 激活 + `v_dot2_f32_f16` 的内核（`w4a16_gemv_h`）现在**是均匀格
 格点，不再每权重读一次 LDS 表。深队列实测（graph replay，fp32 out，us/call）
 4096²@m2 58.7→56.8、12288×4096@m2 135.7→131.5、4096²@m4 137.7→128.4、
 12288×4096@m4 301.3→289.1（快 3-7%），m=8 的 481.9/866.4 → 481.0/866.4 打平；
-6 组形状 × fp32/fp16 输出全部逐位一致。`COMFY_GFX906_W4A16_VALU=off` 回落表格做 A/B。
+6 组形状 × fp32/fp16 输出全部逐位一致。`COMFY_GPU_TUNE_W4A16_VALU=off` 回落表格做 A/B。
 M=8 自动回落：它本来就在 256 VGPR / spill 53，8 个 asm 输出的活跃区间再压上去会慢 9%。
 
 单条 linear 实测（合成权重，m=1，深队列下的平均墙钟）：
@@ -182,7 +182,7 @@ int8 张量与 scale，直接调 `int8_gemv.linear`；prefill（多行）和任�
 checkpoint 也能转，但它带 16 级 Lloyd-Max codebook，等于再量化一次，误差会多出来。
 
 ```bash
-python custom_nodes/ComfyUI-gfx906-Tuning/tools/requant_uniform4.py \
+python custom_nodes/ComfyUI-GPU-Tuning/tools/requant_uniform4.py \
   --src models/text_encoders/xxx_int8_convrot.safetensors \
   --dst models/text_encoders/xxx_int8_convrot_uniform4.safetensors
 ```
@@ -253,14 +253,14 @@ decode step 会在 CPU 上开内存。CLIP Settings 节点的 `text_gemv=off` �
 
 | 节点 | 位置 | 作用 |
 |---|---|---|
-| **GFX906 Model Settings** | 模型链（加载器 → 采样器之间） | 注意力模式、连续布局、fp16、amax 保护、convrot、int8 tile、`m≤8` 窄 tile、QKV、VAE、GEMV、prefix KV、profiler |
-| **GFX906 CLIP Settings** | CLIP 链（加载器 → 编码） | 文本编码器 int8、编码器注意力后端、TE GEMV、4-bit w4a8、文本生成补丁组 |
+| **GPU Tuning Model Settings** | 模型链（加载器 → 采样器之间） | 注意力模式、连续布局、fp16、amax 保护、convrot、int8 tile、`m≤8` 窄 tile、QKV、VAE、GEMV、prefix KV、profiler |
+| **GPU Tuning CLIP Settings** | CLIP 链（加载器 → 编码） | 文本编码器 int8、编码器注意力后端、TE GEMV、4-bit w4a8、文本生成补丁组 |
 
 设置节点改动**下一次执行就生效**，不用重启。命令行复测 `benchmark()` 已删除：它没有节点注册、也没有任何调用者，长期是死代码；需要复测时直接用 `gfx906fix/` 下的独立脚本，避免再维护第三个节点。
 
 所有开关都是三态 combo：
 
-- `default`：沿用该功能的 `COMFY_GFX906_*` 启动值（完全不改变现有默认行为）；
+- `default`：沿用该功能的 `COMFY_GPU_TUNE_*` 启动值（完全不改变现有默认行为）；
 - `on` / `off`：显式覆盖 env；
 - 例外：`text_encoder` / `text_attention` 里的 `default` 是显式选择（fp16 路径 / 核心注意力），
   不跟随 env。
@@ -285,13 +285,13 @@ CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`imag
 
 ### 在其它显卡上使用 / 扫描 int8 tile
 
-其它 AMD 显卡上的功能分级（常开 / 可选开关 / 测量门 / 不可用）、门控与 dispatch 的分工、扫描工具 `tools/tile_sweep.py` 的完整用法，以及 `COMFY_GFX906_TILE_CONFIG` / `SMALL_TILE_CONFIG` 的使用方式，见：
+其它 AMD 显卡上的功能分级（常开 / 可选开关 / 测量门 / 不可用）、门控与 dispatch 的分工、扫描工具 `tools/tile_sweep.py` 的完整用法，以及 `COMFY_GPU_TUNE_TILE_CONFIG` / `SMALL_TILE_CONFIG` 的使用方式，见：
 
 **[docs/PORTING.md — 其它显卡移植与二次开发指南](docs/PORTING.md)**
 
 给其它架构写 HIP 内核见 [docs/HIP_KERNELS.md](docs/HIP_KERNELS.md)。
 
-最短路径：先用节点默认值跑通（没跑过 bench 的卡上测量门功能是关的），再运行一次 `python custom_nodes/ComfyUI-gfx906-Tuning/tools/bench.py --all --write`。它测出这张卡的 int8 tile，以及 GEMV / w4a8 / deltanet（含 prefill）/ vae / convrot / vision 的开或关，写进 `~/.config/comfy-gfx-tune/arch/<gcn>/manifest.toml`，之后启动不再 autotune。attention 只打印证据不写记录：`hip` 是默认模式（下面有实测，内核随包分发），本机 HIP 装不上它时回落到 `int8` 并在启动日志提示重编，其余模式仍可在节点里手选。想知道时间落在哪一段（而不是哪个内核快）用 `tools/chain_profile.py`，见 [docs/PORTING.md](docs/PORTING.md)。
+最短路径：先用节点默认值跑通（没跑过 bench 的卡上测量门功能是关的），再运行一次 `python custom_nodes/ComfyUI-GPU-Tuning/tools/bench.py --all --write`。它测出这张卡的 int8 tile，以及 GEMV / w4a8 / deltanet（含 prefill）/ vae / convrot / vision 的开或关，写进 `~/.config/comfy-gpu-tune/arch/<gcn>/manifest.toml`，之后启动不再 autotune。attention 只打印证据不写记录：`hip` 是默认模式（下面有实测，内核随包分发），本机 HIP 装不上它时回落到 `int8` 并在启动日志提示重编，其余模式仍可在节点里手选。想知道时间落在哪一段（而不是哪个内核快）用 `tools/chain_profile.py`，见 [docs/PORTING.md](docs/PORTING.md)。
 
 ### 注意力模式怎么选
 
@@ -311,7 +311,7 @@ CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`imag
 `... did not load ...; rebuild it for this HIP runtime with tools/build_hip_attn.py --force`。重编命令：
 
 ```bash
-.venv/bin/python custom_nodes/ComfyUI-gfx906-Tuning/tools/build_hip_attn.py
+.venv/bin/python custom_nodes/ComfyUI-GPU-Tuning/tools/build_hip_attn.py
 ```
 
 `tools/bench.py --attention` / `--tile` 在 `.so` 缺失时自己跑这个构建（约 4 秒），因为少了它们那两个站点只是静默少一行最快的数据。节点启动不构建任何东西。
@@ -358,32 +358,32 @@ m ≤ 1 的解码仍走 GEMV；m < 128 直接回落 Triton（128 行 tile 在更
 
 ## 开关
 
-开关都在节点里（GFX906 Model Settings / GFX906 CLIP Settings），`default` 用内置默认值，
+开关都在节点里（GPU Tuning Model Settings / GPU Tuning CLIP Settings），`default` 用内置默认值，
 `on/off` 显式覆盖，下一次执行生效，不回落任何环境变量。
 
 环境变量只剩两类：节点执行前的总闸，以及没有节点入口的诊断/基准旋钮。
 
 | 变量 | 默认 | 作用 |
 |---|---|---|
-| `COMFY_GFX906_TUNING` | `1` | `off` 整包关闭；补丁在节点执行前安装，这是唯一总闸 |
-| `COMFY_GFX906_FORCE` | 空 | 逗号分隔，在非目标架构上单独放行 `deltanet` / `qwen35` / `w4a8` / `attention`（启动会 WARNING：这些内核不是在当前卡上测的） |
-| `COMFY_GFX906_TE_DEQUANT` | 空 | te=default 的寄存器内反量化门：`on`/`off` 覆盖 manifest 的 `feature.te_dequant`；关闭时 te=default 回到逐调用反量化，并自动关掉 TE 图捕获（反量化副本会被图钉 ~21 GB） |
-| `COMFY_GFX906_TILE_CONFIG` | 空 | 手工实测的大 tile，设置后该卡视为已实测（跳过 autotune）；不设时用 manifest 的 `int8_gemm.tile/large` |
-| `COMFY_GFX906_SMALL_TILE_CONFIG` | 空 | 手工实测的窄 tile，替换候选/强制值 |
-| `COMFY_GFX906_INT8_GEMV_ASM` | `auto` | int8 解码 GEMV 后端：`auto` 编译探测 / `on` 强制 asm / `off` 强制 int32 tl.sum |
-| `COMFY_GFX906_W4A8_ASM` | `auto` | 4-bit GEMV 后端：`auto` 编译探测 / `on` 强制 asm / `off` 跳过 asm（还有 HIP 扩展时仍用 HIP，见下一行） |
-| `COMFY_GFX906_W4A8_HIP` | `auto` | 节点目录下的 `w4a8_hip` 扩展：`auto` 有就用 / `off` 忽略它，让 `W4A8_ASM` 的 off 真正落到 per-group tl.dot |
-| `COMFY_GFX906_MEASURED` | `1` | 用 `arch/<gcn>/manifest.toml` 的实测记录按形状选后端；`0` 关掉这一层，回到纯探测 |
-| `COMFY_GFX906_DELTANET` | `1` | textgen 分项基准旋钮：DeltaNet 解码 Triton 内核 |
-| `COMFY_GFX906_KVDECODE` | `1` | 同上：折叠 GQA 的 KV decode |
-| `COMFY_GFX906_LLAMA` | `1` | 同上：llama RMSNorm 预计算 + RoPE 频率表 |
-| `COMFY_GFX906_QWEN35` | `1` | 同上：Qwen3.5 计算类替换（等价改写，逐方法对过 core） |
-| `COMFY_GFX906_GRAPH` | `1` | textgen 分项基准旋钮：权重常驻时的逐块 CUDA graph（也跟随 CLIP 节点的 `textgen` 开关） |
-| `COMFY_GFX906_ROTATE` | `1` | 解码激活旋转的 HIP butterfly 内核；`off` 回落到 Triton 做 A/B。fp16 输入下 HIP 以 fp32 累加，量化激活更准但与 Triton 不等价 |
-| `COMFY_GFX906_W4A16_HIP` | `1` | te=default 4-bit 反量化 GEMV 的 HIP 内核（`arch/gfx906/kernels/w4a16.cu`，m=1 与 m=2..8 两个入口）；`off` 回落到 Triton 的 `dequant_w4a16_kernel` 做 A/B。m>8 或不合形状的批仍走 Triton |
-| `COMFY_GFX906_W4A16_F16ACT` | `0` | 只管**带 codebook** 的检查点是否用 fp16 激活 + `v_dot2_f32_f16` 的 feed（`w4a16_gemv_h`，m=1..8，比无损 feed 快 1.05-4.89x）；代价是 16 个格点退到 fp16（fp32 输出归一化 1.6-2.6e-4、fp16 输出约 1.5 ulp），开启前按 `--sampling off` 重验生文 md5。无 codebook 的检查点不看这个开关，默认就走该 feed（均匀格点在 fp16 里精确） |
-| `COMFY_GFX906_W4A16_VALU` | 空 | **测量门**：缺省时由 `feature.w4a16_valu`（本机/出厂 manifest）决定，出厂表为 `on`；显式 `on`/`off` 覆盖它。均匀格点（无 codebook）的 m=2..4 GEMV 用 `v_cvt_f32_ubyteN` 在 VALU 里构造 16 个格点，替掉 `tab[16]` 的 LDS gather；逐位一致，实测快 3-7%（数字见上文与 docs/HIP_KERNELS.md）。M=8 自动回落表格路径（该形状已 spill），带 codebook 的检查点不看这个开关。`bench.py --w4a16-valu --write` 可重新测并改写判定 |
-| `COMFY_GFX906_TRITON_BACKEND` | 空 | comfy-kitchen 的 triton 后端是否让 dispatch 选：空=跟随启动参数（`--disable-triton-backend` 就不开），`on`/`off` 覆盖它。`off` 让本包没覆盖的 kitchen 操作回落 eager，便于 A/B（实测 4096x4096 上 `quantize_int8_rowwise` 113.7→381.3 us、`dequantize_per_tensor_fp8` 666.9→863.4 us）；int8 linear 不受影响——两个后端的 `int8_linear` 都包了本包的路由，兜底始终是 triton 内核，因为 eager 的 `torch._int_mm` 在本卡每个 m 都抛 `HIPBLAS_STATUS_INVALID_VALUE` |
+| `COMFY_GPU_TUNE` | `1` | `off` 整包关闭；补丁在节点执行前安装，这是唯一总闸 |
+| `COMFY_GPU_TUNE_FORCE` | 空 | 逗号分隔，在非目标架构上单独放行 `deltanet` / `qwen35` / `w4a8` / `attention`（启动会 WARNING：这些内核不是在当前卡上测的） |
+| `COMFY_GPU_TUNE_TE_DEQUANT` | 空 | te=default 的寄存器内反量化门：`on`/`off` 覆盖 manifest 的 `feature.te_dequant`；关闭时 te=default 回到逐调用反量化，并自动关掉 TE 图捕获（反量化副本会被图钉 ~21 GB） |
+| `COMFY_GPU_TUNE_TILE_CONFIG` | 空 | 手工实测的大 tile，设置后该卡视为已实测（跳过 autotune）；不设时用 manifest 的 `int8_gemm.tile/large` |
+| `COMFY_GPU_TUNE_SMALL_TILE_CONFIG` | 空 | 手工实测的窄 tile，替换候选/强制值 |
+| `COMFY_GPU_TUNE_INT8_GEMV_ASM` | `auto` | int8 解码 GEMV 后端：`auto` 编译探测 / `on` 强制 asm / `off` 强制 int32 tl.sum |
+| `COMFY_GPU_TUNE_W4A8_ASM` | `auto` | 4-bit GEMV 后端：`auto` 编译探测 / `on` 强制 asm / `off` 跳过 asm（还有 HIP 扩展时仍用 HIP，见下一行） |
+| `COMFY_GPU_TUNE_W4A8_HIP` | `auto` | 节点目录下的 `w4a8_hip` 扩展：`auto` 有就用 / `off` 忽略它，让 `W4A8_ASM` 的 off 真正落到 per-group tl.dot |
+| `COMFY_GPU_TUNE_MEASURED` | `1` | 用 `arch/<gcn>/manifest.toml` 的实测记录按形状选后端；`0` 关掉这一层，回到纯探测 |
+| `COMFY_GPU_TUNE_DELTANET` | `1` | textgen 分项基准旋钮：DeltaNet 解码 Triton 内核 |
+| `COMFY_GPU_TUNE_KVDECODE` | `1` | 同上：折叠 GQA 的 KV decode |
+| `COMFY_GPU_TUNE_LLAMA` | `1` | 同上：llama RMSNorm 预计算 + RoPE 频率表 |
+| `COMFY_GPU_TUNE_QWEN35` | `1` | 同上：Qwen3.5 计算类替换（等价改写，逐方法对过 core） |
+| `COMFY_GPU_TUNE_GRAPH` | `1` | textgen 分项基准旋钮：权重常驻时的逐块 CUDA graph（也跟随 CLIP 节点的 `textgen` 开关） |
+| `COMFY_GPU_TUNE_ROTATE` | `1` | 解码激活旋转的 HIP butterfly 内核；`off` 回落到 Triton 做 A/B。fp16 输入下 HIP 以 fp32 累加，量化激活更准但与 Triton 不等价 |
+| `COMFY_GPU_TUNE_W4A16_HIP` | `1` | te=default 4-bit 反量化 GEMV 的 HIP 内核（`arch/gfx906/kernels/w4a16.cu`，m=1 与 m=2..8 两个入口）；`off` 回落到 Triton 的 `dequant_w4a16_kernel` 做 A/B。m>8 或不合形状的批仍走 Triton |
+| `COMFY_GPU_TUNE_W4A16_F16ACT` | `0` | 只管**带 codebook** 的检查点是否用 fp16 激活 + `v_dot2_f32_f16` 的 feed（`w4a16_gemv_h`，m=1..8，比无损 feed 快 1.05-4.89x）；代价是 16 个格点退到 fp16（fp32 输出归一化 1.6-2.6e-4、fp16 输出约 1.5 ulp），开启前按 `--sampling off` 重验生文 md5。无 codebook 的检查点不看这个开关，默认就走该 feed（均匀格点在 fp16 里精确） |
+| `COMFY_GPU_TUNE_W4A16_VALU` | 空 | **测量门**：缺省时由 `feature.w4a16_valu`（本机/出厂 manifest）决定，出厂表为 `on`；显式 `on`/`off` 覆盖它。均匀格点（无 codebook）的 m=2..4 GEMV 用 `v_cvt_f32_ubyteN` 在 VALU 里构造 16 个格点，替掉 `tab[16]` 的 LDS gather；逐位一致，实测快 3-7%（数字见上文与 docs/HIP_KERNELS.md）。M=8 自动回落表格路径（该形状已 spill），带 codebook 的检查点不看这个开关。`bench.py --w4a16-valu --write` 可重新测并改写判定 |
+| `COMFY_GPU_TUNE_TRITON_BACKEND` | 空 | comfy-kitchen 的 triton 后端是否让 dispatch 选：空=跟随启动参数（`--disable-triton-backend` 就不开），`on`/`off` 覆盖它。`off` 让本包没覆盖的 kitchen 操作回落 eager，便于 A/B（实测 4096x4096 上 `quantize_int8_rowwise` 113.7→381.3 us、`dequantize_per_tensor_fp8` 666.9→863.4 us）；int8 linear 不受影响——两个后端的 `int8_linear` 都包了本包的路由，兜底始终是 triton 内核，因为 eager 的 `torch._int_mm` 在本卡每个 m 都抛 `HIPBLAS_STATUS_INVALID_VALUE` |
 
 ## 已知边界
 
@@ -415,6 +415,7 @@ m ≤ 1 的解码仍走 GEMV；m < 128 直接回落 Triton（128 行 tile 在更
 - `tools/bench.py` — 站点微基准（数值门先于计时），`--all --write` 写本机 manifest
 - `tools/chain_profile.py` — **生文链路归因**：一次 TextGenerate 的嵌套 CUDA event 分解（图像塔 / block / MLP / lm_head / prefill vs 每步），按结构发现归因点，跨架构可用，见 [docs/PORTING.md](docs/PORTING.md)
 - `tools/status.py` / `tools/verify_backends.py` — 不开 ComfyUI 看当前判定 / 改内核后的选择 parity 与数值 A/B
+- `tools/registry_selftest.py` / `tools/manifest_selftest.py` / `tools/settings_selftest.py` — 无 GPU 自检：后端链决策、manifest 解析与信任、节点三态开关（settings 需要 venv 里的 torch）
 
 - `gfx906fix/textgen-tuning.md` — **文本生成调优记录**：现状、时间分解、五个坑、后续方向
 - `gfx906fix/qwen-image21-remaining-ops.md` — 各补丁的收益与测量方法

@@ -1,7 +1,7 @@
-"""Runtime tuning patches for gfx906 (MI50 / MI60 / Radeon VII).
+"""Runtime tuning patches for ComfyUI on AMD GPUs, measured on gfx906 (MI50 / MI60 / Radeon VII).
 
 Two independent patches, both skipped on other architectures and both opt-out
-with COMFY_GFX906_TUNING=off:
+with COMFY_GPU_TUNE=off:
 
 * int8 linear: the comfy-kitchen triton autotune list uses CDNA2+/CUDA tile
   shapes (128x256x64, 8 warps). gfx906 has 256 VGPR/thread and no matrix cores,
@@ -142,7 +142,7 @@ _state = {
 
 
 def enabled():
-    return os.getenv("COMFY_GFX906_TUNING", "1").lower() not in ("0", "off", "false", "no")
+    return os.getenv("COMFY_GPU_TUNE", "1").lower() not in ("0", "off", "false", "no")
 
 
 def env_flag(name, default="1"):
@@ -187,8 +187,8 @@ def textgen_summary():
 
 
 def _int8_rotate_env(default=128):
-    """COMFY_GFX906_INT8_ATTN_ROTATE: 0/off, or a Hadamard group (32/64/128)."""
-    raw = os.getenv("COMFY_GFX906_INT8_ATTN_ROTATE", "").strip().lower()
+    """COMFY_GPU_TUNE_INT8_ATTN_ROTATE: 0/off, or a Hadamard group (32/64/128)."""
+    raw = os.getenv("COMFY_GPU_TUNE_INT8_ATTN_ROTATE", "").strip().lower()
     if raw in ("", "auto", "default"):
         return default
     if raw in ("0", "off", "none"):
@@ -207,21 +207,21 @@ def _init_env_settings():
     dequant gate override stay here.
     """
     _state["textgen_env"] = {
-        "deltanet": env_flag("COMFY_GFX906_DELTANET"),
-        "kvdecode": env_flag("COMFY_GFX906_KVDECODE"),
-        "llama": env_flag("COMFY_GFX906_LLAMA"),
-        "qwen35": env_flag("COMFY_GFX906_QWEN35"),
-        "graph": env_flag("COMFY_GFX906_GRAPH"),
+        "deltanet": env_flag("COMFY_GPU_TUNE_DELTANET"),
+        "kvdecode": env_flag("COMFY_GPU_TUNE_KVDECODE"),
+        "llama": env_flag("COMFY_GPU_TUNE_LLAMA"),
+        "qwen35": env_flag("COMFY_GPU_TUNE_QWEN35"),
+        "graph": env_flag("COMFY_GPU_TUNE_GRAPH"),
     }
     _state["textgen_ready"] = {name: False for name in TEXTGEN_ITEMS}
     _state["textgen_override"] = None
     _state["forced_items"] = {item.strip().lower()
-                              for item in os.getenv("COMFY_GFX906_FORCE", "").replace(",", " ").split()
+                              for item in os.getenv("COMFY_GPU_TUNE_FORCE", "").replace(",", " ").split()
                               if item.strip()}
-    _state["te_dequant_env"] = os.getenv("COMFY_GFX906_TE_DEQUANT", "").strip().lower()
-    _state["int8_attn_enabled"] = env_flag("COMFY_GFX906_INT8_ATTN", "0")
+    _state["te_dequant_env"] = os.getenv("COMFY_GPU_TUNE_TE_DEQUANT", "").strip().lower()
+    _state["int8_attn_enabled"] = env_flag("COMFY_GPU_TUNE_INT8_ATTN", "0")
     _state["int8_attn_rotate"] = _int8_rotate_env()
-    _state["qwen21_int8_cache"] = env_flag("COMFY_GFX906_QWEN21_INT8_CACHE", "0")
+    _state["qwen21_int8_cache"] = env_flag("COMFY_GPU_TUNE_QWEN21_INT8_CACHE", "0")
 
 
 def arch_name():
@@ -300,7 +300,7 @@ def resolved_convrot_mode():
 def install_ready(item):
     """Whether an architecture-specific code path should be installed here.
 
-    * `COMFY_GFX906_FORCE`: one path opted in by hand, no questions asked;
+    * `COMFY_GPU_TUNE_FORCE`: one path opted in by hand, no questions asked;
     * deltanet also installs wherever comfy-kitchen has no fused gated-delta
       op -- the replacement exists for exactly that case, and the structural
       fact does not go stale the way a timing does;
@@ -331,7 +331,7 @@ def warn_forced_items():
     """Say that the items being installed here were not measured on this card."""
     forced = sorted(_state.get("forced_items", set()))
     if forced:
-        logging.warning("gfx906: installing %s on %s because of COMFY_GFX906_FORCE; these kernels "
+        logging.warning("gpu-tune: installing %s on %s because of COMFY_GPU_TUNE_FORCE; these kernels "
                         "were not measured on this card, expect the untested ones to be slower or wrong",
                         ", ".join(forced), _state.get("arch"))
 
@@ -340,7 +340,7 @@ def _triton_available(patch):
     try:
         import triton  # noqa: F401
     except ImportError:
-        logging.warning("gfx906: triton is not importable, %s patch skipped", patch)
+        logging.warning("gpu-tune: triton is not importable, %s patch skipped", patch)
         return False
     return True
 
@@ -362,20 +362,20 @@ def _parse_tile_spec(raw):
 
 
 def _tile_spec(name):
-    """Parse e.g. COMFY_GFX906_TILE_CONFIG="block_m=128,block_n=256,block_k=32,..."."""
+    """Parse e.g. COMFY_GPU_TUNE_TILE_CONFIG="block_m=128,block_n=256,block_k=32,..."."""
     raw = os.getenv(name, "").strip()
     if not raw:
         return None
     spec = _parse_tile_spec(raw)
     if spec is None:
-        logging.warning("gfx906: %s=%r is not a tile spec, using the built-in tile", name, raw)
+        logging.warning("gpu-tune: %s=%r is not a tile spec, using the built-in tile", name, raw)
     return spec
 
 
 def _triton_config():
     import triton
 
-    spec = _tile_spec("COMFY_GFX906_TILE_CONFIG")
+    spec = _tile_spec("COMFY_GPU_TUNE_TILE_CONFIG")
     if spec is None:
         spec = measured_tile("large")
     if spec is not None:
@@ -395,7 +395,7 @@ def _int8_kernels():
 def _small_tile_config():
     import triton
 
-    spec = _tile_spec("COMFY_GFX906_SMALL_TILE_CONFIG")
+    spec = _tile_spec("COMFY_GPU_TUNE_SMALL_TILE_CONFIG")
     if spec is None:
         spec = measured_tile("small")
     if spec is None and measured_tile("large") is not None:
@@ -538,7 +538,7 @@ def measured_tile(bucket):
     """The int8 tile measured on this card ("large" / "small"), or None.
 
     Stored as the same "block_m=...,warps=...,stages=..." string the startup
-    variables take, so an entry can be pasted into COMFY_GFX906_TILE_CONFIG and
+    variables take, so an entry can be pasted into COMFY_GPU_TUNE_TILE_CONFIG and
     a card that has run tools/bench.py skips autotune without any env variable.
     """
     table = measured_table()
@@ -547,7 +547,7 @@ def measured_tile(bucket):
         return None
     spec = _parse_tile_spec(raw)
     if spec is None:
-        logging.warning("gfx906: manifest int8_gemm.tile/%s=%r is not a tile spec, ignoring",
+        logging.warning("gpu-tune: manifest int8_gemm.tile/%s=%r is not a tile spec, ignoring",
                         bucket, raw)
     return spec
 
@@ -560,7 +560,7 @@ def measured_state():
     it is being ignored without anyone noticing unless we say so.
     """
     if "measured_state" not in _state:
-        if not env_flag("COMFY_GFX906_MEASURED"):
+        if not env_flag("COMFY_GPU_TUNE_MEASURED"):
             _state["measured_state"] = "off"
         else:
             data = measured_table()
@@ -582,24 +582,24 @@ def warn_measured_state():
     arch = _state.get("arch")
     if state == "measured":
         if not _state["native"] and not _state.get("tile_measured"):
-            logging.warning("gfx906: measured data for %s has no int8 tile, so the tile list "
+            logging.warning("gpu-tune: measured data for %s has no int8 tile, so the tile list "
                             "still goes to autotune. Run tools/bench.py --all --write on this card.",
                             arch)
         return
     if state == "off":
-        logging.info("gfx906: measured table disabled by COMFY_GFX906_MEASURED, "
+        logging.info("gpu-tune: measured table disabled by COMFY_GPU_TUNE_MEASURED, "
                      "int8 tiles and GEMV backends fall back to autotune/probes")
     elif state == "stale":
-        logging.warning("gfx906: the measured data for %s was taken under %s but this process runs %s: "
+        logging.warning("gpu-tune: the measured data for %s was taken under %s but this process runs %s: "
                         "ignoring it, so int8 tiles go to autotune and the GEMV backends to probes. "
                         "Re-run tools/bench.py --write to refresh it.",
                         arch, data.fingerprint if data else "?", data.runtime_fp if data else "?")
     elif _state["native"]:
-        logging.warning("gfx906: no measured data for %s: the GEMV backends come from probes "
+        logging.warning("gpu-tune: no measured data for %s: the GEMV backends come from probes "
                         "(the first call of each new shape pays the sweep). "
                         "Run tools/bench.py --write once on this card to fix that.", arch)
     else:
-        logging.warning("gfx906: no measured data for %s: int8 tiles come from the stock autotune list "
+        logging.warning("gpu-tune: no measured data for %s: int8 tiles come from the stock autotune list "
                         "and the GEMV backends from probes (the first call of each new shape pays the "
                         "sweep). Run tools/bench.py --write once on this card to fix that.", arch)
 
@@ -616,7 +616,7 @@ def manifest_status_line():
         data = measured_table()
         line = data.status_line() if data is not None else ""
         if line and measured_state() == "off":
-            line = line.replace(", in use", ", layer off (COMFY_GFX906_MEASURED)")
+            line = line.replace(", in use", ", layer off (COMFY_GPU_TUNE_MEASURED)")
         _state["manifest_line"] = line
     return _state["manifest_line"]
 
@@ -950,7 +950,7 @@ def patch_int8_tile_switch():
     The dispatch resolves the backend function by name on every call, and the
     registered backend is the package module (which re-exports the kernel
     function), not the quantization submodule, so both are wrapped. The triton
-    and the eager backend both get it: COMFY_GFX906_TRITON_BACKEND=off moves
+    and the eager backend both get it: COMFY_GPU_TUNE_TRITON_BACKEND=off moves
     dispatch to eager, and int8 linear has to keep serving the same shapes
     either way. The last resort is the triton kernel in both states because
     eager's torch._int_mm has no working hipblasLt path on gfx906, so reaching
@@ -1239,7 +1239,7 @@ def patch_attention():
 
     fallback = attention.optimized_attention
     if fallback in (attention.attention_sage, attention.attention_comfy_kitchen_int8):
-        logging.info("gfx906: %s was requested explicitly, leaving attention alone",
+        logging.info("gpu-tune: %s was requested explicitly, leaving attention alone",
                      getattr(fallback, "__name__", "?"))
         return False
 
@@ -1296,7 +1296,7 @@ def patch_attention():
                     amax = max(torch.linalg.vector_norm(t, ord=float("inf")).item() for t in (q, k, v))
                     if amax >= FP16_SAFE_AMAX:
                         if not stats["fp32"]:
-                            logging.warning("gfx906: attention amax %.0f exceeds %d, leaving the inputs alone",
+                            logging.warning("gpu-tune: attention amax %.0f exceeds %d, leaving the inputs alone",
                                             amax, FP16_SAFE_AMAX)
                         stats["fp32"] += 1
                         return None
@@ -1364,7 +1364,7 @@ def patch_attention():
                     # the kernels are fp16-only; run nothing rather than silently
                     # benchmarking SDPA under the name of the selected mode
                     raise RuntimeError(
-                        f"gfx906: attention mode '{mode}' only runs on fp16 inputs but the fp16 cast is "
+                        f"gpu-tune: attention mode '{mode}' only runs on fp16 inputs but the fp16 cast is "
                         "off; turn the fp16 switch back on or pick a backend name")
                 if out is not None:
                     if out.dtype != out_dtype:
@@ -1536,7 +1536,7 @@ def patch_convrot():
     original = getattr(quantization, "_rotate_activation", None)
     original_quantize = getattr(quantization, "triton_quantize_rowwise", None)
     if original is None or original_quantize is None:
-        logging.warning("gfx906: comfy-kitchen has no _rotate_activation/triton_quantize_rowwise, "
+        logging.warning("gpu-tune: comfy-kitchen has no _rotate_activation/triton_quantize_rowwise, "
                         "convrot patch skipped (the rotation falls back to its matmul)")
         _state["convrot_mode"] = "off"
         return False
@@ -1571,7 +1571,7 @@ def triton_backend_requested():
     this pack does not cover), and it wins over the command line. With nothing
     in the env, --disable-triton-backend is a refusal we no longer override.
     """
-    want = flag_value(os.getenv("COMFY_GFX906_TRITON_BACKEND", ""))
+    want = flag_value(os.getenv("COMFY_GPU_TUNE_TRITON_BACKEND", ""))
     if want is not None:
         return want
     from comfy.cli_args import args
@@ -1591,7 +1591,7 @@ def enable_triton_backend():
     if not triton_backend_requested():
         if not _state.get("triton_refused_logged"):
             _state["triton_refused_logged"] = True
-            logging.info("gfx906: comfy-kitchen triton backend left off (COMFY_GFX906_TRITON_BACKEND "
+            logging.info("gpu-tune: comfy-kitchen triton backend left off (COMFY_GPU_TUNE_TRITON_BACKEND "
                          "or --disable-triton-backend); kitchen dispatch uses eager for every op this "
                          "pack does not cover, and eager int8 matmul has no working hipblasLt path on "
                          "gfx906")
@@ -1599,12 +1599,12 @@ def enable_triton_backend():
     try:
         import triton  # noqa: F401
     except ImportError:
-        logging.warning("gfx906: triton is not importable, comfy-kitchen stays on the eager backend")
+        logging.warning("gpu-tune: triton is not importable, comfy-kitchen stays on the eager backend")
         return False
     registry.enable("triton")
     ok = registry.is_available("triton")
     if ok:
-        logging.info("gfx906: comfy-kitchen triton backend enabled (same as --enable-triton-backend, "
+        logging.info("gpu-tune: comfy-kitchen triton backend enabled (same as --enable-triton-backend, "
                      "the backend list printed above was from before this line)")
     return ok
 
@@ -1620,7 +1620,7 @@ def configure(attention=None, convrot=None, profile=None, text_encoder=None,
               vae=None, gemv=None, textgen=None, prefix_kv=None, text_gemv=None, w4a8=None,
               amax_guard=None, int8_tile=None, small_batch=None, image_tower=None,
               int8_gemm=None, int8_attn=None, int8_attn_rotate=None, qwen21_int8_cache=None):
-    """Runtime settings, used by the GFX906 nodes.
+    """Runtime settings, used by the GPU Tuning nodes.
 
     Every argument is three-state: None/"default" keeps the built-in default
     (the manifest verdict where one exists), other values are explicit
@@ -1634,7 +1634,7 @@ def configure(attention=None, convrot=None, profile=None, text_encoder=None,
         if wanted == "hip":
             hip = _hip_attention()
             if hip is None or not hip.available():
-                logging.info("gfx906: HIP attention extension is not built, keeping mode %s",
+                logging.info("gpu-tune: HIP attention extension is not built, keeping mode %s",
                              _state["attn_kernel"])
                 wanted = _state["attn_kernel"]
         # combo values are untrusted: stale workflows may still carry removed names
@@ -1722,7 +1722,7 @@ def configure(attention=None, convrot=None, profile=None, text_encoder=None,
         if want and not was:
             # the model node absorbed the old Tuning Info node: its one-shot
             # report ships with the first profiled prompt
-            logging.info("gfx906 tuning status:\n%s", status())
+            logging.info("gpu-tuning status:\n%s", status())
     return _state
 
 
@@ -1747,7 +1747,7 @@ def _te_linear_ready(module, x):
 def _te_dequant_enabled():
     """Per-arch enablement for the register-dequantizing decode GEMV.
 
-    COMFY_GFX906_TE_DEQUANT (on/off) and COMFY_GFX906_FORCE=te_dequant outrank
+    COMFY_GPU_TUNE_TE_DEQUANT (on/off) and COMFY_GPU_TUNE_FORCE=te_dequant outrank
     the manifest; everything else needs [sites."feature.te_dequant"] default
     = "on" in the arch table (a tools/bench.py run records it). No data means
     off -- the stock dequantize-per-call path is the default, exactly like the
@@ -1845,7 +1845,7 @@ def patch_text_encoder():
         return True
     factory = getattr(comfy.ops, "mixed_precision_ops", None)
     if factory is None:
-        logging.warning("gfx906: comfy.ops has no mixed_precision_ops, text-encoder patch skipped")
+        logging.warning("gpu-tune: comfy.ops has no mixed_precision_ops, text-encoder patch skipped")
         return False
 
     def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_precision_mm=False, disabled=[]):
@@ -1859,7 +1859,7 @@ def patch_text_encoder():
             return cls
         previous = getattr(linear, "forward_comfy_cast_weights", None)
         if previous is None:
-            logging.warning("gfx906: MixedPrecisionOps.Linear has no forward_comfy_cast_weights, "
+            logging.warning("gpu-tune: MixedPrecisionOps.Linear has no forward_comfy_cast_weights, "
                             "text-encoder patch skipped")
             return cls
 
@@ -2076,11 +2076,11 @@ def _fused_qkv(attention, x):
             seen = _state.setdefault("qkv_skip_reasons", set())
             if reason not in seen:
                 seen.add(reason)
-                logging.info("gfx906: qkv fusion off, %s", reason)
+                logging.info("gpu-tune: qkv fusion off, %s", reason)
         else:
             if not _state.get("qkv_on_logged"):
                 _state["qkv_on_logged"] = True
-                logging.info("gfx906: qkv fusion on, one %s int8 gemm, rotation %s",
+                logging.info("gpu-tune: qkv fusion on, one %s int8 gemm, rotation %s",
                              tuple(merged[0].shape), merged[2])
     if merged is False:
         _state["qkv_fallbacks"] = _state.get("qkv_fallbacks", 0) + 1
@@ -2406,22 +2406,22 @@ def apply():
     # nodes can fall back to them on every platform
     _init_env_settings()
     if not enabled():
-        _state["reason"] = "disabled by COMFY_GFX906_TUNING"
+        _state["reason"] = "disabled by COMFY_GPU_TUNE"
         return _state
     if not torch.cuda.is_available():
         _state["reason"] = "no CUDA device"
-        logging.info("gfx906 tuning skipped: %s", _state["reason"])
+        logging.info("gpu-tuning skipped: %s", _state["reason"])
         return _state
 
     _state["native"] = native_backend()
     on_amd = is_amd()
     if on_amd and _state["native"]:
-        logging.info("gfx906: comfy-kitchen %s serves this %s; the triton kernel patches "
+        logging.info("gpu-tune: comfy-kitchen %s serves this %s; the triton kernel patches "
                      "below only run where its per-call constraints decline a shape",
                      _state["native"], _state["arch"])
     # a hand-measured tile spec, or one measured by tools/bench.py on this card
     # (or shipped for its arch), replaces the autotune list with a single config
-    _state["tile_measured"] = (_tile_spec("COMFY_GFX906_TILE_CONFIG") is not None
+    _state["tile_measured"] = (_tile_spec("COMFY_GPU_TUNE_TILE_CONFIG") is not None
                                or measured_tile("large") is not None)
     # before anything is patched: a card running without its numbers says so in
     # the boot log, instead of looking identical to one that has them
@@ -2439,8 +2439,8 @@ def apply():
     # tier-3 features: on only where the manifest says so -- the shipped table
     # for measured archs, or a local bench run. env overrides per value.
     # non-quantized fp16 linear: big aligned GEMMs beat rocBLAS on the measured
-    # arch; COMFY_GFX906_F16_GEMM forces it on/off for A/B.
-    if env_flag("COMFY_GFX906_F16_GEMM", "1" if feature_on("f16_gemm") else "0"):
+    # arch; COMFY_GPU_TUNE_F16_GEMM forces it on/off for A/B.
+    if env_flag("COMFY_GPU_TUNE_F16_GEMM", "1" if feature_on("f16_gemm") else "0"):
         _state["f16_gemm_enabled"] = True
         _install("f16 gemm", patch_f16_linear)
     if feature_on("convrot"):
@@ -2521,7 +2521,7 @@ def apply():
         _install("attention", patch_attention)
         _install("int8 attention", patch_int8_attention)
     logging.info(
-        "gfx906 tuning active: int8 linear %s%s%s, convrot %s, vae %s, qkv %s, attention %s%s%s%s, "
+        "gpu-tuning active: int8 linear %s%s%s, convrot %s, vae %s, qkv %s, attention %s%s%s%s, "
         "text encoder %s + lm_head, encoder attention %s, textgen %s",
         "measured tile" if _state.get("int8_tile_replaced") else ("on (stock candidates)" if _state["int8_linear"] else "off"),
         " + decode gemv" if _state.get("gemv_model") else "",
@@ -2590,7 +2590,7 @@ def status():
                  + f" ({_state.get('hip_gemm_calls', 0)} calls)") if hip_gemm is not None else "int8 gemm hip n/a"
     w4a16 = load_hip_w4a16()
     valu_line = ("w4a16 VALU levels " + ("on" if w4a16.valu_enabled() else "off")
-                 + (" (env)" if os.getenv("COMFY_GFX906_W4A16_VALU") else
+                 + (" (env)" if os.getenv("COMFY_GPU_TUNE_W4A16_VALU") else
                     " (measured)" if measured_state() == "measured" else "")) \
         if w4a16 is not None else "w4a16 VALU levels n/a"
     prefix_patched = _state.get("prefix_kv_patched")
@@ -2636,7 +2636,7 @@ def status():
         f"arch {_state['arch']}",
         f"comfy-kitchen triton backend "
         + ("on" if triton_backend_active() else
-           "off (COMFY_GFX906_TRITON_BACKEND / --disable-triton-backend; int8 linear keeps this "
+           "off (COMFY_GPU_TUNE_TRITON_BACKEND / --disable-triton-backend; int8 linear keeps this "
            "pack's kernels, every other kitchen op runs eager)"),
         tile_line,
         small_line,
@@ -2682,7 +2682,7 @@ def status():
                         f"triton kernel patches are fallback-only here")
     if _state["int8_linear"] and _state.get("int8_tile_enabled", True):
         if _state.get("tile_measured"):
-            if _tile_spec("COMFY_GFX906_TILE_CONFIG") is not None:
+            if _tile_spec("COMFY_GPU_TUNE_TILE_CONFIG") is not None:
                 suffix = "env tile"
             elif measured_tile("large") is not None:
                 suffix = "measured tile"
@@ -2705,5 +2705,5 @@ def status():
         lines.append(_state["reason"])
     forced = sorted(_state.get("forced_items") or ())
     if forced:
-        lines.append(f"forced on an unmeasured arch: {', '.join(forced)} (COMFY_GFX906_FORCE)")
+        lines.append(f"forced on an unmeasured arch: {', '.join(forced)} (COMFY_GPU_TUNE_FORCE)")
     return "\n".join(lines)

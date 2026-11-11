@@ -2,7 +2,7 @@
 
 Run without a GPU (the registry never imports torch):
 
-    python custom_nodes/ComfyUI-gfx906-Tuning/tools/registry_selftest.py
+    python custom_nodes/ComfyUI-GPU-Tuning/tools/registry_selftest.py
 
 The first half replays the *old* backend_name() logic verbatim for every
 combination of (env value, extension present, asm compiles) and compares it
@@ -77,17 +77,17 @@ def build_site(site, env_name, hip_present, asm_ok, probes, arch=None):
     candidates = []
     if site == "w4a8.m1":
         candidates.append(kreg.Candidate("hip", kind="extension",
-                                         env="COMFY_GFX906_W4A8_HIP", loader=loader))
+                                         env="COMFY_GPU_TUNE_W4A8_HIP", loader=loader))
     candidates.append(kreg.Candidate("asm", kind="asm", env=env_name, probe=probe))
     candidates.append(kreg.Candidate("triton", kind="portable"))
     return kreg.BackendRegistry(site, candidates, arch=arch)
 
 
 def compare_all():
-    os.environ.pop("COMFY_GFX906_W4A8_HIP", None)
+    os.environ.pop("COMFY_GPU_TUNE_W4A8_HIP", None)
     cases = 0
     envs = [None, "", "auto", "on", "asm", "1", "off", "triton", "0", "nonsense"]
-    sites = [("w4a8.m1", "COMFY_GFX906_W4A8_ASM"), ("int8_gemv.m1", "COMFY_GFX906_INT8_GEMV_ASM")]
+    sites = [("w4a8.m1", "COMFY_GPU_TUNE_W4A8_ASM"), ("int8_gemv.m1", "COMFY_GPU_TUNE_INT8_GEMV_ASM")]
     for site, env_name in sites:
         for hip in (False, True) if site == "w4a8.m1" else (False,):
             for asm_ok in (False, True):
@@ -242,13 +242,13 @@ def choose_layer():
 
     # an explicit switch means the user outranks the table: not even read
     table = Table({(4096, 4096, 1): "triton"})
-    reg = site(table=table, env="COMFY_GFX906_DEMO_ASM")
-    os.environ["COMFY_GFX906_DEMO_ASM"] = "on"
+    reg = site(table=table, env="COMFY_GPU_TUNE_DEMO_ASM")
+    os.environ["COMFY_GPU_TUNE_DEMO_ASM"] = "on"
     try:
         check("choose: explicit env beats the table", reg.choose(4096, 4096, 1), "asm")
         check("choose: table untouched", table.lookups, 0)
     finally:
-        os.environ.pop("COMFY_GFX906_DEMO_ASM", None)
+        os.environ.pop("COMFY_GPU_TUNE_DEMO_ASM", None)
 
     # a table naming an implementation we do not have is a table bug
     reg = site(table=Table({(4096, 4096, 1): "rocmblas"}))
@@ -278,8 +278,8 @@ def arch_kernels():
     base = [kreg.Candidate("asm", kind="asm", probe=lambda: True, priority=50),
             kreg.Candidate("triton", kind="portable")]
 
-    os.environ.pop("COMFY_GFX906_ARCH", None)
-    os.environ.pop("COMFY_GFX906_ARCH_KERNELS", None)
+    os.environ.pop("COMFY_GPU_TUNE_ARCH", None)
+    os.environ.pop("COMFY_GPU_TUNE_ARCH_KERNELS", None)
     kloader.reset()
     check("loader: no arch finds nothing", [c.name for c in kreg.site_candidates("demo.m1", base)],
           ["asm", "triton"])
@@ -287,7 +287,7 @@ def arch_kernels():
     with tempfile.TemporaryDirectory() as tmp:
         Path(tmp, "fast_demo.py").write_text(
             'SITE = "demo.m1"\nNAME = "fast"\nPRIORITY = 10\n'
-            'ENV = "COMFY_GFX906_DEMO_FAST"\nREQUIRES = ("demo",)\n\n'
+            'ENV = "COMFY_GPU_TUNE_DEMO_FAST"\nREQUIRES = ("demo",)\n\n'
             "def linear(x):\n    return x\n", encoding="utf-8")
         Path(tmp, "slow_demo.py").write_text(
             'SITE = "demo.m1"\nNAME = "slow"\nPRIORITY = 90\n\n'
@@ -301,8 +301,8 @@ def arch_kernels():
             'SITE = "demo.m1"\nNAME = "asm"\n\n'
             "def linear(x):\n    return x\n", encoding="utf-8")
 
-        os.environ["COMFY_GFX906_ARCH"] = "gfx000"
-        os.environ["COMFY_GFX906_ARCH_KERNELS"] = tmp
+        os.environ["COMFY_GPU_TUNE_ARCH"] = "gfx000"
+        os.environ["COMFY_GPU_TUNE_ARCH_KERNELS"] = tmp
         kloader.reset()
         try:
             found = kreg.site_candidates("demo.m1", base)
@@ -311,7 +311,7 @@ def arch_kernels():
             check("loader: other site ignored", "other_site" in [c.name for c in found], False)
             # a file must not shadow a name the site already declares
             check("loader: duplicate name dropped", [c.name for c in found].count("asm"), 1)
-            check("loader: env carried", found[0].env, "COMFY_GFX906_DEMO_FAST")
+            check("loader: env carried", found[0].env, "COMFY_GPU_TUNE_DEMO_FAST")
             check("loader: requires carried", found[0].requires, ("demo",))
             check("loader: kind is extension", found[0].kind, "extension")
             check("loader: probe absent", found[0].probe, None)
@@ -326,14 +326,14 @@ def arch_kernels():
 
             # disabling discovery through the arch env must be enough: an arch
             # with no directory falls back to the declared list
-            os.environ.pop("COMFY_GFX906_ARCH_KERNELS", None)
-            os.environ["COMFY_GFX906_ARCH"] = "gfx001"
+            os.environ.pop("COMFY_GPU_TUNE_ARCH_KERNELS", None)
+            os.environ["COMFY_GPU_TUNE_ARCH"] = "gfx001"
             kloader.reset()
             check("loader: other arch", [c.name for c in kreg.site_candidates("demo.m1", base)],
                   ["asm", "triton"])
         finally:
-            os.environ.pop("COMFY_GFX906_ARCH", None)
-            os.environ.pop("COMFY_GFX906_ARCH_KERNELS", None)
+            os.environ.pop("COMFY_GPU_TUNE_ARCH", None)
+            os.environ.pop("COMFY_GPU_TUNE_ARCH_KERNELS", None)
             kloader.reset()
 
 

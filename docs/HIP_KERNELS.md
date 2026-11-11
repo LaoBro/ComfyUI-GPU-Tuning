@@ -138,11 +138,11 @@ int8 GEMM 就是被 211 VGPR 钉在 4 波、后来靠 124 VGPR 上到 8 波快 1
 用某内核」。
 
 **留一个开关。** 任何手写内核都要能被单独关掉，用来 A/B、用来在本机 HIP
-不兼容时回退。开关名跟现有的 `COMFY_GFX906_*` 保持一致的风格。
+不兼容时回退。开关名跟现有的 `COMFY_GPU_TUNE_*` 保持一致的风格。
 
 **本卡没有可用的 eager int8 矩阵乘。** `torch._int_mm` 在本机的 hipblasLt 上（缺
 `TensileLibrary_lazy_gfx906.dat`）m=1/16/64/1024 全部抛 `HIPBLAS_STATUS_INVALID_VALUE`，
-所以 comfy-kitchen 的 triton 后端在这里不是「可选加速」。`COMFY_GFX906_TRITON_BACKEND=off`
+所以 comfy-kitchen 的 triton 后端在这里不是「可选加速」。`COMFY_GPU_TUNE_TRITON_BACKEND=off`
 只该用于 A/B 本包没覆盖的操作（4096x4096：`quantize_int8_rowwise` 113.7→381.3 us、
 `dequantize_per_tensor_fp8` 666.9→863.4 us）。本包在 triton 和 eager 两个后端的
 `int8_linear` 上都装了同一层路由（GEMV → HIP int8 GEMM → triton 内核兜底），所以这个
@@ -259,7 +259,7 @@ GEMV（只接 m=1）也不在 HIP GEMM（`MIN_ROWS=128`）里。
 | 融合注意力 `hip_attn.cu` | 5.0-6.0 TMAC/s，比 int8 快 1.3-1.7x。**「4 波 dot2 天花板的 75-78%」这句已作废**：消融实测两次矩阵乘占 ~95% 周期、且已贴着 4 波 dot2 天花板（旧表里「矩阵乘 21%」是段标签错位，见下面「注意力的相位分解」） | 128 Q 行 x 64 keys、256 线程、1 block/CU、32+64 fp32 累加器、XOR swizzled LDS 恰好 64 KB、**K 不做跨 tile 预取**（预取反而慢 6.7%，逐位相同） |
 | 大 m int8 GEMM `int8_gemm.cu` | 16.56 TMAC/s @8192³（原 10.04，**1.6x**；对参考包 0.99x，已追平），节点级 1.10-1.16x 以上 | 128x128 tile、TM8/TN8 = 64 int32 累加器、BK=64、chunk-major LDS、**123-124 VGPR 无 spill、2 block/CU（8 波）**。操作数驻 LDS、逐 k-dword 即时读（B 跨 TM 行复用），s 循环 unroll 2、uint4 整块写 LDS、**`ALIGNED_K` 编译期特化去掉尾部掩码** |
 | 激活旋转 `rotate.cu` | fp32 档约 12x（graph 内 23.6 → 2.0 us/call），端到端 38.4 → 51.6 tok/s | radix-4 butterfly，D=1/4/16 用 shfl_xor、D=64 走 LDS，无全局 Hadamard 流量 |
-| W4A16 解码 GEMV `w4a16.cu` | 单行解码 3.6-4.4x（48-62 → 185-274 GB/s）；多行 `w4a16_gemv_m`（m=2..8）1.6-5.3x（11-45 → 18-238 GB/s） | 一行拆 32 lane（一个 wavefront 读 8 行 x 16 B）、grid 封顶 240 块 = 960 波、每 lane 一个 uint4、16 级 fp32 codebook 放 LDS、每个 dword 一条独立累加链、**激活按 quad 行落 LDS**（先 lane-major 修 bank 冲突 1.4x，再 b128 一条指令供 4 个权重又 1.15x）、**循环倒置**（每个 chunk 只 pack 一次激活，再遍历本块的 32 个 row-group，部分和走 LDS、每块一次 shuffle，寄存器不涨）；多行版沿用这套 lane 划分，但一个 dword 解出的 8 个格点跨 M 行复用，激活按 M 行整块落 LDS。同文件第三个入口 `w4a16_gemv_h` 把激活换成 fp16、乘加换成 `v_dot2_f32_f16`：m=1..8 再快 1.05-4.89x，寄存器从 94-240 掉到 29-59。**无 codebook 时它是默认**（`code-8` 在 fp16 里精确，数值与无损版同为 2.4e-7）；带 codebook 要把格点退到 fp16，故 `COMFY_GFX906_W4A16_F16ACT=1` 才开 |
+| W4A16 解码 GEMV `w4a16.cu` | 单行解码 3.6-4.4x（48-62 → 185-274 GB/s）；多行 `w4a16_gemv_m`（m=2..8）1.6-5.3x（11-45 → 18-238 GB/s） | 一行拆 32 lane（一个 wavefront 读 8 行 x 16 B）、grid 封顶 240 块 = 960 波、每 lane 一个 uint4、16 级 fp32 codebook 放 LDS、每个 dword 一条独立累加链、**激活按 quad 行落 LDS**（先 lane-major 修 bank 冲突 1.4x，再 b128 一条指令供 4 个权重又 1.15x）、**循环倒置**（每个 chunk 只 pack 一次激活，再遍历本块的 32 个 row-group，部分和走 LDS、每块一次 shuffle，寄存器不涨）；多行版沿用这套 lane 划分，但一个 dword 解出的 8 个格点跨 M 行复用，激活按 M 行整块落 LDS。同文件第三个入口 `w4a16_gemv_h` 把激活换成 fp16、乘加换成 `v_dot2_f32_f16`：m=1..8 再快 1.05-4.89x，寄存器从 94-240 掉到 29-59。**无 codebook 时它是默认**（`code-8` 在 fp16 里精确，数值与无损版同为 2.4e-7）；带 codebook 要把格点退到 fp16，故 `COMFY_GPU_TUNE_W4A16_F16ACT=1` 才开 |
 
 int8 GEMM 的占用率教训（2026-11，**推翻旧结论**）：旧的内层循环把操作数整块
 物化成 `u4 a[TM]+b[TN]`，用 211 VGPR 只跑 1 block/CU（4 波），10.04 TMAC/s。
@@ -293,7 +293,7 @@ unroll 2、uint4 整块写、`ALIGNED_K` 特化——一次落到 **124 VGPR / 0
 `comfy.ops.disable_weight_init.Linear.forward`（`manual_cast.Linear` 继承它），
 `hip_f16_gemm.linear` 带守卫：fp16、`M>=128`、`K%32`、`N%64`、无 LoRA
 weight/bias function，否则回落 rocBLAS（decode GEMV 与非对齐形状不接）。
-`feature.f16_gemm` 出厂 on，`COMFY_GFX906_F16_GEMM` 可 A/B。**SDXL UNet 端到端
+`feature.f16_gemm` 出厂 on，`COMFY_GPU_TUNE_F16_GEMM` 可 A/B。**SDXL UNet 端到端
 实测 609 → 515.6 ms = 1.18x**（无外部依赖；参考包同形状约 1.22x）。数值 rel 对
 F.linear ~2e-5、对 fp64 2.1e-4（fp16 舍入），生图 md5 仍按惯例 `--sampling off` 复验。
 
@@ -341,7 +341,7 @@ barrier。**逐位一致**，不需要重验 md5。
 
 6 组形状 × fp32/fp16 输出全部 `torch.equal` 为真，对 fp32 参考的 relL2 与表格路径
 相同（3e-7 ~ 1.1e-6）。**进测量门**：`feature.w4a16_valu` 决定缺省开关，出厂
-gfx906 表为 `on`，没跑过 bench 的卡为 `off`；`COMFY_GFX906_W4A16_VALU=on/off`
+gfx906 表为 `on`，没跑过 bench 的卡为 `off`；`COMFY_GPU_TUNE_W4A16_VALU=on/off`
 显式覆盖。`bench.py --w4a16-valu --write` 重测四个 m=2..4 形状并改写判定与
 `w4a16.valu` 记录（3% 的 `--min-gain` 门槛，深队列计时）：本机 VALU 比表格快
 6.1%（中位数）。带 codebook 的检查点仍走表格。m>4 在入口处回落表格：M=8 本来
@@ -632,7 +632,7 @@ VALU 一旦发射就打满 lane，却有 61% 的周期没在发射——**不是
 `prequantize_int8_attention`、`int8_attention_from_prequantized`、
 `int8_attention_is_available` 四个入口，同时点亮 `attention.py` 的可用常量并注册
 `comfy_kitchen_int8` 后端名。checkpoint 的 `ComfyAttention` 配置和 minimax VAE
-都不改代码就能走新内核。默认**关**（`COMFY_GFX906_INT8_ATTN=1` 或节点开关打开）；
+都不改代码就能走新内核。默认**关**（`COMFY_GPU_TUNE_INT8_ATTN=1` 或节点开关打开）；
 关着时这些调用照旧走 `optimized_attention`，不会退化成 SDPA。
 
 尚未覆盖：带 mask 的调用（转给 `attention_pytorch`）、D=256（转给同一条回退）、
@@ -680,7 +680,7 @@ Q/K/V 旋转+量化 1.03 ms、V 打包 0.75 ms、输出反旋转 0.31 ms。改�
    `key*H + hk`，Qwen-Image 2.1（没有 GQA）完全看不出来，直到契约路径的
    GQA 用例（h=4/hkv=2）报出 1.75 才暴露。批次步长同理是 `2*SP*HKV`。
 
-开关 `qwen21_int8_cache`（默认关，`COMFY_GFX906_QWEN21_INT8_CACHE=1` 可开），
+开关 `qwen21_int8_cache`（默认关，`COMFY_GPU_TUNE_QWEN21_INT8_CACHE=1` 可开），
 关闭时 `take()` 与原路径逐位一致；补丁只改读路径，`put()`（缓存写入）不动。
 
 ## 试过但没采用的路径

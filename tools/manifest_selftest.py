@@ -1,6 +1,6 @@
 """Self-test for the measurement manifest: parsing, trust, merge, fallback.
 
-    python custom_nodes/ComfyUI-gfx906-Tuning/tools/manifest_selftest.py
+    python custom_nodes/ComfyUI-GPU-Tuning/tools/manifest_selftest.py
 
 No GPU and no torch: everything here is file parsing plus the fingerprint rules,
 which is exactly the part that decides whether a number is allowed to be used.
@@ -128,14 +128,14 @@ fingerprint = "rocmlike|triton9|gfx000"
 "64x128@m1" = { impl = "asm", grade = "measured", date = "2026-11-04" }
 "256x256@m1" = { impl = "triton", grade = "measured" }
 """)
-        original, os.environ["COMFY_GFX906_MANIFEST_DIR"] = (
+        original, os.environ["COMFY_GPU_TUNE_MANIFEST_DIR"] = (
             mf.node_dir, str(tmp))
         mf.node_dir = lambda: repo
         try:
             data = mf.load("gfx000", runtime=FAKE_RT)
         finally:
             mf.node_dir = original
-            os.environ.pop("COMFY_GFX906_MANIFEST_DIR")
+            os.environ.pop("COMFY_GPU_TUNE_MANIFEST_DIR")
         check("merge: loads", data is not None, True)
         check("merge: override wins on the same shape", data.lookup("demo.m1", 64, 128, 1), "asm")
         check("merge: new shape kept", data.lookup("demo.m1", 256, 256, 1), "triton")

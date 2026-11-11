@@ -7,7 +7,7 @@ site's candidate chain. A module declares what it is:
 SITE = "w4a8.m1"                  # required: which site it implements
 NAME = "hip"                      # optional: candidate name, defaults to the file name
 PRIORITY = 10                     # optional: lower runs first (default 30)
-ENV = "COMFY_GFX906_W4A8_HIP"     # optional: its own on/off switch
+ENV = "COMFY_GPU_TUNE_W4A8_HIP"   # optional: its own on/off switch
 REQUIRES = ("hip extension",)     # optional: documentation only
 
 def probe():                      # optional: defaults to "imported means available"

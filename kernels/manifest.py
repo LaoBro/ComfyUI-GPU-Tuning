@@ -8,7 +8,7 @@ it, and a diff shows exactly which card gained or lost).
 Layout::
 
     arch/<gcn>/manifest.toml                 shipped with the node
-    ~/.config/comfy-gfx-tune/arch/<gcn>/...  local override, wins over the above
+    ~/.config/comfy-gpu-tune/arch/<gcn>/...  local override, wins over the above
 
 Trust is a field, not a convention:
 
@@ -249,7 +249,7 @@ def node_dir():
 
 def default_paths(arch):
     """Shipped manifest first, local override second (it wins)."""
-    override = Path(os.getenv("COMFY_GFX906_MANIFEST_DIR", "~/.config/comfy-gfx-tune")).expanduser()
+    override = Path(os.getenv("COMFY_GPU_TUNE_MANIFEST_DIR", "~/.config/comfy-gpu-tune")).expanduser()
     return [node_dir() / "arch" / arch / "manifest.toml",
             override / "arch" / arch / "manifest.toml"]
 
@@ -257,21 +257,21 @@ def default_paths(arch):
 def _parse_shape(key, raw):
     """One inline table -> Shape, or None when it is not shaped like one."""
     if not isinstance(raw, dict):
-        logger.warning("gfx906: manifest %s is not a table, skipped", key)
+        logger.warning("gpu-tune: manifest %s is not a table, skipped", key)
         return None
     impl = raw.get("impl")
     if not isinstance(impl, str) or not impl:
-        logger.warning("gfx906: manifest %s has no impl, skipped", key)
+        logger.warning("gpu-tune: manifest %s has no impl, skipped", key)
         return None
     ms = {}
     for name, value in (raw.get("ms") or {}).items():
         if isinstance(value, (int, float)) and value > 0:
             ms[str(name)] = float(value)
         else:
-            logger.warning("gfx906: manifest %s ms[%s]=%r is not a time, skipped", key, name, value)
+            logger.warning("gpu-tune: manifest %s ms[%s]=%r is not a time, skipped", key, name, value)
     grade = raw.get("grade", "assumed")
     if grade not in GRADES:
-        logger.warning("gfx906: manifest %s grade %r unknown, treated as assumed", key, grade)
+        logger.warning("gpu-tune: manifest %s grade %r unknown, treated as assumed", key, grade)
         grade = "assumed"
     rel = raw.get("rel")
     return Shape(impl=impl, ms=ms,
@@ -283,7 +283,7 @@ def _parse_sites(data):
     sites = {}
     for name, raw in (data.get("sites") or {}).items():
         if not isinstance(raw, dict):
-            logger.warning("gfx906: manifest site %s is not a table, skipped", name)
+            logger.warning("gpu-tune: manifest site %s is not a table, skipped", name)
             continue
         shapes = {}
         for key, value in (raw.get("shapes") or {}).items():
@@ -293,7 +293,7 @@ def _parse_sites(data):
         default = raw.get("default")
         default_grade = raw.get("default_grade", "assumed")
         if default_grade not in GRADES:
-            logger.warning("gfx906: manifest site %s default_grade %r unknown, treated as assumed",
+            logger.warning("gpu-tune: manifest site %s default_grade %r unknown, treated as assumed",
                            name, default_grade)
             default_grade = "assumed"
         sites[name] = Site(name=name,
@@ -311,9 +311,9 @@ def _read(path):
     try:
         return _loads(text)
     except ImportError:
-        logger.warning("gfx906: no TOML reader on this Python (need 3.11+), manifest %s ignored", path)
+        logger.warning("gpu-tune: no TOML reader on this Python (need 3.11+), manifest %s ignored", path)
     except Exception as exc:                        # noqa: BLE001 - a broken file must not stop a start
-        logger.warning("gfx906: manifest %s is not valid TOML: %s", path, exc)
+        logger.warning("gpu-tune: manifest %s is not valid TOML: %s", path, exc)
     return None
 
 
@@ -336,12 +336,12 @@ def load(arch, path=None, runtime=None):
             continue
         schema = data.get("schema")
         if schema != SCHEMA_VERSION:
-            logger.warning("gfx906: manifest %s has schema %r, expected %d, ignored",
+            logger.warning("gpu-tune: manifest %s has schema %r, expected %d, ignored",
                            candidate, schema, SCHEMA_VERSION)
             continue
         block = data.get("arch") or {}
         if block.get("gcn") not in (None, arch):
-            logger.warning("gfx906: manifest %s is for %r, not %r, ignored",
+            logger.warning("gpu-tune: manifest %s is for %r, not %r, ignored",
                            candidate, block.get("gcn"), arch)
             continue
         sites = _parse_sites(data)

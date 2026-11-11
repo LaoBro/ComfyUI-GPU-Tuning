@@ -274,9 +274,9 @@ def _probe_asm():
 _REGISTRY = kreg.BackendRegistry(
     "w4a8.m1",
     kreg.site_candidates("w4a8.m1", [
-        kreg.Candidate("hip", kind="extension", env="COMFY_GFX906_W4A8_HIP",
+        kreg.Candidate("hip", kind="extension", env="COMFY_GPU_TUNE_W4A8_HIP",
                        loader=_load_hip, priority=10, requires=("hip extension",)),
-        kreg.Candidate("asm", kind="asm", env="COMFY_GFX906_W4A8_ASM",
+        kreg.Candidate("asm", kind="asm", env="COMFY_GPU_TUNE_W4A8_ASM",
                        probe=_probe_asm, priority=50, requires=("v_dot4_i32_i8", "v_perm_b32")),
         kreg.Candidate("triton", kind="portable"),
         # floor: any group size, no instruction the card may lack
@@ -393,7 +393,7 @@ def linear_dequant(x, qdata, s_rel, s_channel, bias, out_dtype, group_size,
     # skips. Without a codebook it runs by default: the uniform `code - 8` grid is
     # exact in fp16, so that tier gains speed and nothing else changes. A codebook
     # rounds its 16 levels to fp16 (~2.5e-4), which is opt-in through
-    # COMFY_GFX906_W4A16_F16ACT.
+    # COMFY_GPU_TUNE_W4A16_F16ACT.
     if (hip_w4a16.enabled() and x.dtype == torch.float16 and not convrot_groupsize
             and (codebook is None or hip_w4a16.f16_enabled())):
         if hip_w4a16.linear_dequant_h(x, qdata, s_rel, s_channel, bias, out, group_size, lut):
@@ -596,7 +596,7 @@ def _note_floor(group_size):
     if _FLOOR_SEEN:
         return
     _FLOOR_SEEN = True
-    kreg.logger.info("gfx906: w4a8 group %d is below the tl.dot floor of 16, using the tl.sum kernel",
+    kreg.logger.info("gpu-tune: w4a8 group %d is below the tl.dot floor of 16, using the tl.sum kernel",
                      group_size)
 
 

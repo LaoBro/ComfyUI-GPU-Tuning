@@ -85,11 +85,11 @@ def load(name, label=None):
     if not path.exists():
         return None
     if not _runtime_ready(arch):
-        logger.info("gfx906: GPU runtime not found, %s stays off", label or name)
+        logger.info("gpu-tune: GPU runtime not found, %s stays off", label or name)
         return None
     try:
         return ctypes.CDLL(str(path))
     except OSError as exc:
-        logger.warning("gfx906: %s did not load (%s); rebuild it for this runtime with "
+        logger.warning("gpu-tune: %s did not load (%s); rebuild it for this runtime with "
                        "tools/build_hip_attn.py --force", path.name, exc)
         return None

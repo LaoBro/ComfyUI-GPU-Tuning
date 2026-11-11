@@ -31,14 +31,14 @@ NVIDIA 和 CPU 会整包跳过（`apply()` 里的 `is_amd()` 判断）。
 C 类最关键：**没跑过测量就别猜**。数据有两个来源，本地覆盖出厂：
 
 - `arch/<gcn>/manifest.toml` 随包分发，只对已实测架构生效，开箱即得；
-- `~/.config/comfy-gfx-tune/arch/<gcn>/manifest.toml` 由 `bench.py --write` 写，
+- `~/.config/comfy-gpu-tune/arch/<gcn>/manifest.toml` 由 `bench.py --write` 写，
   带本机指纹，逐形状覆盖出厂表。
 
 指纹包含 ROCm 版本、Torch 构建号、Triton 版本和 gcn 目标。**换一次 torch 就要
 重测**：内核是那个编译器产出的，同版本 ROCm 的另一次构建也可能挪动几个百分点。
 指纹不符时整张表被忽略（不是逐条赌），启动会 WARNING。
 
-`COMFY_GFX906_FORCE=deltanet,w4a8,...` 是手动逃生口：跳过一切判定直接装，
+`COMFY_GPU_TUNE_FORCE=deltanet,w4a8,...` 是手动逃生口：跳过一切判定直接装，
 启动会 WARNING 说明这些内核没在当前卡上测过。
 
 还有一点容易误解：这里的「安装」是**替换模块级符号或类**，不是设一个开关位。
@@ -67,7 +67,7 @@ dispatch 管不到的几类：
 `feature.qwen35`（用例只覆盖 prefill，收益主要在 decode，测量覆盖不了决策面），
 所以 qwen35 留在 B 类。
 
-优先级一句话：**节点显式 on/off > `COMFY_GFX906_*` > 内置默认**。节点里的
+优先级一句话：**节点显式 on/off > `COMFY_GPU_TUNE_*` > 内置默认**。节点里的
 `default` / `auto` 表示沿用 env，不会拿硬编码值盖掉它。
 
 ## 加一个内核或后端
@@ -87,7 +87,7 @@ dispatch 管不到的几类：
 
 「节点跑了但没在用实测数据」是最糟的状态：表现和正常一模一样，只是慢。
 所以 `measured` / `stale` / `absent` / `off` 四种状态各有对应的 WARNING 或
-`status()` 行，`COMFY_GFX906_MEASURED=0` 可以整体关掉这一层救急。
+`status()` 行，`COMFY_GPU_TUNE_MEASURED=0` 可以整体关掉这一层救急。
 
 ## 归因与 A/B 纪律
 
@@ -140,7 +140,7 @@ dispatch 管不到的几类：
 
 ```
 # 只打印，不写文件
-.venv/bin/python custom_nodes/ComfyUI-gfx906-Tuning/tools/bench.py
+.venv/bin/python custom_nodes/ComfyUI-GPU-Tuning/tools/bench.py
 
 # 一张卡需要的一切：tile + 各 feature 的 on/off，写入本机覆盖
 ... --all --write
@@ -149,24 +149,24 @@ dispatch 管不到的几类：
 ... --site w4a8.m1 --shapes 4096x4096@m1,4096x4096@m8 --write
 
 # 直接改随包分发的表（准备 PR 时用）
-... --write --out custom_nodes/ComfyUI-gfx906-Tuning/arch/gfx906/manifest.toml
+... --write --out custom_nodes/ComfyUI-GPU-Tuning/arch/gfx906/manifest.toml
 
 # 扫单个 tile 候选、打印可直接用的环境变量
-.venv/bin/python custom_nodes/ComfyUI-gfx906-Tuning/tools/tile_sweep.py --emit
+.venv/bin/python custom_nodes/ComfyUI-GPU-Tuning/tools/tile_sweep.py --emit
 
 # 生文链路归因
-.venv/bin/python custom_nodes/ComfyUI-gfx906-Tuning/tools/chain_profile.py --clip <文件名> --max-length 32
+.venv/bin/python custom_nodes/ComfyUI-GPU-Tuning/tools/chain_profile.py --clip <文件名> --max-length 32
 
 # 不开 ComfyUI 看判定 / 改内核后的 parity 与数值 A/B
-.venv/bin/python custom_nodes/ComfyUI-gfx906-Tuning/tools/status.py
-.venv/bin/python custom_nodes/ComfyUI-gfx906-Tuning/tools/verify_backends.py
+.venv/bin/python custom_nodes/ComfyUI-GPU-Tuning/tools/status.py
+.venv/bin/python custom_nodes/ComfyUI-GPU-Tuning/tools/verify_backends.py
 ```
 
-手工指定 tile：`COMFY_GFX906_TILE_CONFIG` 让该卡视为「已实测」、列表只放这一个
-配置、不跑 autotune；`COMFY_GFX906_SMALL_TILE_CONFIG` 只换小 tile 候选。
+手工指定 tile：`COMFY_GPU_TUNE_TILE_CONFIG` 让该卡视为「已实测」、列表只放这一个
+配置、不跑 autotune；`COMFY_GPU_TUNE_SMALL_TILE_CONFIG` 只换小 tile 候选。
 两个变量都是启动期读取，manifest 里的 `int8_gemm.tile` 与 env 同权（env 优先）。
-manifest 根目录可用 `COMFY_GFX906_MANIFEST_DIR` 改，`COMFY_GFX906_ARCH` 可强制
-指定目标目录（没插卡时开发用），`COMFY_GFX906_ARCH_KERNELS` 可追加搜索目录。
+manifest 根目录可用 `COMFY_GPU_TUNE_MANIFEST_DIR` 改，`COMFY_GPU_TUNE_ARCH` 可强制
+指定目标目录（没插卡时开发用），`COMFY_GPU_TUNE_ARCH_KERNELS` 可追加搜索目录。
 
 ## B. 功能全表
 
@@ -197,7 +197,7 @@ prefix KV 复用、profiler（常开）；qkv（1.6 GB 常驻，默认关）、q
 
 易踩的坑：`configure(w4a8=on)` 会在节点执行时直接把模块装上，绕过
 `feature.w4a8` 的安装判定。非 gfx906 上 asm 探测会自动失败、落到 per-group
-`tl.dot`；但显式 `COMFY_GFX906_W4A8_ASM=on` 会跳过探测，实际调用时报编译错误。
+`tl.dot`；但显式 `COMFY_GPU_TUNE_W4A8_ASM=on` 会跳过探测，实际调用时报编译错误。
 
 `feature.*` 由 bench 写七项：`gemv`、`w4a8`、`deltanet`、`deltanet_prefill`、
 `vae`、`vision`、`convrot`。不写三项：`attention`（质量取舍）、`qwen35`、
@@ -344,10 +344,11 @@ fallback，别指望在 gfx906 上追平 asm。原型脚本（不随节点分发
 后端链（`w4a8.m1`）：`hip` 扩展 > `asm`（编译探测 `v_dot4_i32_i8`）>
 `triton`（per-group `tl.dot`，要求 group_size >= 16 且是 16 的倍数）>
 `sum`（`tl.sum` 保底，无条件接受所有合法形状）。`int8_gemv.m1` 用同一套，
-候选是 `asm` / `triton`。`COMFY_GFX906_W4A8_ASM` / `_HIP` /
-`COMFY_GFX906_INT8_GEMV_ASM` 都是 `auto` / `on` / `off` 三态。
+候选是 `asm` / `triton`。`COMFY_GPU_TUNE_W4A8_ASM` / `_HIP` /
+`COMFY_GPU_TUNE_INT8_GEMV_ASM` 都是 `auto` / `on` / `off` 三态。
 选择 parity 用 `tools/registry_selftest.py`（无 GPU，60 种情形），
 真机 parity 与数值 A/B 用 `tools/verify_backends.py`。
+节点三态开关的语义用 `tools/settings_selftest.py`（需要 venv 里的 torch，无 GPU）。
 
 ## F. 非目标设备
 
@@ -369,4 +370,4 @@ AMD 上 kitchen 已有后端的卡走上一节的 dispatch 逻辑：只装与后
 4. 逐项 A/B，一次只动一个变量。
 5. `gfx906` 上 `textgen` 四项都是 on；别的卡上 `status()` 打 `n/a` 是正常的。
 6. 改内核后跑 `verify_backends.py` 再记录性能。
-7. 换了 torch/驱动就重跑第 2 步；表写错时 `COMFY_GFX906_MEASURED=0` 整体关掉。
+7. 换了 torch/驱动就重跑第 2 步；表写错时 `COMFY_GPU_TUNE_MEASURED=0` 整体关掉。

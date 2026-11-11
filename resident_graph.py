@@ -222,7 +222,7 @@ def install(gate=None):
         from comfy.text_encoders import llama
         import execution
     except ImportError:
-        logging.warning("gfx906: resident graph hooks unavailable on this build, decode runs eagerly")
+        logging.warning("gpu-tune: resident graph hooks unavailable on this build, decode runs eagerly")
         return False
     core_symbols = ("prefetch_queue_pop", "_drop_graph", "pause_malloc_graph",
                     "GRAPH_WARMED_MODULES", "MALLOC_GRAPHS", "cleanup_prefetch_queues")
@@ -230,7 +230,7 @@ def install(gate=None):
             or not hasattr(llama, "Llama2_")
             or not hasattr(llama.BaseGenerate, "generate")
             or not hasattr(execution.PromptExecutor, "execute_async")):
-        logging.warning("gfx906: resident graph hooks unavailable on this build, decode runs eagerly")
+        logging.warning("gpu-tune: resident graph hooks unavailable on this build, decode runs eagerly")
         return False
     return (_patch_prefetch_queue_pop() and _patch_forward()
             and _patch_generate() and _patch_prompt_end())

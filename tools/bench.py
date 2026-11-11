@@ -1,7 +1,7 @@
 """Measure a site's implementations on this GPU and record the result.
 
     # dry run: print the table, touch nothing
-    .venv/bin/python custom_nodes/ComfyUI-gfx906-Tuning/tools/bench.py
+    .venv/bin/python custom_nodes/ComfyUI-GPU-Tuning/tools/bench.py
 
     # one site, custom shapes
     ... --site w4a8.m1 --shapes 4096x4096@m1,4096x4096@m8
@@ -14,7 +14,7 @@
     ... --all --write
 
     # target the file that ships with the node (for a PR)
-    ... --write --out custom_nodes/ComfyUI-gfx906-Tuning/arch/gfx906/manifest.toml
+    ... --write --out custom_nodes/ComfyUI-GPU-Tuning/arch/gfx906/manifest.toml
 
 --all is what fills a card's measurement gates: after one run the int8 linear
 list holds a single tile, attention has a tile per head dim and a measured
@@ -567,7 +567,7 @@ def run_tile_site(args, today):
     """
     import tile_sweep
 
-    import gfx906_tuning as tuning
+    import gpu_tuning as tuning
 
     tuning.enable_triton_backend()
     try:
@@ -645,7 +645,7 @@ def run_attention_site(args, today):
     data), the mode that won, and whether our kernel should be installed at all.
     """
     import attention_kernel as attn
-    import gfx906_tuning as tuning
+    import gpu_tuning as tuning
     try:
         import hip_attention as hip
     except ImportError:
@@ -1277,7 +1277,7 @@ def run_w4a16_valu_site(args, today):
     group = args.w4a8_group
     gen = torch.Generator(device="cuda").manual_seed(0)
     records, ratios = {}, {}
-    saved = os.environ.get("COMFY_GFX906_W4A16_VALU")
+    saved = os.environ.get("COMFY_GPU_TUNE_W4A16_VALU")
     try:
         for item in args.w4a16_valu_shapes.split(","):
             size, _, mtext = item.strip().partition("@m")
@@ -1301,7 +1301,7 @@ def run_w4a16_valu_site(args, today):
 
             times, errors = {}, {}
             for name, mode in (("table", "off"), ("valu", "on")):
-                os.environ["COMFY_GFX906_W4A16_VALU"] = mode
+                os.environ["COMFY_GPU_TUNE_W4A16_VALU"] = mode
 
                 def call():
                     return hip.linear_dequant(x, qdata, s8, s_channel, None, out, group, None)
@@ -1328,9 +1328,9 @@ def run_w4a16_valu_site(args, today):
                 date=today, note="uniform grid, fp32 activations, deep queue")
     finally:
         if saved is None:
-            os.environ.pop("COMFY_GFX906_W4A16_VALU", None)
+            os.environ.pop("COMFY_GPU_TUNE_W4A16_VALU", None)
         else:
-            os.environ["COMFY_GFX906_W4A16_VALU"] = saved
+            os.environ["COMFY_GPU_TUNE_W4A16_VALU"] = saved
 
     defaults = {}
     if ratios:
@@ -1403,7 +1403,7 @@ def main():
     if not torch.cuda.is_available():
         print("no device: torch.cuda.is_available() is False (see tools/verify_backends.py for the same check)")
         return 2
-    import gfx906_tuning as tuning
+    import gpu_tuning as tuning
 
     arch = manifest_mod.device_arch()
     fingerprint = manifest_mod.runtime_fingerprint(arch)

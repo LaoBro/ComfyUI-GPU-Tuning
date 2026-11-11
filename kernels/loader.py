@@ -6,7 +6,7 @@ turns it into a candidate:
     SITE = "w4a8.m1"                   # required; the site name it belongs to
     NAME = "hip"                       # optional; defaults to the file name
     PRIORITY = 10                      # optional; lower runs first (default 30)
-    ENV = "COMFY_GFX906_W4A8_HIP"      # optional per-implementation switch
+    ENV = "COMFY_GPU_TUNE_W4A8_HIP"    # optional per-implementation switch
     REQUIRES = ("hip extension",)      # optional, documentation
     def probe(): return True           # optional; "imported" is enough otherwise
     def linear(...): ...               # the site's own signature, unchanged
@@ -20,8 +20,8 @@ Rules that keep this simple:
 * a compiled extension is wrapped by a two-line shim that imports it, so the
   `.so` can live wherever it was built.
 
-`COMFY_GFX906_ARCH` overrides the detected target (useful on a machine without
-the GPU you are targeting), and `COMFY_GFX906_ARCH_KERNELS` adds a search
+`COMFY_GPU_TUNE_ARCH` overrides the detected target (useful on a machine without
+the GPU you are targeting), and `COMFY_GPU_TUNE_ARCH_KERNELS` adds a search
 directory, which is how the self-test exercises discovery without touching the
 repository.
 """
@@ -33,8 +33,8 @@ from pathlib import Path
 
 from .contract import Candidate, logger
 
-ARCH_ENV = "COMFY_GFX906_ARCH"
-SEARCH_ENV = "COMFY_GFX906_ARCH_KERNELS"
+ARCH_ENV = "COMFY_GPU_TUNE_ARCH"
+SEARCH_ENV = "COMFY_GPU_TUNE_ARCH_KERNELS"
 DEFAULT_PRIORITY = 30
 
 _cache = {}
@@ -106,7 +106,7 @@ def candidates_for(site, arch=None):
             try:
                 module = _import(path, arch)
             except Exception as exc:                    # noqa: BLE001 - see module docstring
-                logger.warning("gfx906: %s/%s could not be imported (%s: %s), skipped",
+                logger.warning("gpu-tune: %s/%s could not be imported (%s: %s), skipped",
                                Path(directory).name, path.name, type(exc).__name__, exc)
                 continue
             if module is None:
@@ -125,7 +125,7 @@ def candidates_for(site, arch=None):
                 requires=tuple(getattr(module, "REQUIRES", ())),
             )
             found.append(candidate)
-            logger.info("gfx906: %s gets %r from arch/%s/kernels/%s (priority %d)",
+            logger.info("gpu-tune: %s gets %r from arch/%s/kernels/%s (priority %d)",
                         site, candidate.name, arch, path.name, priority)
     _cache[key] = tuple(found)
     return _cache[key]

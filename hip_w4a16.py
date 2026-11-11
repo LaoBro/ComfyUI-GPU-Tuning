@@ -9,11 +9,11 @@ dword (1.6-5.3x), and a third that takes fp16 activations and does the math with
 v_dot2_f32_f16 for any m=1..8 (4.1-8.7x). That feed is the default unless the
 checkpoint carries a codebook, because the uniform `code - 8` grid is exact in
 fp16; a codebook rounds its 16 levels (~2.5e-4) so it needs
-COMFY_GFX906_W4A16_F16ACT=1. m > 8, convrot and any other mismatch fall back to Triton.
+COMFY_GPU_TUNE_W4A16_F16ACT=1. m > 8, convrot and any other mismatch fall back to Triton.
 
-COMFY_GFX906_W4A16_HIP=off restores the Triton kernel for an A/B run;
-COMFY_GFX906_W4A16_F16ACT=1 also lets a codebook checkpoint use that feed;
-COMFY_GFX906_W4A16_VALU=off restores the tab[16] feed for an A/B run; the
+COMFY_GPU_TUNE_W4A16_HIP=off restores the Triton kernel for an A/B run;
+COMFY_GPU_TUNE_W4A16_F16ACT=1 also lets a codebook checkpoint use that feed;
+COMFY_GPU_TUNE_W4A16_VALU=off restores the tab[16] feed for an A/B run; the
 VALU-built levels are the default for m = 2..4 (m > 4 keeps the table).
 
 The stream is read at call time: torch.cuda.graph() switches current_stream to its
@@ -64,14 +64,14 @@ def available():
 
 
 def enabled():
-    return os.getenv("COMFY_GFX906_W4A16_HIP", "1").strip().lower() not in ("0", "off", "false", "no")
+    return os.getenv("COMFY_GPU_TUNE_W4A16_HIP", "1").strip().lower() not in ("0", "off", "false", "no")
 
 
 def f16_enabled():
     """Whether a checkpoint *with* a codebook may use the fp16 feed. Without one the
     grid is exact in fp16 and the caller uses that feed regardless; with one it rounds
     the 16 levels, a ~2.5e-4 systematic relative error rather than rounding noise."""
-    return os.getenv("COMFY_GFX906_W4A16_F16ACT", "0").strip().lower() in ("1", "on", "true", "yes")
+    return os.getenv("COMFY_GPU_TUNE_W4A16_F16ACT", "0").strip().lower() in ("1", "on", "true", "yes")
 
 
 def valu_enabled():
@@ -82,7 +82,7 @@ def valu_enabled():
     is on there. `linear_dequant` still sends m > 4 to the table entry: that
     shape spills at 256 VGPR and the VALU levels cost more than they save.
     """
-    explicit = os.getenv("COMFY_GFX906_W4A16_VALU")
+    explicit = os.getenv("COMFY_GPU_TUNE_W4A16_VALU")
     if explicit is not None and explicit.strip():
         return explicit.strip().lower() not in ("0", "off", "false", "no")
     table = kreg.runtime_manifest()
