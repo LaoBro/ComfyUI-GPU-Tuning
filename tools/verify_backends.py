@@ -180,8 +180,8 @@ def main():
         return 2
 
     environment()
-    import int8_gemv
-    import w4a8_gemv
+    from kernels.triton import int8_gemv
+    from kernels.triton import w4a8_gemv
 
     print("\n[1] selection parity with the pre-registry logic")
     selection(w4a8_gemv, int8_gemv, legacy)

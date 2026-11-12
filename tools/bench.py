@@ -406,7 +406,7 @@ def int8_baseline(x, weight, scale):
     from comfy_kitchen.backends.triton import quantization
 
     if x.shape[0] <= 1:
-        import int8_gemv
+        from kernels.triton import int8_gemv
 
         out = int8_gemv.linear(x, weight, scale, None, torch.float32, 0)
         if out is not None:
@@ -608,7 +608,7 @@ def run_tile_site(args, today):
 
     # evidence only: the HIP dot4 GEMM against the Triton path, same shapes
     try:
-        import hip_int8_gemm as hipg
+        from kernels.hip import int8_gemm as hipg
     except ImportError:
         hipg = None
     if hipg is None or not hipg.available():
@@ -644,10 +644,10 @@ def run_attention_site(args, today):
     Writes a tile per head dim, so a later mode change still has
     data), the mode that won, and whether our kernel should be installed at all.
     """
-    import attention_kernel as attn
+    from kernels.triton import attention as attn
     import gpu_tuning as tuning
     try:
-        import hip_attention as hip
+        from kernels.hip import attention as hip
     except ImportError:
         hip = None
 
@@ -780,7 +780,7 @@ def run_deltanet_site(args, today):
     compared with refs.py before either side is timed.
     """
     import comfy_kitchen
-    import deltanet
+    from kernels.triton import deltanet
 
     records, ratios = {}, []
     for batch, heads, dk, dv, seq in parse_deltanet_shapes(args.deltanet_shapes):
@@ -875,7 +875,7 @@ def run_deltanet_prefill_site(args, today):
     explode. On that regime the doubling measures rel 4.65e+03 and this
     implementation 1.6e-07.
     """
-    import deltanet
+    from kernels.triton import deltanet
     from comfy.text_encoders.qwen35 import torch_chunk_gated_delta_rule
 
     records, ratios = {}, []
@@ -957,7 +957,7 @@ def run_qwen35_site(args, today):
     import comfy.ops
     from comfy.text_encoders.qwen35 import Qwen35Config, _qwen35_layer_types
 
-    import qwen35_model
+    from patches.textgen import qwen35
 
     layers, hidden, seq = args.qwen35_layers, args.qwen35_hidden, args.qwen35_seq
     heads = max(1, hidden // 256)
@@ -1171,7 +1171,7 @@ def run_convrot_site(args, today):
     kernel that rotates and quantizes together. The winner becomes
     convrot.mode, and feature.convrot says whether ours is worth installing.
     """
-    import convrot_kernel as rot
+    from kernels.triton import convrot as rot
     from comfy_kitchen.backends.triton import quantization as tq
     from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation
 
@@ -1255,7 +1255,7 @@ def run_w4a16_valu_site(args, today):
     3-7%, which a single-launch event interval swamps (docs/HIP_KERNELS.md).
     The verdict becomes feature.w4a16_valu; the shape rows are evidence.
     """
-    import hip_w4a16 as hip
+    from kernels.hip import w4a16 as hip
 
     lib = hip._load()
     if lib is None or lib.gfx906_w4a16_mu is None:

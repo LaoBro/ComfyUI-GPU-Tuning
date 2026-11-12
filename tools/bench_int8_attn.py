@@ -15,8 +15,8 @@ import torch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
-import hip_attn_i8  # noqa: E402
-import hip_attention  # noqa: E402
+from kernels.hip import attention_i8  # noqa: E402
+from kernels.hip import attention  # noqa: E402
 
 SHAPES = ("1024x1024x16x128", "256x1024x8x128", "512x512x20x64", "4096x256x4x128")
 

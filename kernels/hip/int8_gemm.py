@@ -14,10 +14,7 @@ import ctypes
 
 import torch
 
-try:
-    from .kernels import runtime
-except ImportError:                                   # imported as a top-level module
-    from kernels import runtime
+from .. import runtime
 
 _LIB = None
 _PROBED = False

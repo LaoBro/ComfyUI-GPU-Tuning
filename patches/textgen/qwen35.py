@@ -349,10 +349,7 @@ def install(gate=None, freqs_gate=None):
     # the shared base class carries the position-table patch; this class overrides
     # compute_freqs_cis, so wrap it too when the base was wrapped
     if getattr(Llama2_.compute_freqs_cis, "_gfx906_table", False) and not getattr(Qwen35Transformer.compute_freqs_cis, "_gfx906_table", False):
-        try:
-            from . import core_llama_patches as patches
-        except ImportError:
-            import core_llama_patches as patches
+        from . import llama as patches
         wrapped = patches.table_compute_freqs_cis(Qwen35Transformer.__dict__["compute_freqs_cis"], freqs_gate)
         wrapped._gfx906_table = True
         Qwen35Transformer.compute_freqs_cis = wrapped

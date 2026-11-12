@@ -10,7 +10,7 @@ NVIDIA 和 CPU 会整包跳过（`apply()` 里的 `is_amd()` 判断）。
 ## 三步跑通
 
 1. **确认前提**：AMD 卡、PyTorch 是 ROCm/HIP 构建、`comfy-kitchen` 的 triton 后端
-   可用、ComfyUI 0.39.0 或更新。逐块 CUDA graph 由节点的 `resident_graph.py`
+   可用、ComfyUI 0.39.0 或更新。逐块 CUDA graph 由节点的 `patches/textgen/resident_graph.py`
    在启动时以运行时包装装上，不需要改任何 core 文件。
 2. **用节点默认值先跑一遍**。没跑过 bench 的卡上「测量门」功能是关的 ——
    这是预期行为，不是坏了。

@@ -19,13 +19,13 @@ import sys
 import torch
 
 try:
-    from .profiler import patch_prompt_end as _patch_prompt_end
-    from .profiler import set_enabled as _set_profiler
-    from .profiler import enabled as _profiler_enabled
+    from .patches.profiler import patch_prompt_end as _patch_prompt_end
+    from .patches.profiler import set_enabled as _set_profiler
+    from .patches.profiler import enabled as _profiler_enabled
 except ImportError:
-    from profiler import patch_prompt_end as _patch_prompt_end
-    from profiler import set_enabled as _set_profiler
-    from profiler import enabled as _profiler_enabled
+    from patches.profiler import patch_prompt_end as _patch_prompt_end
+    from patches.profiler import set_enabled as _set_profiler
+    from patches.profiler import enabled as _profiler_enabled
 
 INT8_TILE = {"block_m": 128, "block_n": 256, "block_k": 32, "group_size_m": 8}
 INT8_WARPS = 4
@@ -43,7 +43,7 @@ INT8_SMALL_WARPS = 4
 INT8_SMALL_STAGES = 3
 INT8_SMALL_MAX_M = 8
 # Decode is m=1: no row tile at all, one program per 16 output rows walking K.
-# See int8_gemv.py; it streams the weight once instead of computing a 16x64x32 tile.
+# See kernels/triton/int8_gemv.py; it streams the weight once instead of computing a 16x64x32 tile.
 INT8_GEMV_MAX_M = 1
 
 # fp16 overflows past 65504; leave headroom for the dot products.
@@ -429,45 +429,39 @@ def select_int8_tile(m):
 
 
 def load_int8_gemv():
-    """Import the decode GEMV kernel module shipped next to this file."""
+    """The decode GEMV kernel module, or None when Triton is unavailable."""
     try:
-        from . import int8_gemv
-        return int8_gemv
-    except ImportError:
-        pass
-    try:
-        import int8_gemv
-        return int8_gemv
-    except ImportError:
-        return None
+        from .kernels.triton import int8_gemv
+    except ImportError:                                   # imported as a top-level module
+        try:
+            from kernels.triton import int8_gemv
+        except ImportError:
+            return None
+    return int8_gemv
 
 
 def load_w4a8_gemv():
-    """Import the 4-bit weight kernel module shipped next to this file."""
+    """The 4-bit weight kernel module, or None when Triton is unavailable."""
     try:
-        from . import w4a8_gemv
-        return w4a8_gemv
-    except ImportError:
-        pass
-    try:
-        import w4a8_gemv
-        return w4a8_gemv
-    except ImportError:
-        return None
+        from .kernels.triton import w4a8_gemv
+    except ImportError:                                   # imported as a top-level module
+        try:
+            from kernels.triton import w4a8_gemv
+        except ImportError:
+            return None
+    return w4a8_gemv
 
 
 def load_hip_w4a16():
-    """Import the W4A16 HIP loader, which owns the VALU measurement gate."""
+    """The W4A16 HIP loader, which owns the VALU measurement gate."""
     try:
-        from . import hip_w4a16
-        return hip_w4a16
-    except ImportError:
-        pass
-    try:
-        import hip_w4a16
-        return hip_w4a16
-    except ImportError:
-        return None
+        from .kernels.hip import w4a16
+    except ImportError:                                   # imported as a top-level module
+        try:
+            from kernels.hip import w4a16
+        except ImportError:
+            return None
+    return w4a16
 
 
 def load_manifest():
@@ -478,9 +472,6 @@ def load_manifest():
     except ImportError:
         pass
     try:
-        import sys
-
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         from kernels import manifest
         return manifest
     except ImportError:
@@ -495,9 +486,6 @@ def load_registry():
     except ImportError:
         pass
     try:
-        import sys
-
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         from kernels import registry
         return registry
     except ImportError:
@@ -677,59 +665,51 @@ def patch_kv_decode(gate=None):
 
 
 def load_deltanet():
-    """Import the DeltaNet decode kernel module shipped next to this file."""
+    """The DeltaNet decode kernel module, or None when Triton is unavailable."""
     try:
-        from . import deltanet
-        return deltanet
-    except ImportError:
-        pass
-    try:
-        import deltanet
-        return deltanet
-    except ImportError:
-        return None
+        from .kernels.triton import deltanet
+    except ImportError:                                   # imported as a top-level module
+        try:
+            from kernels.triton import deltanet
+        except ImportError:
+            return None
+    return deltanet
 
 
 def load_llama_patches():
-    """Import the core llama.py hot-path replacements shipped next to this file."""
+    """The core llama.py hot-path replacements."""
     try:
-        from . import core_llama_patches
-        return core_llama_patches
-    except ImportError:
-        pass
-    try:
-        import core_llama_patches
-        return core_llama_patches
-    except ImportError:
-        return None
+        from .patches.textgen import llama
+    except ImportError:                                   # imported as a top-level module
+        try:
+            from patches.textgen import llama
+        except ImportError:
+            return None
+    return llama
 
 
 def load_qwen35_model():
-    """Import the Qwen3.5 compute classes shipped next to this file."""
+    """The Qwen3.5 compute classes."""
     try:
-        from . import qwen35_model
-        return qwen35_model
-    except ImportError:
-        pass
-    try:
-        import qwen35_model
-        return qwen35_model
-    except ImportError:
-        return None
+        from .patches.textgen import qwen35
+    except ImportError:                                   # imported as a top-level module
+        try:
+            from patches.textgen import qwen35
+        except ImportError:
+            return None
+    return qwen35
 
 
 def load_resident_graph():
-    """Import the per-block resident CUDA graph hooks shipped next to this file."""
+    """The per-block resident CUDA graph hooks."""
     try:
-        from . import resident_graph
-        return resident_graph
-    except ImportError:
-        pass
-    try:
-        import resident_graph
-        return resident_graph
-    except ImportError:
-        return None
+        from .patches.textgen import resident_graph
+    except ImportError:                                   # imported as a top-level module
+        try:
+            from patches.textgen import resident_graph
+        except ImportError:
+            return None
+    return resident_graph
 
 
 def _gemv_rotation_ok(groupsize, device, dtype):
@@ -1145,25 +1125,25 @@ def _swap_optimized_attention(old, new):
 def _hip_int8_gemm():
     """The gfx906 HIP int8 GEMM module, or None when it is not built."""
     try:
-        from . import hip_int8_gemm
+        from .kernels.hip import int8_gemm
     except ImportError:
         try:
-            import hip_int8_gemm
+            from kernels.hip import int8_gemm
         except ImportError:
             return None
-    return hip_int8_gemm
+    return int8_gemm
 
 
 def _hip_f16_gemm():
     """The gfx906 HIP fp16 GEMM module, or None when it is not built."""
     try:
-        from . import hip_f16_gemm
+        from .kernels.hip import f16_gemm
     except ImportError:
         try:
-            import hip_f16_gemm
+            from kernels.hip import f16_gemm
         except ImportError:
             return None
-    return hip_f16_gemm
+    return f16_gemm
 
 
 def patch_f16_linear():
@@ -1226,11 +1206,11 @@ def patch_attention():
     if not _triton_available("attention"):
         return False
     try:
-        from .attention_kernel import (SUPPORTED_HEAD_DIMS, attention_fwd,
-                                       supported as kernel_supported)
+        from .kernels.triton.attention import (SUPPORTED_HEAD_DIMS, attention_fwd,
+                                               supported as kernel_supported)
     except ImportError:
-        from attention_kernel import (SUPPORTED_HEAD_DIMS, attention_fwd,
-                                      supported as kernel_supported)
+        from kernels.triton.attention import (SUPPORTED_HEAD_DIMS, attention_fwd,
+                                              supported as kernel_supported)
     hip = _hip_attention()
     if hip is not None and hip.available():
         hip_supported, hip_fwd = hip.supported, hip.attention_fwd
@@ -1509,13 +1489,13 @@ def patch_int8_attention():
 def _hip_int8_attention():
     """The INT8-input attention module, or None when it is not built."""
     try:
-        from . import hip_attn_i8
+        from .kernels.hip import attention_i8
     except ImportError:
         try:
-            import hip_attn_i8
+            from kernels.hip import attention_i8
         except ImportError:
             return None
-    return hip_attn_i8
+    return attention_i8
 
 
 def patch_convrot():
@@ -1526,9 +1506,9 @@ def patch_convrot():
         _state["convrot_mode"] = "off"
         return False
     try:
-        from .convrot_kernel import QuantizedRotation, convrot_quantize, hadamard_rotate
+        from .kernels.triton.convrot import QuantizedRotation, convrot_quantize, hadamard_rotate
     except ImportError:
-        from convrot_kernel import QuantizedRotation, convrot_quantize, hadamard_rotate
+        from kernels.triton.convrot import QuantizedRotation, convrot_quantize, hadamard_rotate
 
     _state["convrot_mode"] = resolved_convrot_mode()
     if getattr(quantization, "_gfx906_convrot", False):

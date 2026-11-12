@@ -4,7 +4,7 @@
 int8 levels differ per group, so a fast decode kernel would need one table lookup
 per weight. This tool decodes each packed weight through the codebook, re-quantizes
 it onto a uniform grid with a per-group scale search, and drops `weight_codebook`
-so `w4a8_gemv.py` can unpack nibbles in registers.
+so `kernels/triton/w4a8_gemv.py` can unpack nibbles in registers.
 
 Two sources are understood: an `asym_w4a8_int8` checkpoint (decoded through its
 codebook, so the weight is quantized twice) and a `convrot` `int8_tensorwise`

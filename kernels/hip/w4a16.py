@@ -21,15 +21,10 @@ capture stream, so a cached handle would leave the launch out of the graph.
 """
 import ctypes
 import os
-import sys
 
 import torch
 
-try:
-    from .kernels import registry as kreg, runtime
-except ImportError:                                   # imported as a top-level module
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from kernels import registry as kreg, runtime
+from .. import registry as kreg, runtime
 
 _LIB = None
 _PROBED = False

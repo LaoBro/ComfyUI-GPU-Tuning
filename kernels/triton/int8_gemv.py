@@ -34,13 +34,7 @@ ROTATE_WARPS = 4
 ASM_BLOCK_N = 16
 ASM_BLOCK_K = 2048
 
-try:
-    from .kernels import registry as kreg
-except ImportError:                                   # imported as a top-level module
-    import sys
-
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from kernels import registry as kreg
+from .. import registry as kreg
 
 
 @triton.jit
@@ -103,17 +97,9 @@ def gemv_kernel(a_ptr, b_ptr, c_ptr, gmax_ptr, b_scale_ptr, bias_ptr,
 
 
 def load_hip_rotate():
-    """Import the gfx906 HIP rotation loader shipped next to this file."""
-    try:
-        from . import hip_rotate
-        return hip_rotate
-    except ImportError:
-        pass
-    try:
-        import hip_rotate
-        return hip_rotate
-    except ImportError:
-        return None
+    """The gfx906 HIP rotation loader shipped with this pack."""
+    from ..hip import rotate
+    return rotate
 
 
 def _hip_rotate_enabled():

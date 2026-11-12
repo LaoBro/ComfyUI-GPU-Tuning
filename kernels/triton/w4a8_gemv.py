@@ -32,22 +32,13 @@ kernel. Prefill still unpacks whole layers to int8 (`decode_int8`), because the
 int8 GEMM needs a contiguous tile.
 """
 
-import os
-
 import torch
 import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-try:
-    from . import int8_gemv
-except ImportError:
-    import int8_gemv
-
-try:
-    from . import hip_w4a16
-except ImportError:
-    import hip_w4a16
+from . import int8_gemv
+from ..hip import w4a16 as hip_w4a16
 
 BN = 16
 MAX_M = 8
@@ -230,13 +221,7 @@ def _probe_dot4(a, b, c):
     tl.store(c + tl.arange(0, 1), _dot4_asm(x, y))
 
 
-try:
-    from .kernels import registry as kreg
-except ImportError:                                   # imported as a top-level module
-    import sys
-
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from kernels import registry as kreg
+from .. import registry as kreg
 
 
 def _load_hip():
@@ -245,7 +230,7 @@ def _load_hip():
     if _hip is not None:
         return _hip
     try:
-        from . import w4a8_hip as hip
+        from ... import w4a8_hip as hip
     except ImportError:
         try:
             import w4a8_hip as hip

@@ -18,7 +18,7 @@ import sys
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import hip_attn_i8  # noqa: E402
+from kernels.hip import attention_i8  # noqa: E402
 
 SHAPES = {
     "small": (1, 100, 100, 3, 64),

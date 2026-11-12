@@ -23,7 +23,7 @@ def rel(a, b):
 
 def delta_decode_reference(mixed_qkv, x, w_a, w_b, dt_bias, g_decay, state, key_dim,
                            num_key_heads, scale, z, norm_weight, eps):
-    """The gated delta rule of deltanet.py, one (batch, head, step) at a time.
+    """The gated delta rule of kernels/triton/deltanet.py, one (batch, head, step) at a time.
 
     `state` is updated in place, like the kernels, so every implementation gets
     its own copy. Everything is fp32: the kernels run fp32 too, which is why a

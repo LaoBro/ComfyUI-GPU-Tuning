@@ -1,6 +1,6 @@
 """End-to-end attribution for the text-generation chain.
 
-profiler.py covers the DiT side: BaseModel.apply_model, the module level
+patches/profiler.py covers the DiT side: BaseModel.apply_model, the module level
 attention entry, and kitchen's int8_linear. The text encoder goes through the
 CLIP chain instead, and its attention comes from
 optimized_attention_for_device(small_input=True), so none of those hooks see it.
@@ -97,7 +97,7 @@ def parse_args():
     parser.add_argument("--list-classes", action="store_true",
                         help="load the checkpoint, print the module class census, exit")
     parser.add_argument("--kitchen", action="store_true",
-                        help="also install profiler.py's hooks for the kitchen level view under these rows")
+                        help="also install patches/profiler.py's hooks for the kitchen level view under these rows")
     parser.add_argument("--json", action="store_true", help="one machine readable line at the end")
     args, passthrough = parser.parse_known_args()
     sys.argv = [sys.argv[0]] + passthrough
@@ -138,7 +138,7 @@ def keep(child):
     comfy.ops and torch.nn hold the leaf layers -- Linear, Embedding, Conv, the
     norm containers. Wrapping one of them wraps every instance, which pulls the
     leaf time out of every region above and flattens them to self 0. That view
-    is profiler.py's int8_linear hook (--kitchen), or an explicit --wrap Linear.
+    is patches/profiler.py's int8_linear hook (--kitchen), or an explicit --wrap Linear.
     """
     return not type(child).__module__.startswith(("comfy.ops", "torch.nn"))
 
@@ -267,7 +267,7 @@ def main():
     text = out.result[0]
 
     if args.kitchen:
-        import profiler
+        from patches import profiler
         print(f"[kitchen]\n{profiler.summary()}")
 
     totals, selfs, roots = summarize()

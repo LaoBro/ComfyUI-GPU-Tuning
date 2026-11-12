@@ -2,7 +2,9 @@
 
 Layout this package grows into (see docs/PORTING.md):
 
-    kernels/            # arch-agnostic: contracts, portable Triton impls
+    kernels/            # registry, contracts, manifests -- pure bookkeeping
+    kernels/triton/     # portable Triton kernels, no arch-specific asm
+    kernels/hip/        # ctypes wrappers around arch/<gcn>/kernels/*.so
     arch/<gcn>/         # per-arch measurement manifests and specialised kernels
 
 Nothing here imports torch or triton: the registry is pure bookkeeping so it

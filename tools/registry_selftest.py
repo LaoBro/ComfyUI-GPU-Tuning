@@ -36,7 +36,7 @@ OLD_OFF = ("off", "triton", "0", "false", "no")
 
 
 def legacy_w4a8(env, hip, asm_ok, probes):
-    """backend_name() from w4a8_gemv.py before the registry."""
+    """backend_name() from kernels/triton/w4a8_gemv.py before the registry."""
     probes.append("hip")                       # _load_hip() was always consulted first
     mode = (env if env is not None else "auto").strip().lower()
     if mode in OLD_OFF:

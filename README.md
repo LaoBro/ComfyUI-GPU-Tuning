@@ -116,16 +116,16 @@ GPU 时间从 37.5 涨到 ~135 ms/step，wall 155 ms 里 87% 是 GPU 在等权�
 ### m=1 走专用 GEMV
 
 tile 只能把分块 GEMM 调到 55 GB/s；解码的权重是"读一遍、每个元素用一次"，正确形状是不分块。
-`int8_gemv.py` 里一程序负责 16 行输出，沿 K 以 1024 为步长累加 `int32`（整数求和可结合，
+`kernels/triton/int8_gemv.py` 里一程序负责 16 行输出，沿 K 以 1024 为步长累加 `int32`（整数求和可结合，
 所以结果与 GEMM 路径同值）。旋转与量化也折进来：旋转内核顺手写出每个 256-group 的最大值，
 GEMV 内核自己合成行 scale 并在线量化，一条 linear 从 3 次启动降到 2 次。
 
-旋转本身也换成了 HIP radix-4 butterfly（`hip_rotate.py` + `arch/gfx906/kernels/rotate.cu`）：
+旋转本身也换成了 HIP radix-4 butterfly（`kernels/hip/rotate.py` + `arch/gfx906/kernels/rotate.cu`）：
 Hadamard 符号在寄存器里生成，不再逐 tile 读 256x256 矩阵。fp32 档量化激活与 Triton 逐元素一致，
 `COMFY_GPU_TUNE_ROTATE=off` 回退到 Triton 做 A/B；fp16 档按 fp32 累加，结果更准但不等价。
 
 te=default 的 4-bit 解码（激活不量化、权重在寄存器内反量化）换成 HIP 内核
-（`hip_w4a16.py` + `arch/gfx906/kernels/w4a16.cu`）：nibble 不再展成 8 个 fp32 元素，
+（`kernels/hip/w4a16.py` + `arch/gfx906/kernels/w4a16.cu`）：nibble 不再展成 8 个 fp32 元素，
 16 级 codebook 走 LDS 索引读，一行拆给 32 条 lane、grid 封顶 240 块，每个 k 块的激活
 只打包一次（一条 `ds_read_b128` 供 4 个权重）再摊给整块的 row-group 复用。单行与
 多行（m=2..8，一个 dword 解出的 8 个格点跨行复用）两个入口，fp32 累加，数值与
@@ -175,7 +175,7 @@ int8 张量与 scale，直接调 `int8_gemv.linear`；prefill（多行）和任�
 
 解码是带宽问题，权重从 1 字节降到 4 bit 就能少流一半显存。gfx906 有
 `v_dot4_i32_i8`（MI50 的 53 TOPS INT8 就是靠它），Triton 本身不会发这条指令，
-`w4a8_gemv.py` 用 inline asm 直接发；nibble 在寄存器里展开
+`kernels/triton/w4a8_gemv.py` 用 inline asm 直接发；nibble 在寄存器里展开
 （`w & 0x0F0F0F0F` / `w >> 4`），零点用「组内和 − 8·Σq」修正（逐字节减 8 会借位）。
 
 **优先从 convrot int8 转**：只量化一次，误差最小。已打包的 `asym_w4a8_int8`

@@ -37,7 +37,7 @@ radix-4 butterfly 拿到约 12 倍，靠的是消掉 8 次串行全局读和 O(G
    Linux 是 `lib<目标>_<名字>.so`，Windows 是 `<目标>_<名字>.dll`。一份 checkout
    因此可以同时放几个平台/架构的产物。代码对象按目标绑定，别的架构要各自编译。
    Windows 由构建脚本生成 `.def` 导出 `extern "C"` 入口并链接 `amdhip64.lib`。
-4. **写 loader**。照 `hip_attention.py`：调 `kernels/runtime.py` 的 `load(名字)`，
+4. **写 loader**。照 `kernels/hip/attention.py`：调 `kernels/runtime.py` 的 `load(名字)`，
    它按当前平台/架构定位产物、预载运行时、加载失败打 WARNING 并返回 `None` 让调用方
    回落；loader 只设 `argtypes` 和形状校验。不要把架构名或库文件名写进 loader。
 5. **接入站点**。在 `BackendRegistry` 加一个 Candidate，或在调用点分派。
@@ -157,7 +157,7 @@ GEMV（只接 m=1）也不在 HIP GEMM（`MIN_ROWS=128`）里。
 - **真实 q/k/v 的抓法**：`gfx906fix/capture_sdxl_qkv.py` 在 `optimized_attention`
   上挂 hook、跑两步 SDXL 采样，把 `[B,S,H,D]` fp16 的 self-attention 张量存成 .pt。
   注意力量化档的 relL2 和 softmax 参与率都是从这儿来的。
-- **可照抄的模板**：`hip_attention.py` / `hip_int8_gemm.py` / `hip_rotate.py`
+- **可照抄的模板**：`kernels/hip/attention.py` / `kernels/hip/int8_gemm.py` / `kernels/hip/rotate.py`
   （loader 与回落）、`arch/gfx906/kernels/*.cu`（内核）、
   `tools/build_hip_attn.py`（构建）、`kernels/registry.py` / `contract.py`
   （后端链）、`arch/gfx906/kernels/README.md`（站点契约）。
@@ -454,7 +454,7 @@ V 寄存器预取慢 5%、d64 重排到 2 block/CU 不动（见下条）——�
   | int8 QK + int8 PV | 7.73e-03 | 1.10e-02 |
 
   **这一档的误差由 QK 量化主导，不是 P 量化**：QK 从 fp16 换成 int8 就是 29-33x
-  （2.1e-4 → 6-7e-3），在此之上把 PV 也量化只再加 1.3-1.6x。`attention_kernel.py`
+  （2.1e-4 → 6-7e-3），在此之上把 PV 也量化只再加 1.3-1.6x。`kernels/triton/attention.py`
   里「INT8_PV=False 更准 2-30x」那句比的是 int8 档内部的两个 PV 形态，不是 int8 对
   fp16 的总代价，读的时候别混。顺带量到 softmax 的平坦度：参与率 1066/4096（平均最大
   概率 0.02）与 401/1024（0.09）——确实是扁平分布，所以 int8 P 的损失反而小，主导项
@@ -503,7 +503,7 @@ P 只有 8 bit、对扩散不划算。这条是另一件事：**调用方手里�
 2. Qwen-Image 2.1 的 int8 前缀缓存：`PoseBranchCache` 以 convrot int8 + 每 token
    scale 存 K/V，现在读出来先 dequantize 再走 fp16 注意力。
 
-契约（[`hip_attn_i8.py`](../hip_attn_i8.py)）：Q/K 为 `[B,S,H,D]` int8 + 每 (token,head)
+契约（[`attention_i8.py`](../kernels/hip/attention_i8.py)）：Q/K 为 `[B,S,H,D]` int8 + 每 (token,head)
 fp32 scale；V 打包成 `[B,H,SKP/4,D]` int32（一个字 4 个连续 key，按 head dim 一列），
 scale 每 (head,dim)；V 在 SK 方向补到 64 的倍数，补出来的 key 被 softmax 掩掉。
 
