@@ -1,6 +1,6 @@
 """Print the tuning status in a plain terminal, without opening ComfyUI.
 
-    cd /home/liu/ComfyUI-0.39.0
+    cd /path/to/ComfyUI
     .venv/bin/python custom_nodes/ComfyUI-GPU-Tuning/tools/status.py
 
 Same text the `profile` switch on the GPU Tuning Model Settings node logs at startup

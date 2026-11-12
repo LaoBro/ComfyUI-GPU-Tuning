@@ -16,7 +16,7 @@ the model's own classes, found structurally instead of by name:
 Rows are self time, a region's total minus the regions nested directly inside
 it, so the table adds up instead of counting a block's attention twice.
 
-    cd /home/liu/ComfyUI-0.39.0
+    cd /path/to/ComfyUI
     .venv/bin/python custom_nodes/ComfyUI-GPU-Tuning/tools/chain_profile.py \
         --clip qwen3.5-9b.safetensors --max-length 64
 

@@ -2,8 +2,7 @@
 
 Run it with the ComfyUI interpreter, on the machine that has the GPU:
 
-    /home/liu/ComfyUI-0.39.0/.venv/bin/python \
-        custom_nodes/ComfyUI-GPU-Tuning/tools/verify_backends.py
+    .venv/bin/python custom_nodes/ComfyUI-GPU-Tuning/tools/verify_backends.py
 
 Three things are checked, in order of how much they can lie to you:
 

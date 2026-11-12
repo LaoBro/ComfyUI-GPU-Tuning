@@ -23,7 +23,7 @@ import torch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
-sys.path.insert(0, "/home/liu/ComfyUI-0.39.0")
+sys.path.insert(0, os.path.dirname(os.path.dirname(ROOT)))    # ComfyUI root
 from kernels.hip import attention_i8  # noqa: E402
 from kernels.hip import attention  # noqa: E402
 from comfy.quant_ops import TensorWiseINT8Layout  # noqa: E402

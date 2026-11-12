@@ -71,9 +71,8 @@ KV cache 容量级拷贝、launch 开销，这些在别的卡上一样存在。�
 ## 安装
 
 ```bash
-# 1. ComfyUI Manager / Registry 搜 "GPU Tuning"
-# 2. 或 git clone 到 custom_nodes/
-git clone https://github.com/<your>/ComfyUI-GPU-Tuning custom_nodes/ComfyUI-GPU-Tuning
+# git clone 到 custom_nodes/
+git clone https://github.com/LaoBro/ComfyUI-GPU-Tuning custom_nodes/ComfyUI-GPU-Tuning
 ```
 
 不需要改动 ComfyUI 源码，也没有安装脚本；逐块 CUDA graph 的 hook 随节点在启动时安装。
