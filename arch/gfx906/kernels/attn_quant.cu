@@ -19,8 +19,16 @@
 #include <stdint.h>
 
 #define G 64
-#define NT 64
 #define INV8 0.125f
+
+// 256-thread blocks: four 64-lane rows per block for the row kernels, four key
+// quads for the pack. One tiny block per row meant 129k blocks of 64 threads and
+// ran 3-5x off the bandwidth the same bytes should take.
+#define NTQ 256
+#define RPB (NTQ / 64)
+#define QPB 4
+
+static inline int cdiv(int a, int b) { return (a + b - 1) / b; }
 
 // one radix-4 stage x3 over the 64-lane wave; matches rotate.cu's butterfly
 __device__ __forceinline__ float bf3(float v) {
@@ -44,11 +52,13 @@ __device__ __forceinline__ float wave_max(float m) {
 }
 
 template <typename T>
-__global__ void __launch_bounds__(NT, 4)
+__global__ void __launch_bounds__(NTQ, 4)
 rot_quant_kernel(const T* __restrict__ x, int8_t* __restrict__ out,
-                 float* __restrict__ scale, int D, int ng) {
-    const int64_t row = blockIdx.x;
-    const int lane = threadIdx.x;
+                 float* __restrict__ scale, int rows, int D, int ng) {
+    // the butterfly is a width-64 shuffle, so a row is one sub-wave
+    const int lane = threadIdx.x & 63;
+    const int64_t row = (int64_t)blockIdx.x * RPB + (threadIdx.x >> 6);
+    if (row >= rows) return;
     float v[4];
     const T* p = x + row * D + lane;
 #pragma unroll
@@ -68,10 +78,12 @@ rot_quant_kernel(const T* __restrict__ x, int8_t* __restrict__ out,
 }
 
 template <typename T>
-__global__ void __launch_bounds__(NT, 4)
-rot_f16_kernel(const T* __restrict__ x, __half* __restrict__ out, int D, int ng) {
-    const int64_t row = blockIdx.x;
-    const int lane = threadIdx.x;
+__global__ void __launch_bounds__(NTQ, 4)
+rot_f16_kernel(const T* __restrict__ x, __half* __restrict__ out,
+               int rows, int D, int ng) {
+    const int lane = threadIdx.x & 63;
+    const int64_t row = (int64_t)blockIdx.x * RPB + (threadIdx.x >> 6);
+    if (row >= rows) return;
     float v[4];
     const T* p = x + row * D + lane;
 #pragma unroll
@@ -88,14 +100,15 @@ rot_f16_kernel(const T* __restrict__ x, __half* __restrict__ out, int D, int ng)
 // [b][S][H][D] inside a possibly larger tensor, so each is addressed by a row
 // offset and a per-batch row pitch (the cache keeps K and V stacked on one
 // axis, which makes its V slice non-contiguous in b).
-__global__ void __launch_bounds__(NT, 4)
+__global__ void __launch_bounds__(NTQ, 4)
 rot_pack_v_kernel(const int8_t* __restrict__ pa, int64_t off_a, int64_t pitch_a,
                   const int8_t* __restrict__ pb, int64_t off_b, int64_t pitch_b,
                   uint32_t* __restrict__ out, int H, int D, int Sp, int Sb, int q_total) {
-    const int q = blockIdx.x;
+    const int q = blockIdx.x * QPB + (threadIdx.x >> 6);
+    if (q >= q_total) return;
     const int bh = blockIdx.y;
     const int b = bh / H, h = bh - b * H;
-    const int lane = threadIdx.x;
+    const int lane = threadIdx.x & 63;
     const int ng = D / G;
     const int t0 = 4 * q;
     int8_t vals[4][4];
@@ -126,11 +139,11 @@ extern "C" int gfx906_rot_quant(const void* x, void* out, void* scale,
     const int ng = D / G;
     hipStream_t st = (hipStream_t)stream;
     if (dtype == 0)
-        rot_quant_kernel<float><<<rows, NT, 0, st>>>((const float*)x, (int8_t*)out,
-                                                     (float*)scale, D, ng);
+        rot_quant_kernel<float><<<cdiv(rows, RPB), NTQ, 0, st>>>((const float*)x, (int8_t*)out,
+                                                             (float*)scale, rows, D, ng);
     else
-        rot_quant_kernel<__half><<<rows, NT, 0, st>>>((const __half*)x, (int8_t*)out,
-                                                      (float*)scale, D, ng);
+        rot_quant_kernel<__half><<<cdiv(rows, RPB), NTQ, 0, st>>>((const __half*)x, (int8_t*)out,
+                                                              (float*)scale, rows, D, ng);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : (int)e;
 }
@@ -140,9 +153,9 @@ extern "C" int gfx906_rot_f16(const void* x, void* out, int rows, int D, int dty
     const int ng = D / G;
     hipStream_t st = (hipStream_t)stream;
     if (dtype == 0)
-        rot_f16_kernel<float><<<rows, NT, 0, st>>>((const float*)x, (__half*)out, D, ng);
+        rot_f16_kernel<float><<<cdiv(rows, RPB), NTQ, 0, st>>>((const float*)x, (__half*)out, rows, D, ng);
     else
-        rot_f16_kernel<__half><<<rows, NT, 0, st>>>((const __half*)x, (__half*)out, D, ng);
+        rot_f16_kernel<__half><<<cdiv(rows, RPB), NTQ, 0, st>>>((const __half*)x, (__half*)out, rows, D, ng);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : (int)e;
 }
@@ -153,7 +166,7 @@ extern "C" int gfx906_rot_pack_v(const void* pa, long long off_a, long long pitc
                                  int q_total, void* stream) {
     if (B <= 0 || H <= 0 || D % G || D > 4 * G || Sp < 0 || Sb < 0 || q_total <= 0) return -3;
     hipStream_t st = (hipStream_t)stream;
-    rot_pack_v_kernel<<<dim3(q_total, B * H), NT, 0, st>>>(
+    rot_pack_v_kernel<<<dim3(cdiv(q_total, QPB), B * H), NTQ, 0, st>>>(
         (const int8_t*)pa, off_a, pitch_a, (const int8_t*)pb, off_b, pitch_b,
         (uint32_t*)out, H, D, Sp, Sb, q_total);
     hipError_t e = hipGetLastError();
