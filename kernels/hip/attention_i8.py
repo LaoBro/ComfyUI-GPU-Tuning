@@ -35,16 +35,13 @@ def _load():
         return None
     lib.gfx906_attn_i8_fwd.restype = ctypes.c_int
     lib.gfx906_attn_i8_fwd.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_longlong] + [
-        ctypes.c_void_p] * 6 + [ctypes.c_int] * 9 + [ctypes.c_float, ctypes.c_void_p]
+        ctypes.c_void_p] * 6 + [ctypes.c_int] * 10 + [ctypes.c_float, ctypes.c_void_p]
     _LIB = lib
     q = runtime.load("attn_quant", "the int8 prefix cache path")
     if q is not None:
         q.gfx906_rot_quant.restype = ctypes.c_int
         q.gfx906_rot_quant.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
                                        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
-        q.gfx906_rot_f16.restype = ctypes.c_int
-        q.gfx906_rot_f16.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int,
-                                     ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
         q.gfx906_rot_pack_v.restype = ctypes.c_int
         q.gfx906_rot_pack_v.argtypes = [ctypes.c_void_p, ctypes.c_longlong, ctypes.c_longlong,
                                         ctypes.c_void_p, ctypes.c_longlong, ctypes.c_longlong,
@@ -119,7 +116,7 @@ def quantize_v(v):
 
 
 def _fwd_split(q8, q_scale, k1, ks1, vk1, pitch1, k2, ks2, vk2, vq, v_scale, sq, sp, st,
-               skp, h, hkv, d, scale, tq=2):
+               skp, h, hkv, d, scale, tq=2, unrotate=0):
     """One launch over up to two K sources; see the kernel header."""
     out = torch.empty((q8.shape[0], sq, h, d), dtype=torch.float16, device=q8.device)
     rc = _LIB.gfx906_attn_i8_fwd(q8.data_ptr(), q_scale.data_ptr(),
@@ -128,7 +125,7 @@ def _fwd_split(q8, q_scale, k1, ks1, vk1, pitch1, k2, ks2, vk2, vq, v_scale, sq,
                                  vq.data_ptr(),
                                  0 if v_scale is None else v_scale.data_ptr(),
                                  out.data_ptr(),
-                                 q8.shape[0], sq, sp, st, skp, h, hkv, d, tq,
+                                 q8.shape[0], sq, sp, st, skp, h, hkv, d, tq, int(unrotate),
                                  ctypes.c_float(float(scale)),
                                  ctypes.c_void_p(torch.cuda.current_stream().cuda_stream))
     if rc != 0:
@@ -184,25 +181,6 @@ def rotate_quant(x, out=None, scale=None):
         raise RuntimeError(f"gfx906 rotate+quantize launch failed ({rc})")
     return out.view(*x.shape), scale
 
-
-def rotate_f16(x, out=None):
-    """Undo the H64 rotation on fp16 rows: [.., D] -> same shape fp16."""
-    if not rotation_ready():
-        raise RuntimeError("gfx906 rotate/quantize helpers are not built")
-    d = x.shape[-1]
-    rows = x.numel() // d
-    xc = x.view(rows, d) if x.is_contiguous() else x.reshape(rows, d).contiguous()
-    if xc.dtype != torch.float16:
-        xc = xc.to(torch.float16)
-    if out is None:
-        out = torch.empty((rows, d), dtype=torch.float16, device=x.device)
-    rc = _LIBQ.gfx906_rot_f16(xc.data_ptr(), out.data_ptr(), rows, d, 1,
-                              ctypes.c_void_p(torch.cuda.current_stream().cuda_stream))
-    if rc != 0:
-        raise RuntimeError(f"gfx906 rotate launch failed ({rc})")
-    return out.view(*x.shape)
-
-
 def supported(q, k, v):
     """fp16/bf16/fp32 contiguous [B, S, H, D] with D in (64, 128) and GQA heads."""
     if _load() is None or q.dim() != 4:
@@ -238,7 +216,8 @@ def cache_attention(q, k, v, prefix_kv8, prefix_scale, softmax_scale=None, tq=2)
     The kernel reads the cached K and both scale planes straight out of those
     tensors (its K sources are the cached prefix and this step's K), so nothing
     is copied or dequantized per block; only this step's Q/K/V are rotated and
-    quantized, and the output is rotated once more because H is symmetric.
+    quantized, and the kernel un-rotates the output in its epilogue (H is
+    symmetric, so the same transform undoes it) instead of paying another pass.
     """
     if not rotation_ready():
         raise RuntimeError("gfx906 rotate/quantize helpers are not built")
@@ -266,9 +245,8 @@ def cache_attention(q, k, v, prefix_kv8, prefix_scale, softmax_scale=None, tq=2)
     # K sources: cached prefix plane 0 (rows pitch 2*SP*HKV apart per batch) then
     # the current step. Both scale planes use the same pitch; the V plane just
     # starts SP*HKV elements later, which is the view's data pointer.
-    out = _fwd_split(q8, q_scale,
+    return _fwd_split(q8, q_scale,
                      prefix_kv8.data_ptr(), prefix_scale.data_ptr(),
                      prefix_scale[:, 1].data_ptr(), 2 * sp * hkv,
                      k8.data_ptr(), k_scale_t.data_ptr(), v_scale_t.data_ptr(),
-                     vq, None, sq, sp, st, skp, h, hkv, d, scale, tq)
-    return rotate_f16(out)
+                     vq, None, sq, sp, st, skp, h, hkv, d, scale, tq, 1)

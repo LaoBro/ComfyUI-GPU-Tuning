@@ -78,7 +78,7 @@ attn_i8_kernel(const int8_t* __restrict__ q, const float* __restrict__ qs,
                const float* __restrict__ vk2,
                const int32_t* __restrict__ vq, const float* __restrict__ vs,
                __half* __restrict__ out,
-               int SQ, int SP, int ST, int SKP, int H, int HKV, float sm_scale) {
+               int SQ, int SP, int ST, int SKP, int H, int HKV, int unrotate, float sm_scale) {
     constexpr int NQ = 32 * TQ;        // Q rows per block (4 warps x 8 x TQ)
     constexpr int CPT = HDT / 16;      // 16-byte chunks per row
     constexpr int DPT = HDT / 8;       // dims per lane in PV
@@ -346,12 +346,58 @@ attn_i8_kernel(const int8_t* __restrict__ q, const float* __restrict__ qs,
         const int gq = sq0 + row[t];
         if (gq >= SQ) continue;
         const float rcp = 1.f / l_run[t];
+        float o[DPT / 4][4];
+#pragma unroll
+        for (int i = 0; i < DPT / 4; ++i)
+#pragma unroll
+            for (int k = 0; k < 4; ++k) o[i][k] = accp[t][4 * i + k] * rcp;
+        if (unrotate) {
+            // the cache stores V in the H64 basis, so the result comes back rotated;
+            // H64 = H4 (x) H4 (x) H4 over each 64-dim group, with the digits being k
+            // (in-register), j (lane ^8/^16/^24) and 2*(i/2) + (j >> 2) (register i^1
+            // and lane ^32). Doing it here saves a separate 33 MB round trip.
+#pragma unroll
+            for (int i = 0; i < DPT / 4; ++i) {
+                const float a0 = o[i][0], a1 = o[i][1], a2 = o[i][2], a3 = o[i][3];
+                o[i][0] = a0 + a1 + a2 - a3;
+                o[i][1] = a1 + a0 + a3 - a2;
+                o[i][2] = a2 + a3 + a0 - a1;
+                o[i][3] = a3 + a2 + a1 - a0;
+            }
+#pragma unroll
+            for (int i = 0; i < DPT / 4; ++i)
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    const float a = __shfl_xor(o[i][k], 8, 64);
+                    const float bq = __shfl_xor(o[i][k], 16, 64);
+                    const float c = __shfl_xor(o[i][k], 24, 64);
+                    o[i][k] = o[i][k] + a + bq - c;
+                }
+#pragma unroll
+            for (int p = 0; p < DPT / 8; ++p) {
+                float* u0 = o[2 * p];
+                float* u1 = o[2 * p + 1];
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    const float q0 = __shfl_xor(u0[k], 32, 64);
+                    const float q1 = __shfl_xor(u1[k], 32, 64);
+                    const float n0 = u0[k] + q0 + u1[k] - q1;
+                    const float n1 = u1[k] + q1 + u0[k] - q0;
+                    u0[k] = n0;
+                    u1[k] = n1;
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < DPT / 4; ++i)
+#pragma unroll
+                for (int k = 0; k < 4; ++k) o[i][k] *= 0.125f;
+        }
         const int64_t off = ((int64_t)(b * SQ + gq) * H + h) * HDT;
 #pragma unroll
         for (int i = 0; i < DPT / 4; ++i) {
             __half ho[4];
 #pragma unroll
-            for (int k = 0; k < 4; ++k) ho[k] = __float2half(accp[t][4 * i + k] * rcp);
+            for (int k = 0; k < 4; ++k) ho[k] = __float2half(o[i][k]);
             *(u2*)(out + off + 4 * j + 32 * i) = *(const u2*)ho;
         }
     }
@@ -363,7 +409,7 @@ extern "C" int gfx906_attn_i8_fwd(const void* q, const void* qs,
                                   const void* k2, const void* ks2, const void* vk2,
                                   const void* vq, const void* vs, void* out,
                                   int B, int SQ, int SP, int ST, int SKP, int H, int HKV, int D,
-                                  int tq, float scale, void* stream) {
+                                  int tq, int unrotate, float scale, void* stream) {
     const int SK = SP + ST;
     if (B <= 0 || SQ <= 0 || SK <= 0 || H <= 0 || HKV <= 0) return -2;
     if (tq != 2 && tq != 4) return -3;
@@ -379,7 +425,7 @@ extern "C" int gfx906_attn_i8_fwd(const void* q, const void* qs,
         (const int8_t*)q, (const float*)qs, (const int8_t*)k1, (const float*)ks1,       \
         (const float*)vk1, pitch1, (const int8_t*)k2, (const float*)ks2,                \
         (const float*)vk2, (const int32_t*)vq, (const float*)vs, (__half*)out,          \
-        SQ, SP, ST, SKP, H, HKV, scale)
+        SQ, SP, ST, SKP, H, HKV, unrotate, scale)
     if (D == 128) {
         if (tq == 2) { vkey ? LAUNCH(128, 2, true) : LAUNCH(128, 2, false); }
         else { vkey ? LAUNCH(128, 4, true) : LAUNCH(128, 4, false); }

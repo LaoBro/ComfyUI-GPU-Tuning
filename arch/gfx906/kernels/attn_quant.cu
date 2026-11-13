@@ -13,7 +13,6 @@
 //   gfx906_rot_pack_v    four keys -> one packed int32 word per dim, from two
 //                        sources (cached prefix + current step), so a prefix
 //                        length that is not a multiple of four needs no padding
-//   gfx906_rot_f16       rows -> rows, rotation only (the output undo)
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <stdint.h>
@@ -26,7 +25,7 @@
 // ran 3-5x off the bandwidth the same bytes should take.
 #define NTQ 256
 #define RPB (NTQ / 64)
-#define QPB 4
+#define QPB 8                     // quads per block: eight 32-lane groups
 
 static inline int cdiv(int a, int b) { return (a + b - 1) / b; }
 
@@ -77,41 +76,33 @@ rot_quant_kernel(const T* __restrict__ x, int8_t* __restrict__ out,
     if (lane == 0) scale[row] = s;
 }
 
-template <typename T>
-__global__ void __launch_bounds__(NTQ, 4)
-rot_f16_kernel(const T* __restrict__ x, __half* __restrict__ out,
-               int rows, int D, int ng) {
-    const int lane = threadIdx.x & 63;
-    const int64_t row = (int64_t)blockIdx.x * RPB + (threadIdx.x >> 6);
-    if (row >= rows) return;
-    float v[4];
-    const T* p = x + row * D + lane;
-#pragma unroll
-    for (int g = 0; g < 4; ++g) v[g] = g < ng ? (float)p[g * G] : 0.f;
-#pragma unroll
-    for (int g = 0; g < 4; ++g) v[g] = bf3(v[g]);
-#pragma unroll
-    for (int g = 0; g < 4; ++g)
-        if (g < ng) out[row * D + g * G + lane] = __float2half(v[g]);
-}
 
 // Four keys per block; key t comes from the cached prefix while t < SP, else
 // from the current step. Both sources are int8 rows of one head stored as
 // [b][S][H][D] inside a possibly larger tensor, so each is addressed by a row
 // offset and a per-batch row pitch (the cache keeps K and V stacked on one
 // axis, which makes its V slice non-contiguous in b).
+__device__ __forceinline__ uint32_t pack_dims(const uint32_t* key, int m) {
+    // byte m of four keys, in key order: the packed word the PV dot reads
+    const int sh = 8 * m;
+    return ((key[0] >> sh) & 0xffu) | (((key[1] >> sh) & 0xffu) << 8)
+         | (((key[2] >> sh) & 0xffu) << 16) | (((key[3] >> sh) & 0xffu) << 24);
+}
+
 __global__ void __launch_bounds__(NTQ, 4)
 rot_pack_v_kernel(const int8_t* __restrict__ pa, int64_t off_a, int64_t pitch_a,
                   const int8_t* __restrict__ pb, int64_t off_b, int64_t pitch_b,
                   uint32_t* __restrict__ out, int H, int D, int Sp, int Sb, int q_total) {
-    const int q = blockIdx.x * QPB + (threadIdx.x >> 6);
-    if (q >= q_total) return;
-    const int bh = blockIdx.y;
+    // a 32-lane group packs one quad and reads four dims per lane, so a key row is
+    // one 128 B transaction instead of two 64 B halves, and the 4x4 byte transpose
+    // stays inside the lane
+    const int dw = threadIdx.x & 31;
+    const int q = blockIdx.y * QPB + (threadIdx.x >> 5);
+    if (q >= q_total || 4 * dw >= D) return;
+    const int bh = blockIdx.x;
     const int b = bh / H, h = bh - b * H;
-    const int lane = threadIdx.x & 63;
-    const int ng = D / G;
     const int t0 = 4 * q;
-    int8_t vals[4][4];
+    uint32_t key[4];
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
         const int t = t0 + r;
@@ -121,16 +112,10 @@ rot_pack_v_kernel(const int8_t* __restrict__ pa, int64_t off_a, int64_t pitch_a,
         } else if (t < Sp + Sb) {
             p = pb + (off_b + (int64_t)b * pitch_b + (int64_t)(t - Sp) * H + h) * D;
         }
-#pragma unroll
-        for (int g = 0; g < 4; ++g) vals[r][g] = (p && g < ng) ? p[g * G + lane] : 0;
+        key[r] = p ? *(const uint32_t*)(p + 4 * dw) : 0u;
     }
-#pragma unroll
-    for (int g = 0; g < 4; ++g) {
-        if (g >= ng) break;
-        const uint32_t w = (uint8_t)vals[0][g] | ((uint32_t)(uint8_t)vals[1][g] << 8)
-                         | ((uint32_t)(uint8_t)vals[2][g] << 16) | ((uint32_t)(uint8_t)vals[3][g] << 24);
-        out[((int64_t)bh * q_total + q) * D + g * G + lane] = w;
-    }
+    uint4 w = {pack_dims(key, 0), pack_dims(key, 1), pack_dims(key, 2), pack_dims(key, 3)};
+    *(uint4*)(out + ((int64_t)bh * q_total + q) * D + 4 * dw) = w;
 }
 
 extern "C" int gfx906_rot_quant(const void* x, void* out, void* scale,
@@ -148,17 +133,6 @@ extern "C" int gfx906_rot_quant(const void* x, void* out, void* scale,
     return e == hipSuccess ? 0 : (int)e;
 }
 
-extern "C" int gfx906_rot_f16(const void* x, void* out, int rows, int D, int dtype, void* stream) {
-    if (rows <= 0 || D % G || D > 4 * G) return -3;
-    const int ng = D / G;
-    hipStream_t st = (hipStream_t)stream;
-    if (dtype == 0)
-        rot_f16_kernel<float><<<cdiv(rows, RPB), NTQ, 0, st>>>((const float*)x, (__half*)out, rows, D, ng);
-    else
-        rot_f16_kernel<__half><<<cdiv(rows, RPB), NTQ, 0, st>>>((const __half*)x, (__half*)out, rows, D, ng);
-    hipError_t e = hipGetLastError();
-    return e == hipSuccess ? 0 : (int)e;
-}
 
 extern "C" int gfx906_rot_pack_v(const void* pa, long long off_a, long long pitch_a,
                                  const void* pb, long long off_b, long long pitch_b,
@@ -166,7 +140,7 @@ extern "C" int gfx906_rot_pack_v(const void* pa, long long off_a, long long pitc
                                  int q_total, void* stream) {
     if (B <= 0 || H <= 0 || D % G || D > 4 * G || Sp < 0 || Sb < 0 || q_total <= 0) return -3;
     hipStream_t st = (hipStream_t)stream;
-    rot_pack_v_kernel<<<dim3(cdiv(q_total, QPB), B * H), NTQ, 0, st>>>(
+    rot_pack_v_kernel<<<dim3(B * H, cdiv(q_total, QPB)), NTQ, 0, st>>>(
         (const int8_t*)pa, off_a, pitch_a, (const int8_t*)pb, off_b, pitch_b,
         (uint32_t*)out, H, D, Sp, Sb, q_total);
     hipError_t e = hipGetLastError();
