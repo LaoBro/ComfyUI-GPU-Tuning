@@ -48,7 +48,9 @@ CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`imag
   Hadamard 旋转（`off` / `64` / `128`，默认 128）；数值代价与实测见 [PATCHES.md](PATCHES.md)、
   [HIP_KERNELS.md](HIP_KERNELS.md)。
 - `qwen21_int8_cache`：Qwen-Image 2.1 的 int8 prefix cache K/V 保持 int8、直接在 int8 内核上算
-  注意力（默认关）；实测见 [HIP_KERNELS.md](HIP_KERNELS.md)。
+  注意力（默认关）；实测见 [HIP_KERNELS.md](HIP_KERNELS.md)。开 `profile` 后每次 prompt 的
+  profiler 报告会打印本次的 int8 注意力调用数与 int8 `take()` 次数（括号内为进程累计），
+  `0 calls` 表示本次回落 fp16 反量化路径；`status()` 里显示的是累计值。
 
 ### 在其它显卡上使用 / 扫描 int8 tile
 
@@ -146,5 +148,5 @@ m ≤ 1 的解码仍走 GEMV；m < 128 直接回落 Triton（128 行 tile 在更
 | `COMFY_GPU_TUNE_W4A16_HIP` | `1` | te=default 4-bit 反量化 GEMV 的 HIP 内核（`arch/gfx906/kernels/w4a16.cu`，m=1 与 m=2..8 两个入口）；`off` 回落到 Triton 的 `dequant_w4a16_kernel` 做 A/B。m>8 或不合形状的批仍走 Triton |
 | `COMFY_GPU_TUNE_W4A16_F16ACT` | `0` | 只管**带 codebook** 的检查点是否用 fp16 激活 + `v_dot2_f32_f16` 的 feed（`w4a16_gemv_h`，m=1..8，比无损 feed 快 1.05-4.89x）；代价是 16 个格点退到 fp16（fp32 输出归一化 1.6-2.6e-4、fp16 输出约 1.5 ulp），开启前按 `--sampling off` 重验生文 md5。无 codebook 的检查点不看这个开关，默认就走该 feed（均匀格点在 fp16 里精确） |
 | `COMFY_GPU_TUNE_W4A16_VALU` | 空 | **测量门**：缺省时由 `feature.w4a16_valu`（本机/出厂 manifest）决定，出厂表为 `on`；显式 `on`/`off` 覆盖它。均匀格点（无 codebook）的 m=2..4 GEMV 用 `v_cvt_f32_ubyteN` 在 VALU 里构造 16 个格点，替掉 `tab[16]` 的 LDS gather；逐位一致，实测快 3-7%（数字见上文与 docs/HIP_KERNELS.md）。M=8 自动回落表格路径（该形状已 spill），带 codebook 的检查点不看这个开关。`bench.py --w4a16-valu --write` 可重新测并改写判定 |
-| `COMFY_GPU_TUNE_TRITON_BACKEND` | 空 | comfy-kitchen 的 triton 后端是否让 dispatch 选：空=跟随启动参数（`--disable-triton-backend` 就不开），`on`/`off` 覆盖它。`off` 让本包没覆盖的 kitchen 操作回落 eager，便于 A/B（实测 4096x4096 上 `quantize_int8_rowwise` 113.7→381.3 us、`dequantize_per_tensor_fp8` 666.9→863.4 us）；int8 linear 不受影响——两个后端的 `int8_linear` 都包了本包的路由，兜底始终是 triton 内核，因为 eager 的 `torch._int_mm` 在本卡每个 m 都抛 `HIPBLAS_STATUS_INVALID_VALUE` |
+| `COMFY_GPU_TUNE_TRITON_BACKEND` | 空 | comfy-kitchen 的 triton 后端是否让 dispatch 选：空（默认）= **开**——core 默认禁用 triton，本包在启动时主动启用它（等价于 `--enable-triton-backend`，启动日志那条 `triton backend enabled` 即由此而来），只有显式 `--disable-triton-backend` 才保持关；`on`/`off` 显式覆盖且优先于启动参数。`off` 让本包没覆盖的 kitchen 操作回落 eager，便于 A/B（实测 4096x4096 上 `quantize_int8_rowwise` 113.7→381.3 us、`dequantize_per_tensor_fp8` 666.9→863.4 us）；int8 linear 不受影响——两个后端的 `int8_linear` 都包了本包的路由，兜底始终是 triton 内核，因为 eager 的 `torch._int_mm` 在本卡每个 m 都抛 `HIPBLAS_STATUS_INVALID_VALUE` |
 

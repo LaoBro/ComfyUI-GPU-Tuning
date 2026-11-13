@@ -2236,6 +2236,7 @@ def patch_qwen21_int8_cache():
         scale = params.scale.reshape(shape[0], 2, shape[2], shape[3]).float()
         _state["qwen21_take"] = (i, kv8, scale)
         _state["qwen21_take_calls"] = _state.get("qwen21_take_calls", 0) + 1
+        _state["qwen21_prompt_takes"] = _state.get("qwen21_prompt_takes", 0) + 1
         return comfy.utils.repeat_to_batch_size(kv8, batch_size)
 
     PoseBranchCache.take = take
@@ -2259,6 +2260,7 @@ def patch_qwen21_int8_cache():
             out = mod.cache_attention(q_t.contiguous(), k_t.contiguous(), v_t.contiguous(),
                                       kv8, scale)
             _state["qwen21_int8_calls"] = _state.get("qwen21_int8_calls", 0) + 1
+            _state["qwen21_prompt_calls"] = _state.get("qwen21_prompt_calls", 0) + 1
             b, st, h, d = q_t.shape
             if out.dtype != q_t.dtype:
                 out = out.to(q_t.dtype)
@@ -2587,16 +2589,22 @@ def _bench(fn, iters=5, warmup=3):
 
 
 def report_lines():
-    """One-shot line for the profiler: how many attention calls took the fp16 path."""
+    """One-shot lines for the profiler: attention casts and int8 prefix cache hits."""
+    lines = []
     cast = _state["attn_cast"]
-    if not cast:
-        return []
-    line = (f"attention fp16-ok {cast['fp16']} / amax overflow {cast['fp32']}"
-            f" (own kernel: hip {cast['hip']}, hand {cast['hand']},"
-            f" gemm {cast['gemm']}, sdpa {cast['sdpa']})")
-    for k in cast:
-        cast[k] = 0
-    return [line]
+    if cast:
+        lines.append(f"attention fp16-ok {cast['fp16']} / amax overflow {cast['fp32']}"
+                     f" (own kernel: hip {cast['hip']}, hand {cast['hand']},"
+                     f" gemm {cast['gemm']}, sdpa {cast['sdpa']})")
+        for k in cast:
+            cast[k] = 0
+    if _state.get("qwen21_int8_cache"):
+        takes = _state.pop("qwen21_prompt_takes", 0)
+        calls = _state.pop("qwen21_prompt_calls", 0)
+        lines.append(f"qwen21 int8 cache: {calls} attention calls / {takes} int8 takes this prompt"
+                     f" (total {_state.get('qwen21_int8_calls', 0)}/"
+                     f"{_state.get('qwen21_take_calls', 0)})")
+    return lines
 
 
 def _format_tile(config):
