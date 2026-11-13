@@ -13,8 +13,11 @@ import torch
 
 MAX_RECORDS = 20000
 
-ORDER = ("model_forward", "attention", "int8_linear")
-DEPTH = {"model_forward": 0, "attention": 1, "int8_linear": 1}
+ORDER = ("model_forward", "attention", "cache_attn", "int8_linear", "norm", "rope", "residual")
+DEPTH = {"model_forward": 0, "attention": 1, "cache_attn": 1, "int8_linear": 1,
+         "norm": 1, "rope": 1, "residual": 1}
+# labels that split model_forward; whatever they do not cover is "other"
+FORWARD_PARTS = ("attention", "cache_attn", "int8_linear", "norm", "rope", "residual")
 
 _records = []
 _installed = []
@@ -130,6 +133,29 @@ def patch():
     target = getattr(attention, "optimized_attention", None)
     if _rebind(target, _wrap_once("attention", target)):
         _installed.append("attention")
+
+    # DiT-only ops that otherwise fall into "other": the block calls these
+    # through their module globals, so replacing the attribute is enough.
+    from comfy.ldm.qwen_image21 import model as qwen21
+
+    qwen21._modulated_norm = _wrap_once("norm", qwen21._modulated_norm)
+    qwen21._gated_residual = _wrap_once("residual", qwen21._gated_residual)
+    _installed.extend(["norm", "residual"])
+
+    from comfy import quant_ops
+
+    rope = getattr(quant_ops.ck, "rms_rope", None)
+    if rope is not None:
+        quant_ops.ck.rms_rope = _wrap_once("rope", rope)
+        _installed.append("rope")
+
+    try:
+        from ..kernels.hip import attention_i8
+    except ImportError:
+        from kernels.hip import attention_i8
+    if attention_i8.available():
+        attention_i8.cache_attention = _wrap_once("cache_attn", attention_i8.cache_attention)
+        _installed.append("cache_attn")
     patch_prompt_end()
     return _installed
 
@@ -193,12 +219,11 @@ def summary(clock_before=None, clock_after=None):
 
     forward = sum(totals.get("model_forward", []))
     if forward:
-        attention_ms = sum(totals.get("attention", []))
-        linear_ms = sum(totals.get("int8_linear", []))
+        parts = {label: sum(totals.get(label, [])) for label in FORWARD_PARTS}
         lines.append(
-            f"model_forward {forward / 1000:.2f} s = attention {attention_ms / 1000:.2f} s"
-            f" + int8_linear {linear_ms / 1000:.2f} s"
-            f" + other {(forward - attention_ms - linear_ms) / 1000:.2f} s"
+            f"model_forward {forward / 1000:.2f} s = "
+            + " + ".join(f"{label} {v / 1000:.2f} s" for label, v in parts.items() if v)
+            + f" + other {(forward - sum(parts.values())) / 1000:.2f} s"
         )
     # the first prompt after profile is switched on has no clock_before, but its
     # counters still say what ran, so report them either way
