@@ -186,19 +186,6 @@ def textgen_summary():
         for name in TEXTGEN_ITEMS)
 
 
-def _int8_rotate_env(default=128):
-    """COMFY_GPU_TUNE_INT8_ATTN_ROTATE: 0/off, or a Hadamard group (32/64/128)."""
-    raw = os.getenv("COMFY_GPU_TUNE_INT8_ATTN_ROTATE", "").strip().lower()
-    if raw in ("", "auto", "default"):
-        return default
-    if raw in ("0", "off", "none"):
-        return 0
-    try:
-        return int(raw)
-    except ValueError:
-        return default
-
-
 def _init_env_settings():
     """Diagnostics that have no node switch, read once by apply().
 
@@ -219,9 +206,6 @@ def _init_env_settings():
                               for item in os.getenv("COMFY_GPU_TUNE_FORCE", "").replace(",", " ").split()
                               if item.strip()}
     _state["te_dequant_env"] = os.getenv("COMFY_GPU_TUNE_TE_DEQUANT", "").strip().lower()
-    _state["int8_attn_enabled"] = env_flag("COMFY_GPU_TUNE_INT8_ATTN", "0")
-    _state["int8_attn_rotate"] = _int8_rotate_env()
-    _state["qwen21_int8_cache"] = env_flag("COMFY_GPU_TUNE_QWEN21_INT8_CACHE", "0")
 
 
 def arch_name():
@@ -1662,9 +1646,7 @@ def configure(attention=None, convrot=None, profile=None, text_encoder=None,
     if int8_gemm is not None:
         _state["int8_gemm_enabled"] = resolve_flag(int8_gemm, True)
     if int8_attn is not None:
-        # default keeps the startup value; the switch decides per call, so a
-        # checkpoint that loaded its int8 attention config can be turned off live
-        _state["int8_attn_enabled"] = resolve_flag(int8_attn, _state.get("int8_attn_enabled", False))
+        _state["int8_attn_enabled"] = resolve_flag(int8_attn, False)
     if int8_attn_rotate is not None:
         raw = str(int8_attn_rotate).strip().lower()
         if raw in ("off", "0", "none"):
@@ -1686,8 +1668,7 @@ def configure(attention=None, convrot=None, profile=None, text_encoder=None,
     if prefix_kv is not None:
         _state["prefix_kv_enabled"] = resolve_flag(prefix_kv, True)
     if qwen21_int8_cache is not None:
-        _state["qwen21_int8_cache"] = resolve_flag(
-            qwen21_int8_cache, _state.get("qwen21_int8_cache", False))
+        _state["qwen21_int8_cache"] = resolve_flag(qwen21_int8_cache, False)
     if text_gemv is not None:
         _state["text_gemv_enabled"] = resolve_flag(text_gemv, True)
     if w4a8 is not None:

@@ -67,9 +67,8 @@ dispatch 管不到的几类：
 `feature.qwen35`（用例只覆盖 prefill，收益主要在 decode，测量覆盖不了决策面），
 所以 qwen35 留在 B 类。
 
-优先级分两层：节点开关显式 `on`/`off` 覆盖一切；`default` 对 `textgen` / `int8_attn` /
-`qwen21_int8_cache` / `int8_attn_rotate` 沿用启动 env，其余开关沿用内置默认或 manifest 判定，
-没有对应的 `COMFY_GPU_TUNE_*`。
+节点值优先且显式：`on`/`off` 直接指定状态，三个测量门开关的 `default` 交给 manifest 判定。
+`COMFY_GPU_TUNE_*` 里没有对应节点开关的启动值；文本生成的分项旋钮只在没连 CLIP 节点时生效。
 
 ## 加一个内核或后端
 

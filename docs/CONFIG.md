@@ -14,15 +14,16 @@
 
 设置节点改动**下一次执行就生效**，不用重启。命令行复测 `benchmark()` 已删除：它没有节点注册、也没有任何调用者，长期是死代码；需要复测时直接用 `gfx906fix/` 下的独立脚本，避免再维护第三个节点。
 
-多数开关是三态 combo（`default` / `on` / `off`）：`default` 沿用内置默认，有实测表的按
-manifest 判定；`on` / `off` 显式覆盖，优先级最高。以下不是三态：`attention`
+多数开关是 `on` / `off` 二态，combo 上显示的就是当前状态，默认值即内置默认。三个测量门开关
+`vae` / `gemv` / `image_tower` 多一个 `default`：按 `arch/<gcn>/manifest.toml` 的实测判定，
+没跑过 bench 的卡保持原路径。其余是模式或数值选择：`attention`
 （`default` + `hip`/`gemm`/`hand` + core 后端名）、`convrot`（`default` + `fused`/`butterfly`/`off`）、
-`fp16_attn`（`force`/`guarded`/`off`）、`int8_attn_rotate`（`default`/`off`/`64`/`128`）、
+`fp16_attn`（`force`/`guarded`/`off`）、`int8_attn_rotate`（`off`/`64`/`128`）、
 `text_encoder`（`int8`/`default`）、`text_attention`（只有 `default`）。
 
-只有 `textgen`（对应 `DELTANET` / `KVDECODE` / `LLAMA` / `QWEN35` / `GRAPH`）、`int8_attn`、
-`qwen21_int8_cache` 和 `int8_attn_rotate` 的 `default` 沿用启动时的环境变量值，其余开关
-没有对应的环境变量。以前“节点默认值会覆盖 env”的问题已修掉。
+节点里所有值都是显式的，没有“沿用启动 env”的隐式状态。文本生成的分项 env
+（`DELTANET` / `KVDECODE` / `LLAMA` / `QWEN35` / `GRAPH`）只在**没连 CLIP 节点**时生效，
+供 `tools/chain_profile.py` 逐项归因；连上节点后由 `textgen` 的 `on`/`off` 完全接管。
 
 ### 节点开关清单
 
@@ -41,9 +42,9 @@ CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`imag
 - `small_batch`：gfx906 上把“`m≤8` 切到 `16×32×64` 窄 tile、`m>8` 切回 `128×256×32`”单独控制；其它 AMD 上表示“把窄 tile 追加为 autotune 候选”（是否真的用它由该卡实测决定）。需要 `int8_tile` 为 on，否则显示 n/a。GEMV 仍由 `gemv` 单独控制。
 - `text_gemv`：单行文本编码器解码时，int8 权重直调 GEMV、未量化的小投影走 `torch.mv`；关闭后两者都回到分派层。
 - `w4a8`：4-bit 权重解码；`status()` 会打印实际调用次数和当前后端（`hip` / `asm` / `triton`），换 checkpoint 后可据此确认是否真的走到了 w4a8 内核（`on: 0 calls ...` 表示权重布局没被识别）。能否用 `tl.dot` 替代 `v_dot4` 的实测结论见 [docs/PORTING.md 附录 E](PORTING.md)。
-- `textgen`：一次控制 DeltaNet 内核、KV decode 折叠、llama RMSNorm/RoPE 缓存、Qwen3.5 计算类；关闭时逐调用委托回 core 实现（Qwen3.5 类符号本身不换回）。
+- `textgen`：默认 on，一次控制 DeltaNet 内核、KV decode 折叠、llama RMSNorm/RoPE 缓存、Qwen3.5 计算类；关闭时逐调用委托回 core 实现（Qwen3.5 类符号本身不换回）。不连该节点时由分项 env 决定。
 - `int8_gemm`：行数 ≥ 128 的 int8 线性交给自带 HIP dot4 GEMM，`off` 强制回 Triton；详见下节。
-- `int8_attn` / `int8_attn_rotate`：comfy-kitchen 的 int8 注意力契约（默认关）及其 Q/K 量化前的
+- `int8_attn` / `int8_attn_rotate`：comfy-kitchen 的 int8 注意力契约（默认 off）及其 Q/K 量化前的
   Hadamard 旋转（`off` / `64` / `128`，默认 128）；数值代价与实测见 [PATCHES.md](PATCHES.md)、
   [HIP_KERNELS.md](HIP_KERNELS.md)。
 - `qwen21_int8_cache`：Qwen-Image 2.1 的 int8 prefix cache K/V 保持 int8、直接在 int8 内核上算
@@ -111,12 +112,13 @@ m ≤ 1 的解码仍走 GEMV；m < 128 直接回落 Triton（128 行 tile 在更
 
 ## 开关
 
-开关都在节点里（GPU Tuning Model Settings / GPU Tuning CLIP Settings），`default` 用内置默认值
-或 manifest 判定，`on/off` 显式覆盖，下一次执行生效。`textgen` / `int8_attn` /
-`qwen21_int8_cache` / `int8_attn_rotate` 的 `default` 沿用启动时的环境变量值。
+开关都在节点里（GPU Tuning Model Settings / GPU Tuning CLIP Settings），下一次执行生效。
+绝大多数是 `on`/`off` 二态，combo 上显示的就是当前状态；`vae` / `gemv` / `image_tower` 另有
+`default` 按 manifest 实测判定。节点开关没有“沿用启动 env”的隐式状态。
 
-环境变量分三类：整包总闸、少数开关的启动值、以及没有节点入口的诊断/基准/移植旋钮。
-下表是全集；移植与内核细节另见 [PORTING.md](PORTING.md) 和 [HIP_KERNELS.md](HIP_KERNELS.md)。
+环境变量只剩两类：整包总闸，以及没有节点入口的诊断/基准/移植旋钮（含文本生成的分项旋钮，
+只在没连 CLIP 节点时生效）。下表是全集；移植与内核细节另见 [PORTING.md](PORTING.md) 和
+[HIP_KERNELS.md](HIP_KERNELS.md)。
 `__init__.py` 导入时还 `setdefault("TRITON_DEFAULT_FP_FUSION", "1")`：Triton 3.10 会把默认改成关，
 本包所有实测都假设 fusion 开；显式设置该变量仍优先，它不是本包的开关。
 
@@ -138,10 +140,7 @@ m ≤ 1 的解码仍走 GEMV；m < 128 直接回落 Triton（128 行 tile 在更
 | `COMFY_GPU_TUNE_KVDECODE` | `1` | 同上：折叠 GQA 的 KV decode |
 | `COMFY_GPU_TUNE_LLAMA` | `1` | 同上：llama RMSNorm 预计算 + RoPE 频率表 |
 | `COMFY_GPU_TUNE_QWEN35` | `1` | 同上：Qwen3.5 计算类替换（等价改写，逐方法对过 core） |
-| `COMFY_GPU_TUNE_GRAPH` | `1` | textgen 分项基准旋钮：权重常驻时的逐块 CUDA graph（也跟随 CLIP 节点的 `textgen` 开关） |
-| `COMFY_GPU_TUNE_INT8_ATTN` | `0` | int8 注意力契约（checkpoint 标记 / int8 minimax VAE）的启动值；节点 `int8_attn=default` 沿用，`on`/`off` 覆盖 |
-| `COMFY_GPU_TUNE_INT8_ATTN_ROTATE` | `128` | int8 注意力 Q/K 量化前的 Hadamard 旋转组：`off`/`0` 关，或 32/64/128；节点 `int8_attn_rotate=default` 沿用 |
-| `COMFY_GPU_TUNE_QWEN21_INT8_CACHE` | `0` | Qwen-Image 2.1 int8 prefix cache 保持 K/V 为 int8 的启动值；节点 `qwen21_int8_cache=default` 沿用 |
+| `COMFY_GPU_TUNE_GRAPH` | `1` | textgen 分项基准旋钮：权重常驻时的逐块 CUDA graph；连上节点时由 `textgen` 的 `on`/`off` 覆盖 |
 | `COMFY_GPU_TUNE_F16_GEMM` | `1`/`0` | 非量化 fp16 linear 的 HIP GEMM；`off` 强制关掉做 A/B。缺省值由 manifest 的 `feature.f16_gemm` 决定，未实测卡为 `0`。见 [HIP_KERNELS.md](HIP_KERNELS.md) |
 | `COMFY_GPU_TUNE_ROTATE` | `1` | 解码激活旋转的 HIP butterfly 内核；`off` 回落到 Triton 做 A/B。fp16 输入下 HIP 以 fp32 累加，量化激活更准但与 Triton 不等价 |
 | `COMFY_GPU_TUNE_W4A16_HIP` | `1` | te=default 4-bit 反量化 GEMV 的 HIP 内核（`arch/gfx906/kernels/w4a16.cu`，m=1 与 m=2..8 两个入口）；`off` 回落到 Triton 的 `dequant_w4a16_kernel` 做 A/B。m>8 或不合形状的批仍走 Triton |

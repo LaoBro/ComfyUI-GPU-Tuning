@@ -632,7 +632,7 @@ VALU 一旦发射就打满 lane，却有 61% 的周期没在发射——**不是
 `prequantize_int8_attention`、`int8_attention_from_prequantized`、
 `int8_attention_is_available` 四个入口，同时点亮 `attention.py` 的可用常量并注册
 `comfy_kitchen_int8` 后端名。checkpoint 的 `ComfyAttention` 配置和 minimax VAE
-都不改代码就能走新内核。默认**关**（`COMFY_GPU_TUNE_INT8_ATTN=1` 或节点开关打开）；
+都不改代码就能走新内核。默认**关**（节点 `int8_attn=on` 打开）；
 关着时这些调用照旧走 `optimized_attention`，不会退化成 SDPA。
 
 尚未覆盖：带 mask 的调用（转给 `attention_pytorch`）、D=256（转给同一条回退）、
@@ -680,7 +680,7 @@ Q/K/V 旋转+量化 1.03 ms、V 打包 0.75 ms、输出反旋转 0.31 ms。改�
    `key*H + hk`，Qwen-Image 2.1（没有 GQA）完全看不出来，直到契约路径的
    GQA 用例（h=4/hkv=2）报出 1.75 才暴露。批次步长同理是 `2*SP*HKV`。
 
-开关 `qwen21_int8_cache`（默认关，`COMFY_GPU_TUNE_QWEN21_INT8_CACHE=1` 可开），
+开关 `qwen21_int8_cache`（默认 off，节点设 `on` 打开），
 关闭时 `take()` 与原路径逐位一致；补丁只改读路径，`put()`（缓存写入）不动。
 
 ## 试过但没采用的路径

@@ -22,7 +22,8 @@ class GpuTuningModelSettings(io.ComfyNode):
             description=(
                 "Runtime settings for the GPU Tuning pack. Values take effect on the next execution, "
                 "no restart needed. Wire it between the model loader and the sampler. Most switches "
-                "are three-state (default/on/off); a few are mode choices."
+                "are plain on/off; vae, gemv and image_tower also offer default to follow the "
+                "measured verdict, and a few are mode choices."
             ),
             inputs=[
                 io.Model.Input("model"),
@@ -40,7 +41,7 @@ class GpuTuningModelSettings(io.ComfyNode):
                                        "kept only for A/B baselines and explicit requests; the fp32 ones are "
                                        "slower here (pytorch/SDPA is math-only on gfx906). default already "
                                        "picks the fastest path (hip when the .so loads, else gemm)."),
-                io.Combo.Input("contiguous", options=list(TRISTATE), default="default",
+                io.Combo.Input("contiguous", options=["on", "off"], default="on",
                                tooltip="When a backend name is selected: transpose to [B,H,S,D] and "
                                        ".contiguous() before calling it. Core hands SDPA/bmm transpose views "
                                        "instead, which measures 4-15x slower on gfx906. Turn off to reproduce "
@@ -56,37 +57,37 @@ class GpuTuningModelSettings(io.ComfyNode):
                 io.Combo.Input("convrot", options=["default"] + list(CONVROT_MODES), default="default",
                                tooltip="default keeps the built-in mode. fused = rotation + int8 quantize in "
                                        "one kernel, butterfly = rotation only, off = the original matmul."),
-                io.Combo.Input("int8_tile", options=list(TRISTATE), default="default",
+                io.Combo.Input("int8_tile", options=["on", "off"], default="on",
                                tooltip="Keep the gfx906 int8 tile (128x256x32, 4 warps, 2 stages) in the "
-                                       "kitchen autotune list. default keeps the injected tiles; off "
+                                       "kitchen autotune list. on keeps the injected tiles; off "
                                        "restores the stock list. The m<=8 narrow tile has its own switch."),
-                io.Combo.Input("small_batch", options=list(TRISTATE), default="default",
+                io.Combo.Input("small_batch", options=["on", "off"], default="on",
                                tooltip="On gfx906: switch the int8 kernel to the 16x32x64 narrow tile when m<=8 "
                                        "(text decode / MTP verify), and back to 128x256x32 for larger batches. "
                                        "Other AMD: add the narrow tile as an autotune candidate and let that "
-                                       "card decide. default keeps the built-in split; needs int8_tile on. "
+                                       "card decide. on keeps the built-in split; needs int8_tile on. "
                                        "GEMV has its own switch."),
-                io.Combo.Input("int8_gemm", options=list(TRISTATE), default="default",
+                io.Combo.Input("int8_gemm", options=["on", "off"], default="on",
                                tooltip="Run int8 linears with at least 128 rows on the HIP dot4 GEMM "
                                        "(128x128 tile, 4 waves/CU) instead of the Triton kernel: 1.10-1.21x "
-                                       "on the measured prefill shapes. default uses it when "
+                                       "on the measured prefill shapes. on uses it when "
                                        "the shipped libgfx906_int8.so loads; off forces the Triton path. Decode "
                                        "(m<=1) still uses the GEMV."),
-                io.Combo.Input("int8_attn", options=list(TRISTATE), default="default",
+                io.Combo.Input("int8_attn", options=["on", "off"], default="off",
                                tooltip="Run comfy_kitchen's INT8 attention contract (models whose checkpoint marks "
                                        "attention as comfy_kitchen_int8, and the int8 minimax VAE) on the HIP "
                                        "int8-input kernel: Q/K int8 with per-token scales, V int8 4-keys-per-word "
                                        "with per-dim scales, 8-bit P, fp32 softmax. Measured output diffl2 1.1-1.3e-2 "
-                                       "(fp16 kernel: 2.5e-4), so default is off; on is opt-in, off runs the "
+                                       "(fp16 kernel: 2.5e-4), so it is off by default; on is opt-in, off runs the "
                                        "regular optimized attention for those calls."),
-                io.Combo.Input("int8_attn_rotate", options=["default", "off", "64", "128"], default="default",
+                io.Combo.Input("int8_attn_rotate", options=["off", "64", "128"], default="128",
                                tooltip="Hadamard rotation applied to Q and K before INT8 quantization on the int8 "
                                        "attention path. It costs one matmul and bounds per-row outliers without "
-                                       "changing dot products; off is the same math with no rotation."),
-                io.Combo.Input("qkv", options=list(TRISTATE), default="default",
+                                       "changing dot products; off is the same math with no rotation. 128 is the built-in default."),
+                io.Combo.Input("qkv", options=["on", "off"], default="off",
                                tooltip="One int8 GEMM for q/k/v instead of three (Qwen-Image 2.1): -81 ms "
                                        "of a 5.24 s step (1.5%), bit-exact. The merged weights stay resident "
-                                       "(1.6 GB on a 32-block DiT), so the env default is off. No restart "
+                                       "(1.6 GB on a 32-block DiT), so it is off by default. No restart "
                                        "needed; turning it off also drops the merged copy."),
                 io.Combo.Input("vae", options=list(TRISTATE), default="default",
                                tooltip="Run depth-1 Conv3d as Conv2d in the video VAE. default keeps "
@@ -94,18 +95,18 @@ class GpuTuningModelSettings(io.ComfyNode):
                 io.Combo.Input("gemv", options=list(TRISTATE), default="default",
                                tooltip="Single-token int8 decode GEMV for the model's int8 linears. default "
                                        "the manifest verdict; off returns every call to the tiled GEMM."),
-                io.Combo.Input("prefix_kv", options=list(TRISTATE), default="default",
+                io.Combo.Input("prefix_kv", options=["on", "off"], default="on",
                                tooltip="Merge the prefix cache K/V into a reused buffer with copy_ instead of "
-                                       "torch.cat (Qwen-Image 2.1). default keeps it on; off "
+                                       "torch.cat (Qwen-Image 2.1). on keeps it on; off "
                                        "restores the shipped torch.cat path."),
-                io.Combo.Input("qwen21_int8_cache", options=list(TRISTATE), default="default",
+                io.Combo.Input("qwen21_int8_cache", options=["on", "off"], default="off",
                                tooltip="Keep the Qwen-Image 2.1 int8 prefix cache's K/V in int8 and run the "
                                        "attention on the int8 kernel: the shipped path dequantizes both to fp16 "
                                        "once per block. Measured 51.2 -> 34.2 ms per block at "
                                        "4058+4032 tokens, 32 heads, d128 (1.50x), output diffl2 1.1e-2 "
-                                       "against the fp16-on-dequant reference (2.6e-4). default is off; off "
+                                       "against the fp16-on-dequant reference (2.6e-4). off "
                                        "keeps the fp16 path."),
-                io.Combo.Input("profile", options=list(TRISTATE), default="default",
+                io.Combo.Input("profile", options=["on", "off"], default="off",
                                tooltip="Print the tuning status once and per-call timings when each prompt finishes."),
             ],
             outputs=[io.Model.Output(display_name="model")],
@@ -141,9 +142,9 @@ class GpuTuningClipSettings(io.ComfyNode):
             category="advanced/debug",
             description=(
                 "Text-encoder settings for the GPU Tuning pack. Sits in the CLIP chain, between the "
-                "loader and the text encode; applies to every text encoder in the process. The on/off "
-                "switches are three-state: default keeps the built-in default; text_encoder "
-                "and text_attention use default as an explicit choice instead."
+                "loader and the text encode; applies to every text encoder in the process. Most "
+                "switches are plain on/off; image_tower also offers default to follow the measured "
+                "verdict, and text_encoder / text_attention are explicit choices."
             ),
             inputs=[
                 io.Clip.Input("clip"),
@@ -158,13 +159,13 @@ class GpuTuningClipSettings(io.ComfyNode):
                                        "replace that pick, but none of them has a measured win on text "
                                        "shapes on this card, so none is offered here; the routing is live, "
                                        "add a name back when a measurement justifies it."),
-                io.Combo.Input("text_gemv", options=list(TRISTATE), default="default",
+                io.Combo.Input("text_gemv", options=["on", "off"], default="on",
                                tooltip="Single-row text-encoder GEMV: the direct int8 kernel call and the "
-                                       "torch.mv path for the unquantized gate projections. default keeps "
+                                       "torch.mv path for the unquantized gate projections. on keeps "
                                        "the built-in on state; off sends both back to the dispatched linear."),
-                io.Combo.Input("w4a8", options=list(TRISTATE), default="default",
+                io.Combo.Input("w4a8", options=["on", "off"], default="on",
                                tooltip="4-bit packed text-encoder weights: decode rows go to the w4a8 GEMV, "
-                                       "prefill unpacks one layer to int8. default keeps it on; "
+                                       "prefill unpacks one layer to int8. on keeps it on; "
                                        "off dequantizes through the shipped layout. status shows the call count "
                                        "so a swapped checkpoint can be confirmed."),
                 io.Combo.Input("image_tower", options=list(TRISTATE), default="default",
@@ -174,12 +175,12 @@ class GpuTuningClipSettings(io.ComfyNode):
                                        "conv3d kernel). Measured 3.83 -> 1.6 s for a 1160x679 image on this "
                                        "card. default keeps the manifest verdict: unmeasured cards stay on "
                                        "the shipped path, tools/bench.py --vision writes the verdict."),
-                io.Combo.Input("textgen", options=list(TRISTATE), default="default",
+                io.Combo.Input("textgen", options=["on", "off"], default="on",
                                tooltip="Text-generation patches: DeltaNet decode kernels, folded KV decode, "
-                                       "llama RMSNorm/RoPE caching and the Qwen3.5 compute classes. default "
-                                       "the four COMFY_GPU_TUNE_DELTANET/KVDECODE/LLAMA/QWEN35 knobs "
-                                       "individually; on/off "
-                                       "switches all four together without a reload."),
+                                       "llama RMSNorm/RoPE caching and the Qwen3.5 compute classes. on "
+                                       "(default) enables all four, off disables them all without a reload. "
+                                       "Without this node the COMFY_GPU_TUNE_DELTANET/KVDECODE/LLAMA/ "
+                                       "QWEN35/GRAPH knobs decide each item."),
             ],
             outputs=[io.Clip.Output(display_name="clip")],
         )
