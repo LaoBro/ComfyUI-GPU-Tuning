@@ -489,7 +489,7 @@ V 寄存器预取慢 5%、d64 重排到 2 block/CU 不动（见下条）——�
      d40 0.74 ms 对 comfy 的 0.76/0.88，d80@4096 17.29 对 22.61/26.11。
   2. decode 形状 sq=1..16 —— 见常见坑点那条，hip 比 gemm 慢 3.2-5.1x，hand 也一样慢
      （0.74 对 0.23 ms），因为它自己的 BLOCK_M=64。
-  3. fp32 输入或 amax 保护触发 —— hand/int8 同样要求 fp16，只有 gemm 收。
+  3. fp32 输入或 `fp16_attn` 的 guard 触发 —— hand/int8 同样要求 fp16，只有 gemm 收。
 
 ## 输入就是 int8 的注意力内核（`hip_attn_i8.cu`，2026-11）
 

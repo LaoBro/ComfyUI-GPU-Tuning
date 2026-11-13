@@ -67,8 +67,9 @@ dispatch 管不到的几类：
 `feature.qwen35`（用例只覆盖 prefill，收益主要在 decode，测量覆盖不了决策面），
 所以 qwen35 留在 B 类。
 
-优先级一句话：**节点显式 on/off > `COMFY_GPU_TUNE_*` > 内置默认**。节点里的
-`default` / `auto` 表示沿用 env，不会拿硬编码值盖掉它。
+优先级分两层：节点开关显式 `on`/`off` 覆盖一切；`default` 对 `textgen` / `int8_attn` /
+`qwen21_int8_cache` / `int8_attn_rotate` 沿用启动 env，其余开关沿用内置默认或 manifest 判定，
+没有对应的 `COMFY_GPU_TUNE_*`。
 
 ## 加一个内核或后端
 
@@ -171,10 +172,10 @@ manifest 根目录可用 `COMFY_GPU_TUNE_MANIFEST_DIR` 改，`COMFY_GPU_TUNE_ARC
 ## B. 功能全表
 
 **A 常开 + B 可选开关**：TE int8 权重常驻、lm_head 保持量化、TE 注意力后端、
-`text_gemv`、`amax_guard`、KV decode 折叠、llama RMSNorm / RoPE 频率表、
+`text_gemv`、`fp16_attn`、KV decode 折叠、llama RMSNorm / RoPE 频率表、
 prefix KV 复用、profiler（常开）；qkv（1.6 GB 常驻，默认关）、qwen35（等价类
 替换，env 默认开）、attention mode（随包 `hip` 内核能加载时默认 `hip`，否则
-`int8`，也可手选）。
+`gemm`，也可手选）。
 
 **C 测量门**：
 

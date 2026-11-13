@@ -1237,6 +1237,8 @@ def patch_attention():
     _state["attn_contiguous"] = True
     stats = _state["attn_cast"] = {"fp16": 0, "fp32": 0, "hand": 0,
                                    "gemm": 0, "hip": 0, "sdpa": 0}
+    # one line per shape that missed our kernels, not one per denoising step
+    declined = set()
 
     def run(q, k, v, softmax_scale):
         """[B, S, H, D] -> same, or None to delegate. fp16 unless the cast is off."""
@@ -1251,6 +1253,15 @@ def patch_attention():
             return _gemm_attention(q, k, v, softmax_scale)
         if mode == "hip":
             if hip_supported is None or not hip_supported(q, k, v):
+                key = ("hip", tuple(q.shape), tuple(k.shape), tuple(v.shape),
+                       str(q.dtype), q.is_contiguous(), k.is_contiguous(), v.is_contiguous())
+                if key not in declined:
+                    declined.add(key)
+                    logging.info("gpu-tune: hip attention declined q=%s k=%s v=%s dtype=%s "
+                                 "contiguous=(%s,%s,%s), falling back to %s",
+                                 tuple(q.shape), tuple(k.shape), tuple(v.shape), q.dtype,
+                                 q.is_contiguous(), k.is_contiguous(), v.is_contiguous(),
+                                 getattr(fallback, "__name__", "?"))
                 return None
             stats["hip"] += 1
             return hip_fwd(q, k, v, softmax_scale)
@@ -1275,9 +1286,16 @@ def patch_attention():
                     # vector_norm(inf) is max(abs()) without materializing the 66 MB temporary
                     amax = max(torch.linalg.vector_norm(t, ord=float("inf")).item() for t in (q, k, v))
                     if amax >= FP16_SAFE_AMAX:
-                        if not stats["fp32"]:
-                            logging.warning("gpu-tune: attention amax %.0f exceeds %d, leaving the inputs alone",
-                                            amax, FP16_SAFE_AMAX)
+                        key = ("amax", tuple(q.shape), tuple(k.shape), tuple(v.shape),
+                               str(q.dtype), q.is_contiguous(), k.is_contiguous(),
+                               v.is_contiguous())
+                        if key not in declined:
+                            declined.add(key)
+                            logging.warning("gpu-tune: attention amax %.0f exceeds %d, q=%s k=%s v=%s "
+                                            "dtype=%s contiguous=(%s,%s,%s), leaving the inputs alone",
+                                            amax, FP16_SAFE_AMAX,
+                                            tuple(q.shape), tuple(k.shape), tuple(v.shape), q.dtype,
+                                            q.is_contiguous(), k.is_contiguous(), v.is_contiguous())
                         stats["fp32"] += 1
                         return None
                 q, k, v = q.half(), k.half(), v.half()
@@ -1610,7 +1628,7 @@ def configure(attention=None, convrot=None, profile=None, text_encoder=None,
         wanted = str(attention).strip().lower()
         if wanted == "default":
             hip = _hip_attention()
-            wanted = "hip" if hip is not None and hip.available() else "int8"
+            wanted = "hip" if hip is not None and hip.available() else "gemm"
         if wanted == "hip":
             hip = _hip_attention()
             if hip is None or not hip.available():

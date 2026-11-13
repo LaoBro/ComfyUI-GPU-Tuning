@@ -51,13 +51,16 @@ textgen deltanet on, kvdecode on, llama on, qwen35 on
 
 | 节点 | 位置 | 作用 |
 |---|---|---|
-| **GPU Tuning Model Settings** | 模型链（加载器 → 采样器之间） | 注意力模式、连续布局、fp16、amax 保护、convrot、int8 tile、`m≤8` 窄 tile、QKV、VAE、GEMV、prefix KV、profiler |
+| **GPU Tuning Model Settings** | 模型链（加载器 → 采样器之间） | 注意力模式、连续布局、fp16 输入策略、convrot、int8 tile、`m≤8` 窄 tile、int8 大 m GEMM、int8 注意力与旋转、QKV、VAE、GEMV、prefix KV、Qwen2.1 int8 缓存、profiler |
 | **GPU Tuning CLIP Settings** | CLIP 链（加载器 → 编码） | 文本编码器 int8、编码器注意力后端、TE GEMV、4-bit w4a8、文本生成补丁组 |
 
-设置节点改动**下一次执行就生效**，不用重启。所有开关都是三态 combo：`default` 沿用启动值，
-`on`/`off` 显式覆盖；优先级是**节点显式 on/off > 环境变量 > 内置默认**。
+设置节点改动**下一次执行就生效**，不用重启。多数开关是三态 combo：`default` 沿用内置默认
+（有实测表的按 manifest 判定），`on`/`off` 显式覆盖且优先；`attention` / `convrot` /
+`fp16_attn` / `int8_attn_rotate` / `text_encoder` / `text_attention` 是多值或二值选择，不是三态。
+`textgen`、`int8_attn`、`qwen21_int8_cache`、`int8_attn_rotate` 的 `default` 沿用启动值，
+可用对应的 `COMFY_GPU_TUNE_*` 环境变量改。
 
-Model Settings：`attention`、`contiguous`、`fp16`、`amax_guard`、`convrot`、`int8_tile`、`small_batch`、`qkv`、`vae`、`gemv`、`prefix_kv`、`profile`。
+Model Settings：`attention`、`contiguous`、`fp16_attn`、`convrot`、`int8_tile`、`small_batch`、`int8_gemm`、`int8_attn`、`int8_attn_rotate`、`qkv`、`vae`、`gemv`、`prefix_kv`、`qwen21_int8_cache`、`profile`。
 
 CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`image_tower`、`textgen`。
 

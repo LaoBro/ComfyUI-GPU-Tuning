@@ -44,7 +44,7 @@
   精度开关（0/64/128）。
 - **文本生成组**：`textgen` 一次控制 `deltanet`、`kvdecode`、`llama`、`qwen35` 四项；
   `default` 时仍按各自环境变量独立生效。
-- **amax 保护**：`amax_guard` 控制注意力输入溢出时是否放弃 fp16 转换。
+- **fp16 输入策略**：`fp16_attn` 三选一（`guarded` / `force` / `off`），合并了旧版的 `fp16` 与 `amax_guard`。
 
 ## 文本生成（单 token 解码）
 

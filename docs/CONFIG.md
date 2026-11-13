@@ -9,35 +9,45 @@
 
 | 节点 | 位置 | 作用 |
 |---|---|---|
-| **GPU Tuning Model Settings** | 模型链（加载器 → 采样器之间） | 注意力模式、连续布局、fp16、amax 保护、convrot、int8 tile、`m≤8` 窄 tile、QKV、VAE、GEMV、prefix KV、profiler |
+| **GPU Tuning Model Settings** | 模型链（加载器 → 采样器之间） | 注意力模式、连续布局、fp16 输入策略、convrot、int8 tile、`m≤8` 窄 tile、int8 大 m GEMM、int8 注意力与旋转、QKV、VAE、GEMV、prefix KV、Qwen2.1 int8 缓存、profiler |
 | **GPU Tuning CLIP Settings** | CLIP 链（加载器 → 编码） | 文本编码器 int8、编码器注意力后端、TE GEMV、4-bit w4a8、文本生成补丁组 |
 
 设置节点改动**下一次执行就生效**，不用重启。命令行复测 `benchmark()` 已删除：它没有节点注册、也没有任何调用者，长期是死代码；需要复测时直接用 `gfx906fix/` 下的独立脚本，避免再维护第三个节点。
 
-所有开关都是三态 combo：
+多数开关是三态 combo（`default` / `on` / `off`）：`default` 沿用内置默认，有实测表的按
+manifest 判定；`on` / `off` 显式覆盖，优先级最高。以下不是三态：`attention`
+（`default` + `hip`/`gemm`/`hand` + core 后端名）、`convrot`（`default` + `fused`/`butterfly`/`off`）、
+`fp16_attn`（`force`/`guarded`/`off`）、`int8_attn_rotate`（`default`/`off`/`64`/`128`）、
+`text_encoder`（`int8`/`default`）、`text_attention`（只有 `default`）。
 
-- `default`：沿用该功能的 `COMFY_GPU_TUNE_*` 启动值（完全不改变现有默认行为）；
-- `on` / `off`：显式覆盖 env；
-- 例外：`text_encoder` / `text_attention` 里的 `default` 是显式选择（fp16 路径 / 核心注意力），
-  不跟随 env。
-
-优先级：**节点显式 on/off > 环境变量 > 内置默认**。以前“节点默认值会覆盖 env”的问题已修掉。
+只有 `textgen`（对应 `DELTANET` / `KVDECODE` / `LLAMA` / `QWEN35` / `GRAPH`）、`int8_attn`、
+`qwen21_int8_cache` 和 `int8_attn_rotate` 的 `default` 沿用启动时的环境变量值，其余开关
+没有对应的环境变量。以前“节点默认值会覆盖 env”的问题已修掉。
 
 ### 节点开关清单
 
-Model Settings：`attention`、`contiguous`、`fp16`、`amax_guard`、`convrot`、`int8_tile`、`small_batch`、`qkv`、`vae`、`gemv`、`prefix_kv`、`profile`。
+Model Settings：`attention`、`contiguous`、`fp16_attn`、`convrot`、`int8_tile`、`small_batch`、`int8_gemm`、`int8_attn`、`int8_attn_rotate`、`qkv`、`vae`、`gemv`、`prefix_kv`、`qwen21_int8_cache`、`profile`。
 
 CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`image_tower`、`textgen`。
 
 补充说明：
 
 - `contiguous`：选中 `basic`/`pytorch`/`sub_quad`/`split` 等 core 后端时，调用前把输入转成连续的 `[B,H,S,D]`；关闭可复现 core 的原始转置视图调用。
-- `amax_guard`：注意力输入绝对值超过 60000 时放弃 fp16 转换，留在模型 dtype，避免 fp16 溢出。
+- `fp16_attn`：三选一。`guarded`（默认）把 fp32/bf16 转 fp16，但 Q/K/V 绝对值 ≥60000 时放弃本次调用、
+  回落 core（fp16 上限 65504，留余量）；`force` 无条件转，可能溢出；`off` 保持模型 dtype，自带
+  hip/gemm/hand 是 fp16-only 会报错，需配 core 后端名使用。旧版 `fp16` / `amax_guard` 已并入此开关，
+  旧工作流需重新连接。
 - `int8_tile`：关闭后恢复上游 autotune 的 tile 列表，不再注入 gfx906 的 `128×256×32`；GEMV 仍由 `gemv` 单独控制。
 - `small_batch`：gfx906 上把“`m≤8` 切到 `16×32×64` 窄 tile、`m>8` 切回 `128×256×32`”单独控制；其它 AMD 上表示“把窄 tile 追加为 autotune 候选”（是否真的用它由该卡实测决定）。需要 `int8_tile` 为 on，否则显示 n/a。GEMV 仍由 `gemv` 单独控制。
 - `text_gemv`：单行文本编码器解码时，int8 权重直调 GEMV、未量化的小投影走 `torch.mv`；关闭后两者都回到分派层。
 - `w4a8`：4-bit 权重解码；`status()` 会打印实际调用次数和当前后端（`hip` / `asm` / `triton`），换 checkpoint 后可据此确认是否真的走到了 w4a8 内核（`on: 0 calls ...` 表示权重布局没被识别）。能否用 `tl.dot` 替代 `v_dot4` 的实测结论见 [docs/PORTING.md 附录 E](PORTING.md)。
 - `textgen`：一次控制 DeltaNet 内核、KV decode 折叠、llama RMSNorm/RoPE 缓存、Qwen3.5 计算类；关闭时逐调用委托回 core 实现（Qwen3.5 类符号本身不换回）。
+- `int8_gemm`：行数 ≥ 128 的 int8 线性交给自带 HIP dot4 GEMM，`off` 强制回 Triton；详见下节。
+- `int8_attn` / `int8_attn_rotate`：comfy-kitchen 的 int8 注意力契约（默认关）及其 Q/K 量化前的
+  Hadamard 旋转（`off` / `64` / `128`，默认 128）；数值代价与实测见 [PATCHES.md](PATCHES.md)、
+  [HIP_KERNELS.md](HIP_KERNELS.md)。
+- `qwen21_int8_cache`：Qwen-Image 2.1 的 int8 prefix cache K/V 保持 int8、直接在 int8 内核上算
+  注意力（默认关）；实测见 [HIP_KERNELS.md](HIP_KERNELS.md)。
 
 ### 在其它显卡上使用 / 扫描 int8 tile
 
@@ -47,7 +57,7 @@ CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`imag
 
 给其它架构写 HIP 内核见 [docs/HIP_KERNELS.md](HIP_KERNELS.md)。
 
-最短路径：先用节点默认值跑通（没跑过 bench 的卡上测量门功能是关的），再运行一次 `python custom_nodes/ComfyUI-GPU-Tuning/tools/bench.py --all --write`。它测出这张卡的 int8 tile，以及 GEMV / w4a8 / deltanet（含 prefill）/ vae / convrot / vision 的开或关，写进 `~/.config/comfy-gpu-tune/arch/<gcn>/manifest.toml`，之后启动不再 autotune。attention 只打印证据不写记录：`hip` 是默认模式（下面有实测，内核随包分发），本机 HIP 装不上它时回落到 `int8` 并在启动日志提示重编，其余模式仍可在节点里手选。想知道时间落在哪一段（而不是哪个内核快）用 `tools/chain_profile.py`，见 [docs/PORTING.md](PORTING.md)。
+最短路径：先用节点默认值跑通（没跑过 bench 的卡上测量门功能是关的），再运行一次 `python custom_nodes/ComfyUI-GPU-Tuning/tools/bench.py --all --write`。它测出这张卡的 int8 tile，以及 GEMV / w4a8 / deltanet（含 prefill）/ vae / convrot / vision 的开或关，写进 `~/.config/comfy-gpu-tune/arch/<gcn>/manifest.toml`，之后启动不再 autotune。attention 只打印证据不写记录：`hip` 是默认模式（下面有实测，内核随包分发），本机 HIP 装不上它时回落到 `gemm` 并在启动日志提示重编，其余模式仍可在节点里手选。想知道时间落在哪一段（而不是哪个内核快）用 `tools/chain_profile.py`，见 [docs/PORTING.md](PORTING.md)。
 
 ### 注意力模式怎么选
 
@@ -56,6 +66,12 @@ CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`imag
 | `hip`（默认） | fp32 累加，rel ≈ 2.5–3.3e-4 | 每个实测形状都最快（对 `gemm` 1.3–3.5x，对本机默认 `sub_quad` 1.5–5.5x），且只占输出显存 10–27 MiB。只支持 D=64/128 |
 | `gemm` | fp16 score 物化，rel ≈ 5.6e-4 | 任意 head_dim 都能用（含 SD1.5 的 40、SD2.1 的 80），`hip` 装不上时的默认；也会拷 58–630 MiB 的 score/连续副本 |
 | `hand` | fp16 累加，rel ≈ 2.8e-4 | Triton 内核，时间与 `gemm` 同级但只占 1–27 MiB；`hip` 不可用时的低显存选择 |
+
+`default` 已经是本机最快路径（`.so` 装得上走 `hip`，否则 `gemm`），日常不用手选。下拉里的
+`basic` / `pytorch` / `sub_quad` / `split` 以及 core 注册的其它后端名（`comfy_kitchen_int8`、
+`sage` 等）是 ComfyUI 自带实现，选中后原样转发，**只作为 A/B 基线和特殊契约/显式请求的入口**：
+其中 fp32 的几个在本卡明显更慢（`pytorch` 的 SDPA 只有 math 后端），`comfy_kitchen_int8`
+另由 `int8_attn` 控制（默认关）。保留它们也是 `contiguous` 开关和 `fp16_attn=off` 的落点。
 
 `int8` 与 `int8qk` 两档已删除：真实 SDXL 形状上它们比 `hip` 慢（4096²：13.4 / 15.3 对 8.5 ms）
 且 relL2 差 30 倍（7.7e-3 对 2.1e-4），实测没有任何一个形状赢过 `hip`。原先"`hip` 装不上时
@@ -93,20 +109,21 @@ CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`imag
 m ≤ 1 的解码仍走 GEMV；m < 128 直接回落 Triton（128 行 tile 在更小 m 上会浪费行）。
 `int8_gemm=off` 可强制回到 Triton；`.so` 在本机装不上时该开关自动无效。
 
-`basic` / `pytorch` / `sub_quad` / `split` 是 ComfyUI 自带实现，选中后原样转发，
-用于对比。注意 `pytorch`（SDPA）在 gfx906 上只有 math 后端，通常不是最快。
-
 ## 开关
 
-开关都在节点里（GPU Tuning Model Settings / GPU Tuning CLIP Settings），`default` 用内置默认值，
-`on/off` 显式覆盖，下一次执行生效，不回落任何环境变量。
+开关都在节点里（GPU Tuning Model Settings / GPU Tuning CLIP Settings），`default` 用内置默认值
+或 manifest 判定，`on/off` 显式覆盖，下一次执行生效。`textgen` / `int8_attn` /
+`qwen21_int8_cache` / `int8_attn_rotate` 的 `default` 沿用启动时的环境变量值。
 
-环境变量只剩两类：节点执行前的总闸，以及没有节点入口的诊断/基准旋钮。
+环境变量分三类：整包总闸、少数开关的启动值、以及没有节点入口的诊断/基准/移植旋钮。
+下表是全集；移植与内核细节另见 [PORTING.md](PORTING.md) 和 [HIP_KERNELS.md](HIP_KERNELS.md)。
+`__init__.py` 导入时还 `setdefault("TRITON_DEFAULT_FP_FUSION", "1")`：Triton 3.10 会把默认改成关，
+本包所有实测都假设 fusion 开；显式设置该变量仍优先，它不是本包的开关。
 
 | 变量 | 默认 | 作用 |
 |---|---|---|
 | `COMFY_GPU_TUNE` | `1` | `off` 整包关闭；补丁在节点执行前安装，这是唯一总闸 |
-| `COMFY_GPU_TUNE_FORCE` | 空 | 逗号分隔，在非目标架构上单独放行 `deltanet` / `qwen35` / `w4a8` / `attention`（启动会 WARNING：这些内核不是在当前卡上测的） |
+| `COMFY_GPU_TUNE_FORCE` | 空 | 逗号分隔的 feature 名，跳过实测判定直接安装：`vision` / `deltanet` / `deltanet_prefill` / `qwen35` / `w4a8` / `te_dequant`（启动会 WARNING：这些内核不是在当前卡上测的） |
 | `COMFY_GPU_TUNE_TE_DEQUANT` | 空 | te=default 的寄存器内反量化门：`on`/`off` 覆盖 manifest 的 `feature.te_dequant`；关闭时 te=default 回到逐调用反量化，并自动关掉 TE 图捕获（反量化副本会被图钉 ~21 GB） |
 | `COMFY_GPU_TUNE_TILE_CONFIG` | 空 | 手工实测的大 tile，设置后该卡视为已实测（跳过 autotune）；不设时用 manifest 的 `int8_gemm.tile/large` |
 | `COMFY_GPU_TUNE_SMALL_TILE_CONFIG` | 空 | 手工实测的窄 tile，替换候选/强制值 |
@@ -114,11 +131,18 @@ m ≤ 1 的解码仍走 GEMV；m < 128 直接回落 Triton（128 行 tile 在更
 | `COMFY_GPU_TUNE_W4A8_ASM` | `auto` | 4-bit GEMV 后端：`auto` 编译探测 / `on` 强制 asm / `off` 跳过 asm（还有 HIP 扩展时仍用 HIP，见下一行） |
 | `COMFY_GPU_TUNE_W4A8_HIP` | `auto` | 节点目录下的 `w4a8_hip` 扩展：`auto` 有就用 / `off` 忽略它，让 `W4A8_ASM` 的 off 真正落到 per-group tl.dot |
 | `COMFY_GPU_TUNE_MEASURED` | `1` | 用 `arch/<gcn>/manifest.toml` 的实测记录按形状选后端；`0` 关掉这一层，回到纯探测 |
+| `COMFY_GPU_TUNE_MANIFEST_DIR` | `~/.config/comfy-gpu-tune` | manifest 根目录；本机实测表放这里的 `arch/<gcn>/manifest.toml`。见 [PORTING.md](PORTING.md) |
+| `COMFY_GPU_TUNE_ARCH` | 空 | 强制指定目标架构目录（没插卡开发用）。见 [PORTING.md](PORTING.md) |
+| `COMFY_GPU_TUNE_ARCH_KERNELS` | 空 | 追加内核 `.so` 搜索目录。见 [PORTING.md](PORTING.md) |
 | `COMFY_GPU_TUNE_DELTANET` | `1` | textgen 分项基准旋钮：DeltaNet 解码 Triton 内核 |
 | `COMFY_GPU_TUNE_KVDECODE` | `1` | 同上：折叠 GQA 的 KV decode |
 | `COMFY_GPU_TUNE_LLAMA` | `1` | 同上：llama RMSNorm 预计算 + RoPE 频率表 |
 | `COMFY_GPU_TUNE_QWEN35` | `1` | 同上：Qwen3.5 计算类替换（等价改写，逐方法对过 core） |
 | `COMFY_GPU_TUNE_GRAPH` | `1` | textgen 分项基准旋钮：权重常驻时的逐块 CUDA graph（也跟随 CLIP 节点的 `textgen` 开关） |
+| `COMFY_GPU_TUNE_INT8_ATTN` | `0` | int8 注意力契约（checkpoint 标记 / int8 minimax VAE）的启动值；节点 `int8_attn=default` 沿用，`on`/`off` 覆盖 |
+| `COMFY_GPU_TUNE_INT8_ATTN_ROTATE` | `128` | int8 注意力 Q/K 量化前的 Hadamard 旋转组：`off`/`0` 关，或 32/64/128；节点 `int8_attn_rotate=default` 沿用 |
+| `COMFY_GPU_TUNE_QWEN21_INT8_CACHE` | `0` | Qwen-Image 2.1 int8 prefix cache 保持 K/V 为 int8 的启动值；节点 `qwen21_int8_cache=default` 沿用 |
+| `COMFY_GPU_TUNE_F16_GEMM` | `1`/`0` | 非量化 fp16 linear 的 HIP GEMM；`off` 强制关掉做 A/B。缺省值由 manifest 的 `feature.f16_gemm` 决定，未实测卡为 `0`。见 [HIP_KERNELS.md](HIP_KERNELS.md) |
 | `COMFY_GPU_TUNE_ROTATE` | `1` | 解码激活旋转的 HIP butterfly 内核；`off` 回落到 Triton 做 A/B。fp16 输入下 HIP 以 fp32 累加，量化激活更准但与 Triton 不等价 |
 | `COMFY_GPU_TUNE_W4A16_HIP` | `1` | te=default 4-bit 反量化 GEMV 的 HIP 内核（`arch/gfx906/kernels/w4a16.cu`，m=1 与 m=2..8 两个入口）；`off` 回落到 Triton 的 `dequant_w4a16_kernel` 做 A/B。m>8 或不合形状的批仍走 Triton |
 | `COMFY_GPU_TUNE_W4A16_F16ACT` | `0` | 只管**带 codebook** 的检查点是否用 fp16 激活 + `v_dot2_f32_f16` 的 feed（`w4a16_gemv_h`，m=1..8，比无损 feed 快 1.05-4.89x）；代价是 16 个格点退到 fp16（fp32 输出归一化 1.6-2.6e-4、fp16 输出约 1.5 ulp），开启前按 `--sampling off` 重验生文 md5。无 codebook 的检查点不看这个开关，默认就走该 feed（均匀格点在 fp16 里精确） |

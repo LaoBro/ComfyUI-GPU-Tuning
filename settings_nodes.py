@@ -21,8 +21,8 @@ class GpuTuningModelSettings(io.ComfyNode):
             category="advanced/debug",
             description=(
                 "Runtime settings for the GPU Tuning pack. Values take effect on the next execution, "
-                "no restart needed. Wire it between the model loader and the sampler. Every switch is "
-                "three-state: default keeps the built-in default, on/off overrides it."
+                "no restart needed. Wire it between the model loader and the sampler. Most switches "
+                "are three-state (default/on/off); a few are mode choices."
             ),
             inputs=[
                 io.Model.Input("model"),
@@ -36,21 +36,23 @@ class GpuTuningModelSettings(io.ComfyNode):
                                        "up to ~630 MiB); hand is the fp16 Triton kernel (same 10-27 MiB footprint "
                                        "as hip, but slower). The int8 tiers were dropped: measured slower than "
                                        "hip at every image shape and 30x less accurate. basic, pytorch, sub_quad, "
-                                       "split and any other backend core registered are ComfyUI's own functions."),
+                                       "split and any other backend core registered are ComfyUI's own functions, "
+                                       "kept only for A/B baselines and explicit requests; the fp32 ones are "
+                                       "slower here (pytorch/SDPA is math-only on gfx906). default already "
+                                       "picks the fastest path (hip when the .so loads, else gemm)."),
                 io.Combo.Input("contiguous", options=list(TRISTATE), default="default",
                                tooltip="When a backend name is selected: transpose to [B,H,S,D] and "
                                        ".contiguous() before calling it. Core hands SDPA/bmm transpose views "
                                        "instead, which measures 4-15x slower on gfx906. Turn off to reproduce "
                                        "core's exact call for comparison on other GPUs. No effect on the "
                                        "hip/hand kernels (they build their own layouts)."),
-                io.Combo.Input("fp16", options=list(TRISTATE), default="default",
-                               tooltip="Cast fp32/bf16 attention inputs to fp16. The hip and hand kernels "
-                                       "are fp16-only and error out instead of running when this is off; the "
-                                       "backend names then run in the model's own dtype."),
-                io.Combo.Input("amax_guard", options=list(TRISTATE), default="default",
-                               tooltip="Skip the fp16 cast when the attention input's abs-max would overflow "
-                                       "fp16 (>= 60000) and leave it in the model dtype instead. default keeps "
-                                       "the built-in on state; off casts unconditionally."),
+                io.Combo.Input("fp16_attn", options=["force", "guarded", "off"], default="guarded",
+                               tooltip="How Q/K/V reach the attention kernels. guarded (default): cast "
+                                       "fp32/bf16 inputs to fp16 unless their abs-max would overflow "
+                                       "(>= 60000), in which case the call falls back to core instead. "
+                                       "force: cast unconditionally, even if it overflows. off: leave the "
+                                       "inputs in the model dtype; hip/gemm/hand are fp16-only and raise, "
+                                       "so pick a core backend name (basic/pytorch/sub_quad/split) with off."),
                 io.Combo.Input("convrot", options=["default"] + list(CONVROT_MODES), default="default",
                                tooltip="default keeps the built-in mode. fused = rotation + int8 quantize in "
                                        "one kernel, butterfly = rotation only, off = the original matmul."),
@@ -110,11 +112,17 @@ class GpuTuningModelSettings(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, attention: str, contiguous: str, fp16: str, amax_guard: str,
+    def execute(cls, model, attention: str, contiguous: str, fp16_attn: str,
                 convrot: str, int8_tile: str, small_batch: str, int8_gemm: str, int8_attn: str,
                 int8_attn_rotate: str, qkv: str, vae: str,
                 gemv: str, prefix_kv: str, qwen21_int8_cache: str, profile: str) -> io.NodeOutput:
         apply()
+        if fp16_attn == "force":
+            fp16, amax_guard = "on", "off"
+        elif fp16_attn == "off":
+            fp16, amax_guard = "off", "on"
+        else:
+            fp16, amax_guard = "on", "on"
         configure(attention=attention, fp16=fp16, convrot=convrot,
                   profile=profile, contiguous=contiguous, qkv=qkv,
                   vae=vae, gemv=gemv, prefix_kv=prefix_kv, amax_guard=amax_guard,
