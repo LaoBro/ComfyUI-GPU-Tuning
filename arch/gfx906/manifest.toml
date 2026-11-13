@@ -57,6 +57,10 @@ default_grade = "measured"
 default = "on"
 default_grade = "measured"
 
+[sites."feature.vae_t"]
+default = "on"
+default_grade = "measured"
+
 # Non-quantized fp16 linear: the self-written v_dot2 GEMM beats rocBLAS on big
 # aligned shapes (SDXL UNet linear is 66% of forward; ~1.18x end-to-end measured).
 [sites."feature.f16_gemm"]
@@ -66,6 +70,13 @@ default_grade = "measured"
 [sites."vae.decode".shapes]
 "c512x64" = { impl = "conv2d", ms = { conv2d = 0.628644, torch = 2.7541 }, grade = "measured", date = "2026-11-05", note = "depth-1 conv3d, fp16, padding 0" }
 "c512x128" = { impl = "conv2d", ms = { conv2d = 2.42322, torch = 7.90901 }, grade = "measured", date = "2026-11-05", note = "depth-1 conv3d, fp16, padding 0" }
+
+[sites."vae.decode_t".shapes]
+"c64xd4x32xkt3" = { impl = "split_t", ms = { split_t = 0.23104, torch = 0.2816 }, grade = "measured", date = "2026-11-13", note = "depth>1 conv3d, fp16, padding 0" }
+"c128xd4x32xkt3" = { impl = "split_t", ms = { split_t = 0.24128, torch = 0.52928 }, grade = "measured", date = "2026-11-13", note = "depth>1 conv3d, fp16, padding 0" }
+"c512xd4x32xkt3" = { impl = "split_t", ms = { split_t = 1.02672, torch = 3.04432 }, grade = "measured", date = "2026-11-13", note = "depth>1 conv3d, fp16, padding 0" }
+"c256xd8x32xkt3" = { impl = "split_t", ms = { split_t = 0.817119, torch = 3.93712 }, grade = "measured", date = "2026-11-13", note = "depth>1 conv3d, fp16, padding 0" }
+"c256xd4x32xkt3c2" = { impl = "split_t", ms = { split_t = 0.5808, torch = 2.4368 }, grade = "measured", date = "2026-11-13", note = "causal front-pad conv3d, fp16" }
 
 [sites."convrot.mode"]
 default = "fused"

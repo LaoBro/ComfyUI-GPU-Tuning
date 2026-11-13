@@ -192,6 +192,7 @@ prefix KV 复用、profiler（常开）；qkv（1.6 GB 常驻，默认关）、q
 | `convrot` | 不安装 | kitchen matmul 旋转 vs butterfly vs fused，写 `feature.convrot` + `convrot.mode` |
 | `w4a16_valu` | 走 `tab[16]` 表格 | 均匀格点 m=2..4 的表格 gather vs VALU 格点，深队列计时，写 `feature.w4a16_valu` + `w4a16.valu` |
 | `vae` | 不安装 | depth-1 Conv3d 三方计时，写 `feature.vae` |
+| `vae_t` | 不安装 | 多帧 Conv3d 拆成逐 T 的 Conv2d 累加，`--vae-t` 写 `feature.vae_t` + `vae.decode_t` |
 | `image_tower` | 包装器总装，默认看 `feature.vision` | patch 投影三种走法，写 `vision.patch_embed` |
 | `qkv` | 默认关 | 纯权衡，不归测量门 |
 
@@ -199,8 +200,8 @@ prefix KV 复用、profiler（常开）；qkv（1.6 GB 常驻，默认关）、q
 `feature.w4a8` 的安装判定。非 gfx906 上 asm 探测会自动失败、落到 per-group
 `tl.dot`；但显式 `COMFY_GPU_TUNE_W4A8_ASM=on` 会跳过探测，实际调用时报编译错误。
 
-`feature.*` 由 bench 写七项：`gemv`、`w4a8`、`deltanet`、`deltanet_prefill`、
-`vae`、`vision`、`convrot`。不写三项：`attention`（质量取舍）、`qwen35`、
+`feature.*` 由 bench 写八项：`gemv`、`w4a8`、`deltanet`、`deltanet_prefill`、
+`vae`、`vae_t`、`vision`、`convrot`。不写三项：`attention`（质量取舍）、`qwen35`、
 `te_dequant`（表里那行手写，bench 无对应站点）。
 
 ## C. manifest 结构
@@ -263,6 +264,8 @@ schema 不符、TOML 语法错、单条记录类型不对都只影响那一条�
   再和 kitchen fused op 同时计时。对端不可用时只记自己的耗时。
 - **vae**：depth-1 Conv3d 三方计时（torch conv3d / conv2d squeeze / kitchen
   `fp16_conv3d`），padding 0 以便可比。
+- **vae_t**：多帧 Conv3d 拆成逐 T 的 Conv2d 累加，与 `F.conv3d` 比，写 `feature.vae_t`。
+  `causal_zero` 只在单帧触发；多帧因果卷积由调用方前置补零后按普通 conv3d 进入同一拆分。
 - **convrot**：kitchen matmul 旋转+量化 vs butterfly 两步 vs fused 单内核。
 - **qwen35**：合成 4 层小模型（约 240M 参数），同一套权重跑两遍，gate 关逐字调用
   core 的方法。fp32 下 1e-3 门槛是真正的等价性检查。只出证据。

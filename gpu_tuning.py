@@ -113,6 +113,7 @@ _state = {
     "prefix_kv": False,
     "reason": "",
     "vae_enabled": True,
+    "vae_t_enabled": False,
     "vae_patched": False,
     "vision_enabled": False,
     "vision_patched": False,
@@ -2269,6 +2270,38 @@ def patch_qwen21_int8_cache():
     return True
 
 
+def split_t_conv3d(input, weight, bias, stride, padding, dilation, groups):
+    """A depth>1 Conv3d as a sum of one Conv2d per depth tap.
+
+    Only a unit depth dilation is expressible; anything else returns None so
+    the caller delegates to the shipped Conv3d.
+    """
+    if dilation[0] != 1 or input.ndim != 5 or weight.ndim != 5:
+        return None
+    kt = weight.shape[2]
+    if kt < 2 or input.shape[2] + 2 * padding[0] < kt:
+        return None
+    n, c, d, h, w = input.shape
+    sd, pad_t = stride[0], padding[0]
+    d_out = (d + 2 * pad_t - kt) // sd + 1
+    if d_out < 1:
+        return None
+    x = torch.nn.functional.pad(input, (0, 0, 0, 0, pad_t, pad_t)) if pad_t else input
+    out = None
+    for t in range(kt):
+        frames = x[:, :, t : t + (d_out - 1) * sd + 1 : sd][:, :, :d_out]
+        if frames.shape[2] != d_out:
+            return None
+        flat = frames.permute(0, 2, 1, 3, 4).reshape(n * d_out, c, h, w)
+        part = torch.nn.functional.conv2d(
+            flat, weight[:, :, t], None, stride[1:], padding[1:], dilation[1:], groups)
+        part = part.reshape(n, d_out, *part.shape[1:]).permute(0, 2, 1, 3, 4)
+        out = part if out is None else out + part
+    if bias is not None:
+        out = out + bias.reshape(1, -1, 1, 1, 1)
+    return out
+
+
 def patch_vae():
     """Run depth-1 Conv3d as Conv2d.
 
@@ -2279,8 +2312,15 @@ def patch_vae():
     decode time. Squeezing the depth axis makes them ordinary conv2d calls that
     land on the fp16 MIOpen kernels: 2.31 s -> 1.09 s at 1024x1024.
 
-    The switch is read in the hot path, so the node can turn it off without a
-    reload; the shipped Conv3d path is still reachable when the gate is off.
+    Multi-frame (K_T>1) convs with unit depth dilation are split into K_T Conv2d
+    taps and summed (split_t_conv3d), gated by feature.vae_t. Core only sends
+    autopad="causal_zero" on a single frame (the weight is truncated to one tap
+    there); multi-frame causal convs arrive pre-padded as ordinary conv3d and
+    take the same split. tools/bench.py --vae-t carries the evidence. Anything
+    else still delegates to the shipped Conv3d.
+
+    The depth-1 switch is read in the hot path, so the node can turn it off
+    without a reload; the shipped Conv3d path is reachable when a gate is off.
     """
     import comfy.ops
 
@@ -2291,14 +2331,26 @@ def patch_vae():
     _state["vae_patched"] = True
 
     def _conv_forward(self, input, weight, bias, autopad=None, *args, **kwargs):
-        if _state.get("vae_enabled", True):
-            if autopad == "causal_zero":
+        depth1 = _state.get("vae_enabled", True)
+        temporal = _state.get("vae_t_enabled", False)
+        if depth1 or temporal:
+            causal = autopad == "causal_zero"
+            if causal:
                 weight = weight[:, :, -input.shape[2]:, :, :]
                 autopad = None
-            if input.ndim == 5 and input.shape[2] == 1 and weight.shape[2] == 1:
+            if (depth1 and input.ndim == 5 and input.shape[2] == 1
+                    and weight.shape[2] == 1):
                 return torch.nn.functional.conv2d(
                     input[:, :, 0], weight[:, :, 0], bias, self.stride[1:],
                     self.padding[1:], self.dilation[1:], self.groups).unsqueeze(2)
+            if (temporal and input.ndim == 5 and weight.shape[2] > 1
+                    and self.dilation[0] == 1
+                    and input.dtype in (torch.float16, torch.bfloat16, torch.float32)
+                    and weight.dtype == input.dtype):
+                out = split_t_conv3d(input, weight, bias, self.stride, self.padding,
+                                     self.dilation, self.groups)
+                if out is not None:
+                    return out
         return original(self, input, weight, bias, autopad=autopad, *args, **kwargs)
 
     conv3d._conv_forward = _conv_forward
@@ -2424,7 +2476,9 @@ def apply():
         _install("f16 gemm", patch_f16_linear)
     if feature_on("convrot"):
         _install("convrot", patch_convrot)
-    if feature_on("vae"):
+    _state["vae_enabled"] = feature_on("vae")
+    _state["vae_t_enabled"] = feature_on("vae_t")
+    if _state["vae_enabled"] or _state["vae_t_enabled"]:
         _install("vae", patch_vae)
     # the image tower belongs to the text encoder, but whether its conv3d and fp32
     # cast cost anything is a per-card fact: the wrappers are always installed so
@@ -2633,7 +2687,8 @@ def status():
         gemv_line,
         text_gemv_line,
         w4a8_line,
-        f"vae {'conv3d as conv2d' if _state.get('vae_patched') and _state.get('vae_enabled') else ('off (patched)' if _state.get('vae_patched') else 'off')}",
+        f"vae {'conv3d as conv2d' if _state.get('vae_patched') and _state.get('vae_enabled') else ('off (patched)' if _state.get('vae_patched') else 'off')}"
+        + f", t {'split conv2d' if _state.get('vae_t_enabled') else 'off'}",
         f"textgen {textgen_summary()}"
         + f", prefill {'block' if _state['delta_prefill_enabled'] else 'core loop'}",
         f"attention {_state['attn_kernel'] if _state['attention'] else 'off'}"

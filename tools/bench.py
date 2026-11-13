@@ -19,7 +19,7 @@
 --all is what fills a card's measurement gates: after one run the int8 linear
 list holds a single tile, attention has a tile per head dim and a measured
 kernel mode, the GEMV sites have a winner per shape, and every feature whose
-fastest form differs per card (gemv, w4a8, deltanet, vae, convrot, w4a16_valu,
+fastest form differs per card (gemv, w4a8, deltanet, vae, vae_t, convrot, w4a16_valu,
 vision) has an on/off record against its real fallback.
 
 The pipeline per shape is fixed, in this order:
@@ -117,6 +117,8 @@ DELTANET_PREFILL_SHAPES = "1x32x128x128x1024,1x32x128x128x2223,1x32x128x128x4096
 # tier-3 features whose fastest form differs per card without being kernels.
 VAE_SITE = "vae.decode"
 VAE_SHAPES = "512x64,512x128"
+VAE_T_SHAPES = "64x4x32x3,128x4x32x3,512x4x32x3,256x8x32x3,256x4x32x3x2"
+VAE_T_SITE = "vae.decode_t"
 CONVROT_SITE = "convrot.mode"
 CONVROT_SHAPES = "1x4096,128x4096"
 # Uniform-grid W4A16 multi-row GEMV: tab[16] LDS gather vs VALU-built levels.
@@ -215,13 +217,18 @@ def parse_args():
                         help="prefill length used for the comparison")
     parser.add_argument("--all", action="store_true",
                         help="the whole table in one run: --tile + --attention + --deltanet + "
-                             "--vae + --convrot + --w4a16-valu + --vision + --qwen35 + the GEMV sites")
+                             "--vae + --vae-t + --convrot + --w4a16-valu + --vision + --qwen35 + the GEMV sites")
     parser.add_argument("--deltanet-shapes", default=DELTANET_SHAPES,
                         help="BxHVxDKxDVxS list for the DeltaNet decode benchmark")
     parser.add_argument("--deltanet-prefill-shapes", default=DELTANET_PREFILL_SHAPES,
                         help="BxHVxDKxDVxS list for the DeltaNet prefill chunk-rule benchmark")
     parser.add_argument("--vae-shapes", default=VAE_SHAPES,
                         help="channels x size list for the depth-1 Conv3d benchmark")
+    parser.add_argument("--vae-t", action="store_true",
+                        help="time depth>1 Conv3d as a sum of Conv2d taps; "
+                             "writes feature.vae_t and vae.decode_t records")
+    parser.add_argument("--vae-t-shapes", default=VAE_T_SHAPES,
+                        help="channels x depth x size x kt [x causal front-pad frames] list for --vae-t")
     parser.add_argument("--vision-shapes", default=VISION_SHAPES,
                         help="patches x embed list for the image tower patch projection benchmark")
     parser.add_argument("--convrot-shapes", default=CONVROT_SHAPES,
@@ -1091,6 +1098,70 @@ def run_vae_site(args, today):
     return records, defaults
 
 
+def run_vae_t_site(args, today):
+    """Time depth>1 Conv3d against the per-depth-tap Conv2d split.
+
+    Writes feature.vae_t: an unmeasured card keeps the shipped im2col+bmm
+    path, and one bench run turns the split on where it wins.
+    """
+    import gpu_tuning
+
+    records, ratios = {}, []
+    for item in args.vae_t_shapes.split(","):
+        fields = item.strip().split("x")
+        c, d, size, kt = (int(v) for v in fields[:4])
+        front = int(fields[4]) if len(fields) > 4 else 0
+        key = f"c{c}xd{d}x{size}xkt{kt}" + (f"c{front}" if front else "")
+        gen = torch.Generator(device="cuda").manual_seed(0)
+        x = torch.randn(1, c, d + front, size, size, device="cuda", dtype=torch.float16,
+                        generator=gen)
+        if front:
+            x[:, :, :front] = 0
+        weight = (torch.randn(c, c, kt, 3, 3, device="cuda", dtype=torch.float16,
+                              generator=gen) * 0.02)
+        bias = torch.randn(c, device="cuda", dtype=torch.float16, generator=gen) * 0.01
+        expected = torch.nn.functional.conv3d(x, weight, bias, stride=1)
+        print(f"\n  {key} ({'causal multi-frame' if front else 'T>1 Conv3d'})")
+        candidates = [
+            ("torch", lambda: torch.nn.functional.conv3d(x, weight, bias, stride=1)),
+            ("split_t", lambda: gpu_tuning.split_t_conv3d(
+                x, weight, bias, (1, 1, 1), (0, 0, 0), (1, 1, 1), 1)),
+        ]
+        times = {}
+        for name, fn in candidates:
+            try:
+                out = fn()
+                torch.cuda.synchronize()
+            except Exception as exc:                       # noqa: BLE001
+                print(f"    {name:<8} unavailable: {type(exc).__name__}: {exc}")
+                continue
+            if out is None:
+                print(f"    {name:<8} declined the shape")
+                continue
+            error = refs.rel(out, expected)
+            if error > args.max_rel:
+                print(f"    {name:<8} REJECTED: rel {error:.2e} > {args.max_rel:.0e}")
+                continue
+            times[name] = bench_ms(fn, args.iters, args.warmup)
+            print(f"    {name:<8} {times[name] * 1000:8.1f} us  rel {error:.1e}")
+        if "torch" not in times or "split_t" not in times:
+            continue
+        ratios.append(times["split_t"] / times["torch"])
+        print(f"    split_t / torch = {ratios[-1]:.2f}x")
+        records.setdefault(VAE_T_SITE, {})[key] = manifest_write.render(
+            key, min(times, key=times.get), times, date=today,
+            note="causal front-pad conv3d, fp16" if front else "depth>1 conv3d, fp16, padding 0")
+    defaults = {}
+    if ratios:
+        gain = 1.0 - statistics.median(ratios)
+        defaults["feature.vae_t"] = "on" if gain >= args.min_gain else "off"
+        print(f"\n  vae_t: split conv2d {gain:+.1%} against torch, "
+              f"feature.vae_t={defaults['feature.vae_t']}")
+    else:
+        print("\n  vae_t: nothing comparable measured, leaving feature.vae_t alone")
+    return records, defaults
+
+
 def run_vision_site(args, today):
     """Time the Qwen3.5 image tower's patch projection three ways.
 
@@ -1412,7 +1483,7 @@ def main():
     # attention records matter wherever the node installs the attention patch
     tile_unused = tuning.native_covers("int8_linear")
     attn_unused = not tuning.is_amd()
-    sites = args.site or list(SITES)
+    sites = args.site or ([] if args.vae_t else list(SITES))
     unknown = [site for site in sites if site not in SITES]
     if unknown:
         print(f"unknown site(s) {unknown}; known: {sorted(SITES)}")
@@ -1463,6 +1534,10 @@ def main():
         defaults.update(choices)
     if args.vae or args.all:
         records, choices = run_vae_site(args, today)
+        written.update(records)
+        defaults.update(choices)
+    if args.vae_t or args.all:
+        records, choices = run_vae_t_site(args, today)
         written.update(records)
         defaults.update(choices)
     if args.vision or args.all:
