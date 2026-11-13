@@ -200,8 +200,10 @@ def summary(clock_before=None, clock_after=None):
             f" + int8_linear {linear_ms / 1000:.2f} s"
             f" + other {(forward - attention_ms - linear_ms) / 1000:.2f} s"
         )
+    # the first prompt after profile is switched on has no clock_before, but its
+    # counters still say what ran, so report them either way
+    lines.extend(line for provider in _providers for line in provider())
     if clock_before is not None:
-        lines.extend(line for provider in _providers for line in provider())
         lines.append(
             f"clock ref {clock_before:.2f} -> {clock_after:.2f} ms (4096^3 fp16 matmul, before/after the prompt; "
             "lower is faster, so a rising value means the GPU throttled)"

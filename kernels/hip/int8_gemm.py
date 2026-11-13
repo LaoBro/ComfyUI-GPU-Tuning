@@ -50,14 +50,19 @@ def linear(x, weight, weight_scale, bias=None, out_dtype=torch.float16, convrot=
     """int8 linear for large row counts, or None to let the caller fall through."""
     if _load() is None:
         return None
-    if input_act is not None or residual is not None:
+    if residual is not None:
         return None
-    if out_dtype not in (torch.float16, torch.bfloat16):
+    if out_dtype not in (torch.float16, torch.bfloat16, torch.float32):
         return None
     if not isinstance(x, torch.Tensor) or not x.is_contiguous():
         return None
     if weight.dtype != torch.int8 or weight.dim() != 2 or not weight.is_contiguous():
         return None
+    if input_act not in (None, "none"):
+        # the same eager activation the Triton path applies, so only the GEMM
+        # implementation differs; swiglu also halves the row to match K
+        from comfy_kitchen.backends._activations import apply_input_act
+        x = apply_input_act(x, input_act, input_act_weight, input_act_eps)
     k = weight.shape[1]
     n = weight.shape[0]
     if x.shape[-1] != k:
@@ -91,11 +96,11 @@ def linear(x, weight, weight_scale, bias=None, out_dtype=torch.float16, convrot=
 
     out = torch.empty((m, n), device=x.device, dtype=out_dtype)
     stream = torch.cuda.current_stream().cuda_stream
+    dtype_code = 2 if out_dtype is torch.float32 else (1 if out_dtype is torch.bfloat16 else 0)
     rc = _LIB.gfx906_int8_gemm(x8.data_ptr(), xs.data_ptr(), weight.data_ptr(),
                                weight_scale.data_ptr(), int(scalar),
                                bias.data_ptr() if bias is not None else None,
-                               out.data_ptr(), m, n, k,
-                               1 if out_dtype is torch.bfloat16 else 0,
+                               out.data_ptr(), m, n, k, dtype_code,
                                ctypes.c_void_p(stream))
     if rc != 0:
         raise RuntimeError(f"gfx906 HIP int8 gemm launch failed ({rc})")

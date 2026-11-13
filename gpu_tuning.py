@@ -892,6 +892,7 @@ def _routed_int8_linear(previous):
             out = select_int8_gemv(x, weight, weight_scale, bias, out_dtype, input_act, residual,
                                    convrot_groupsize if convrot else 0)
             if out is not None:
+                _state["int8_gemv_prompt"] = _state.get("int8_gemv_prompt", 0) + 1
                 return out
         gemm = _state.get("hip_gemm_module")
         if gemm is not None and _state.get("int8_gemm_enabled", True):
@@ -899,7 +900,9 @@ def _routed_int8_linear(previous):
                               input_act, input_act_weight, input_act_eps, residual, residual_scale)
             if out is not None:
                 _state["hip_gemm_calls"] = _state.get("hip_gemm_calls", 0) + 1
+                _state["int8_gemm_prompt"] = _state.get("int8_gemm_prompt", 0) + 1
                 return out
+        _state["int8_tile_prompt"] = _state.get("int8_tile_prompt", 0) + 1
         select_int8_tile(rows)
         return previous(x, weight, weight_scale, bias, out_dtype, convrot, convrot_groupsize,
                         input_act, input_act_weight, input_act_eps, residual, residual_scale)
@@ -1165,13 +1168,13 @@ def patch_f16_linear():
 def _hip_attention():
     """The gfx906 HIP attention extension module, or None when it is not built."""
     try:
-        from . import hip_attention
+        from .kernels.hip import attention
     except ImportError:
         try:
-            import hip_attention
+            from kernels.hip import attention
         except ImportError:
             return None
-    return hip_attention
+    return attention
 
 
 def patch_attention():
@@ -2589,7 +2592,7 @@ def _bench(fn, iters=5, warmup=3):
 
 
 def report_lines():
-    """One-shot lines for the profiler: attention casts and int8 prefix cache hits."""
+    """One-shot lines for the profiler: attention casts and kernel routing."""
     lines = []
     cast = _state["attn_cast"]
     if cast:
@@ -2604,6 +2607,11 @@ def report_lines():
         lines.append(f"qwen21 int8 cache: {calls} attention calls / {takes} int8 takes this prompt"
                      f" (total {_state.get('qwen21_int8_calls', 0)}/"
                      f"{_state.get('qwen21_take_calls', 0)})")
+    if _state.get("int8_linear"):
+        gemm = _state.pop("int8_gemm_prompt", 0)
+        gemv = _state.pop("int8_gemv_prompt", 0)
+        tile = _state.pop("int8_tile_prompt", 0)
+        lines.append(f"int8 linear: {gemm} hip gemm / {gemv} gemv / {tile} triton this prompt")
     return lines
 
 

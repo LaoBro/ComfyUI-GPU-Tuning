@@ -63,6 +63,8 @@ template <>
 __device__ __forceinline__ hip_bfloat16 to_out<hip_bfloat16>(float v) {
     return hip_bfloat16(v);
 }
+template <>
+__device__ __forceinline__ float to_out<float>(float v) { return v; }
 
 template <typename OutT, bool ALIGNED_K>
 __global__ void __launch_bounds__(NT, LBPB)
@@ -213,11 +215,13 @@ static void launch_int8(const void* x8, const void* xs, const void* w8, const vo
 
 extern "C" int gfx906_int8_gemm(const void* x8, const void* xs, const void* w8,
                                 const void* ws, int ws_scalar, const void* bias, void* out,
-                                int M, int N, int K, int out_bf16, void* stream) {
+                                int M, int N, int K, int out_dtype, void* stream) {
     if (M <= 0 || N <= 0 || K <= 0) return -2;
     const int tiles = cdiv(M, BM) * cdiv(N, BN);
     hipStream_t st = (hipStream_t)stream;
-    if (out_bf16)
+    if (out_dtype == 2)
+        launch_int8<float>(x8, xs, w8, ws, ws_scalar, bias, out, M, N, K, tiles, st);
+    else if (out_dtype == 1)
         launch_int8<hip_bfloat16>(x8, xs, w8, ws, ws_scalar, bias, out, M, N, K, tiles, st);
     else
         launch_int8<__half>(x8, xs, w8, ws, ws_scalar, bias, out, M, N, K, tiles, st);

@@ -44,6 +44,8 @@ CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`imag
 - `w4a8`：4-bit 权重解码；`status()` 会打印实际调用次数和当前后端（`hip` / `asm` / `triton`），换 checkpoint 后可据此确认是否真的走到了 w4a8 内核（`on: 0 calls ...` 表示权重布局没被识别）。能否用 `tl.dot` 替代 `v_dot4` 的实测结论见 [docs/PORTING.md 附录 E](PORTING.md)。
 - `textgen`：默认 on，一次控制 DeltaNet 内核、KV decode 折叠、llama RMSNorm/RoPE 缓存、Qwen3.5 计算类；关闭时逐调用委托回 core 实现（Qwen3.5 类符号本身不换回）。不连该节点时由分项 env 决定。
 - `int8_gemm`：行数 ≥ 128 的 int8 线性交给自带 HIP dot4 GEMM，`off` 强制回 Triton；详见下节。
+  开 `profile` 后每次 prompt 的 profiler 报告会打印本次 hip gemm / gemv / triton 三路的次数；
+  带 `input_act`（SwiGLU / gelu / rms_norm）的调用也走 HIP GEMM，只有 `residual` 回落 triton。
 - `int8_attn` / `int8_attn_rotate`：comfy-kitchen 的 int8 注意力契约（默认 off）及其 Q/K 量化前的
   Hadamard 旋转（`off` / `64` / `128`，默认 128）；数值代价与实测见 [PATCHES.md](PATCHES.md)、
   [HIP_KERNELS.md](HIP_KERNELS.md)。
