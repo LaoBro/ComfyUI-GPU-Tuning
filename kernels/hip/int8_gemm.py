@@ -17,6 +17,7 @@ import torch
 from .. import runtime
 
 _LIB = None
+_V2 = None
 _PROBED = False
 
 # The 128-row tile wastes rows below this; measured parity up to 32 rows and a
@@ -25,7 +26,7 @@ MIN_ROWS = 128
 
 
 def _load():
-    global _LIB, _PROBED
+    global _LIB, _V2, _PROBED
     if _PROBED:
         return _LIB
     _PROBED = True
@@ -36,8 +37,22 @@ def _load():
     lib.gfx906_int8_gemm.argtypes = ([ctypes.c_void_p] * 4 + [ctypes.c_int, ctypes.c_void_p,
                                                              ctypes.c_void_p]
                                      + [ctypes.c_int] * 4 + [ctypes.c_void_p])
+    v2 = getattr(lib, "gfx906_int8_gemm_v2", None)
+    if v2 is not None:
+        v2.restype = ctypes.c_int
+        v2.argtypes = ([ctypes.c_void_p] * 4 + [ctypes.c_int, ctypes.c_void_p,
+                                                ctypes.c_void_p]
+                       + [ctypes.c_int] * 4 + [ctypes.c_void_p, ctypes.c_void_p,
+                                               ctypes.c_void_p])
+        _V2 = v2
     _LIB = lib
     return lib
+
+
+def supports_residual():
+    """Whether the loaded library has the v2 residual epilogue."""
+    _load()
+    return _V2 is not None
 
 
 def available():
@@ -48,9 +63,10 @@ def linear(x, weight, weight_scale, bias=None, out_dtype=torch.float16, convrot=
            convrot_groupsize=256, input_act=None, input_act_weight=None, input_act_eps=0.0,
            residual=None, residual_scale=None):
     """int8 linear for large row counts, or None to let the caller fall through."""
-    if _load() is None:
+    lib = _load()
+    if lib is None:
         return None
-    if residual is not None:
+    if residual is not None and _V2 is None:
         return None
     if out_dtype not in (torch.float16, torch.bfloat16, torch.float32):
         return None
@@ -97,11 +113,29 @@ def linear(x, weight, weight_scale, bias=None, out_dtype=torch.float16, convrot=
     out = torch.empty((m, n), device=x.device, dtype=out_dtype)
     stream = torch.cuda.current_stream().cuda_stream
     dtype_code = 2 if out_dtype is torch.float32 else (1 if out_dtype is torch.bfloat16 else 0)
-    rc = _LIB.gfx906_int8_gemm(x8.data_ptr(), xs.data_ptr(), weight.data_ptr(),
-                               weight_scale.data_ptr(), int(scalar),
-                               bias.data_ptr() if bias is not None else None,
-                               out.data_ptr(), m, n, k, dtype_code,
-                               ctypes.c_void_p(stream))
+    if residual is None:
+        rc = _LIB.gfx906_int8_gemm(x8.data_ptr(), xs.data_ptr(), weight.data_ptr(),
+                                   weight_scale.data_ptr(), int(scalar),
+                                   bias.data_ptr() if bias is not None else None,
+                                   out.data_ptr(), m, n, k, dtype_code,
+                                   ctypes.c_void_p(stream))
+    else:
+        if (not isinstance(residual, torch.Tensor) or residual.dtype != out_dtype
+                or not residual.is_contiguous()
+                or tuple(residual.shape) != (*x.shape[:-1], n) or residual_scale is None):
+            return None
+        rs = residual_scale.reshape(-1)
+        if rs.numel() != n:
+            return None
+        if rs.dtype != torch.float32:
+            rs = rs.float()
+        if not rs.is_contiguous():
+            rs = rs.contiguous()
+        rc = _V2(x8.data_ptr(), xs.data_ptr(), weight.data_ptr(),
+                 weight_scale.data_ptr(), int(scalar),
+                 bias.data_ptr() if bias is not None else None,
+                 out.data_ptr(), m, n, k, dtype_code,
+                 residual.data_ptr(), rs.data_ptr(), ctypes.c_void_p(stream))
     if rc != 0:
         raise RuntimeError(f"gfx906 HIP int8 gemm launch failed ({rc})")
     return out.view(*x.shape[:-1], n)

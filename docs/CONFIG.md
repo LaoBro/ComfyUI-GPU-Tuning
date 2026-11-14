@@ -9,7 +9,7 @@
 
 | 节点 | 位置 | 作用 |
 |---|---|---|
-| **GPU Tuning Model Settings** | 模型链（加载器 → 采样器之间） | 注意力模式、连续布局、fp16 输入策略、convrot、int8 tile、`m≤8` 窄 tile、int8 大 m GEMM、int8 注意力与旋转、QKV、VAE、GEMV、prefix KV、Qwen2.1 int8 缓存、profiler |
+| **GPU Tuning Model Settings** | 模型链（加载器 → 采样器之间） | 注意力模式、连续布局、fp16 输入策略、convrot、int8 tile、`m≤8` 窄 tile、int8 大 m GEMM、int8 注意力与旋转、QKV、VAE、GEMV、prefix KV、Qwen2.1 int8 缓存 / fp16 全前向、linear_input_act int8、profiler |
 | **GPU Tuning CLIP Settings** | CLIP 链（加载器 → 编码） | 文本编码器 int8、编码器注意力后端、TE GEMV、4-bit w4a8、文本生成补丁组 |
 
 设置节点改动**下一次执行就生效**，不用重启。命令行复测 `benchmark()` 已删除：它没有节点注册、也没有任何调用者，长期是死代码；需要复测时直接用 `gfx906fix/` 下的独立脚本，避免再维护第三个节点。
@@ -27,7 +27,7 @@
 
 ### 节点开关清单
 
-Model Settings：`attention`、`contiguous`、`fp16_attn`、`convrot`、`int8_tile`、`small_batch`、`int8_gemm`、`int8_attn`、`int8_attn_rotate`、`qkv`、`vae`、`gemv`、`prefix_kv`、`qwen21_int8_cache`、`profile`。
+Model Settings：`attention`、`contiguous`、`fp16_attn`、`convrot`、`int8_tile`、`small_batch`、`int8_gemm`、`int8_attn`、`int8_attn_rotate`、`qkv`、`vae`、`gemv`、`prefix_kv`、`qwen21_int8_cache`、`profile`、`qwen21_fp16`、`int8_linear_act`、`qwen21_residual_fuse`。
 
 CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`image_tower`、`textgen`。
 
@@ -38,6 +38,10 @@ CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`imag
   回落 core（fp16 上限 65504，留余量）；`force` 无条件转，可能溢出；`off` 保持模型 dtype，自带
   hip/gemm/hand 是 fp16-only 会报错，需配 core 后端名使用。旧版 `fp16` / `amax_guard` 已并入此开关，
   旧工作流需重新连接。
+- `convrot`：`fused` 把蝶形旋转和 int8 量化合成一个 kernel。fp16/bf16 也会走融合路径，
+  条件是 K 为 2 的幂且组数 ≤32（K≤8192）；K=12288 的 MLP 下投影仍走 `butterfly`+量化。
+  `butterfly` 保留旧的两次读写路径，`off` 回到原始 matmul；M=4032 fp16 实测 K=4096
+  0.196 → 0.149 ms（1.3x），且少了中间 fp16 舍入、结果更接近 fp32 旋转。
 - `int8_tile`：关闭后恢复上游 autotune 的 tile 列表，不再注入 gfx906 的 `128×256×32`；GEMV 仍由 `gemv` 单独控制。
 - `small_batch`：gfx906 上把“`m≤8` 切到 `16×32×64` 窄 tile、`m>8` 切回 `128×256×32`”单独控制；其它 AMD 上表示“把窄 tile 追加为 autotune 候选”（是否真的用它由该卡实测决定）。需要 `int8_tile` 为 on，否则显示 n/a。GEMV 仍由 `gemv` 单独控制。
 - `text_gemv`：单行文本编码器解码时，int8 权重直调 GEMV、未量化的小投影走 `torch.mv`；关闭后两者都回到分派层。
@@ -45,7 +49,8 @@ CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`imag
 - `textgen`：默认 on，一次控制 DeltaNet 内核、KV decode 折叠、llama RMSNorm/RoPE 缓存、Qwen3.5 计算类；关闭时逐调用委托回 core 实现（Qwen3.5 类符号本身不换回）。不连该节点时由分项 env 决定。
 - `int8_gemm`：行数 ≥ 128 的 int8 线性交给自带 HIP dot4 GEMM，`off` 强制回 Triton；详见下节。
   开 `profile` 后每次 prompt 的 profiler 报告会打印本次 hip gemm / gemv / triton 三路的次数；
-  带 `input_act`（SwiGLU / gelu / rms_norm）的调用也走 HIP GEMM，只有 `residual` 回落 triton。
+  带 `input_act`（SwiGLU / gelu / rms_norm）的调用也走 HIP GEMM；`residual` 走 v2 epilogue
+  （需要新版 `libgfx906_int8.so`，旧库回落 triton）。
 - `int8_attn` / `int8_attn_rotate`：comfy-kitchen 的 int8 注意力契约（默认 off）及其 Q/K 量化前的
   Hadamard 旋转（`off` / `64` / `128`，默认 128）；数值代价与实测见 [PATCHES.md](PATCHES.md)、
   [HIP_KERNELS.md](HIP_KERNELS.md)。
@@ -53,6 +58,24 @@ CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`imag
   注意力（默认关）；实测见 [HIP_KERNELS.md](HIP_KERNELS.md)。开 `profile` 后每次 prompt 的
   profiler 报告会打印本次的 int8 注意力调用数与 int8 `take()` 次数（括号内为进程累计），
   `0 calls` 表示本次回落 fp16 反量化路径；`status()` 里显示的是累计值。
+- `qwen21_fp16`（默认 on）：Qwen-Image 2.1 的 DiT 输入是 bf16 时，把 hidden states / context /
+  参考图 latent 一次性转 fp16 跑整个 forward，出口转回原 dtype。gfx906 上 bf16 是 fp32 模拟，
+  fp16 是原生快路径；64×64 latent 实测 7.92 → 3.83 s（2.07x），输出比 bf16 更接近 fp32。
+  带守卫：fp16 结果出现非有限值就清掉 prefix cache、用原 dtype 重跑本次调用。已经是 fp16/fp32
+  的模型不动；只在没有原生 bf16 的卡（gfx906 等，`should_use_bf16` 为 False）安装，其它卡显示 n/a。
+- `int8_linear_act`（默认 on）：所有 `comfy.ops.linear_input_act` 调用点（SwiGLU / GeGLU 下投影、
+  预归一化块）在 int8 权重与激活 dtype 不一致时保持权重量化。shipped 路径用
+  `compute_dtype=x.dtype` 走 `cast_bias_weight`，gfx906 上“dtype 表不含 fp16 → bf16 激活 +
+  fp32 manual cast”的模型（Qwen-Image 2.1、LTXV、MiniMaxH3 等）因此每块先 requantize 再
+  dequantize，退化成 bf16 rocBLAS GEMM。on 直接调 int8 内核（`swiglu`/`gelu_tanh`/`rms_norm`
+  和 `residual` 都支持）；dtype 本来就一致的调用原样委托，所以 Flux、Wan 默认 fp16、fp32
+  运行测量不变。Qwen-Image 2.1 64×64 latent 实测 7.92 → 3.34 s（2.37x）。
+- `qwen21_residual_fuse`（默认 on）：把 Qwen-Image 2.1 的 gated residual（`x += gate * layer_out`）
+  融进 int8 GEMM 的 epilogue（attention 的 `to_out` 和 SwiGLU 下投影各一次），省掉单独的
+  `addcmul` 和每次约 66 MB 的往返。需要 `libgfx906_int8.so` 里的 v2 residual epilogue；
+  4032 token 实测 MLP down 14.66 → 14.56 ms、to_out 5.02 → 4.99 ms，整步约 0.1%
+  （低于本包的测量噪声）。只有全 prefix 或全 target（`prefix_len == 0` 或等于行数）的调用能融合，
+  prefix+target 混合的首次 pass 仍走 `_gated_residual`。
 
 ### 在其它显卡上使用 / 扫描 int8 tile
 

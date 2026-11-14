@@ -135,6 +135,12 @@ _state = {
     "int8_attn_patched": False,
     "qwen21_int8_cache": False,
     "qwen21_int8_patched": False,
+    "qwen21_fp16": True,
+    "qwen21_fp16_patched": False,
+    "int8_linear_act": True,
+    "int8_linear_act_patched": False,
+    "qwen21_residual_fuse": True,
+    "qwen21_residual_patched": False,
     "int8_tile_enabled": True,
     "small_batch_enabled": True,
     "tile_measured": False,
@@ -225,6 +231,23 @@ def arch_name():
 
 def is_amd():
     return torch.version.hip is not None and torch.cuda.is_available()
+
+
+def bf16_is_emulated():
+    """True on AMD cards without native bf16 (gfx906 and other old parts).
+
+    comfy's own gate already answers this per card: should_use_bf16 is False
+    for gfx900/906 and RDNA2, and True where bf16 is a hardware path. Only the
+    emulated case wants the qwen21 fp16 forward; on a native bf16 card the
+    cast would trade precision for nothing.
+    """
+    if not is_amd():
+        return False
+    try:
+        import comfy.model_management
+        return not comfy.model_management.should_use_bf16(comfy.model_management.get_torch_device())
+    except Exception:
+        return False
 
 
 def native_backend():
@@ -1505,7 +1528,17 @@ def _hip_int8_attention():
 
 
 def patch_convrot():
-    """Replace the O(n^2) convrot rotation matmul with an O(n log n) butterfly."""
+    """Replace the O(n^2) convrot rotation matmul with an O(n log n) butterfly.
+
+    When K is a power of two of at most 32 groups, the butterfly and the int8
+    per-row quantizer are one kernel (convrot_quantize): the row is rotated in
+    fp32 registers and written straight out as int8 + scale, instead of the
+    butterfly writing an fp16/bf16 intermediate that the quantizer reads back.
+    Measured at M=4032 on fp16: K=4096 0.196 -> 0.149 ms, K=2048 0.108 -> 0.084
+    ms (1.3x); skipping the fp16 intermediate also makes the quantized value
+    slightly closer to an fp32 rotation. Larger K (the MLP down projection at
+    12288 = 48 groups) keeps the two-pass butterfly.
+    """
     from comfy_kitchen.backends.triton import quantization
 
     if not _triton_available("convrot"):
@@ -1533,7 +1566,7 @@ def patch_convrot():
         if mode == "off" or group_size != CONVROT_GROUP or x.shape[-1] % CONVROT_GROUP or x.dtype not in (torch.float32, torch.float16, torch.bfloat16):
             return original(x, h, group_size)
         groups = x.shape[-1] // CONVROT_GROUP
-        if mode == "fused" and x.dtype == torch.float32 and groups <= FUSED_MAX_GROUPS and not groups & (groups - 1):
+        if mode == "fused" and groups <= FUSED_MAX_GROUPS and not groups & (groups - 1):
             return convrot_quantize(x.reshape(-1, x.shape[-1]))
         return hadamard_rotate(x)
 
@@ -1605,7 +1638,8 @@ def configure(attention=None, convrot=None, profile=None, text_encoder=None,
               fp16=None, text_attention=None, contiguous=None, qkv=None,
               vae=None, gemv=None, textgen=None, prefix_kv=None, text_gemv=None, w4a8=None,
               amax_guard=None, int8_tile=None, small_batch=None, image_tower=None,
-              int8_gemm=None, int8_attn=None, int8_attn_rotate=None, qwen21_int8_cache=None):
+              int8_gemm=None, int8_attn=None, int8_attn_rotate=None, qwen21_int8_cache=None,
+              qwen21_fp16=None, int8_linear_act=None, qwen21_residual_fuse=None):
     """Runtime settings, used by the GPU Tuning nodes.
 
     Every argument is three-state: None/"default" keeps the built-in default
@@ -1673,6 +1707,12 @@ def configure(attention=None, convrot=None, profile=None, text_encoder=None,
         _state["prefix_kv_enabled"] = resolve_flag(prefix_kv, True)
     if qwen21_int8_cache is not None:
         _state["qwen21_int8_cache"] = resolve_flag(qwen21_int8_cache, False)
+    if qwen21_fp16 is not None:
+        _state["qwen21_fp16"] = resolve_flag(qwen21_fp16, True)
+    if int8_linear_act is not None:
+        _state["int8_linear_act"] = resolve_flag(int8_linear_act, True)
+    if qwen21_residual_fuse is not None:
+        _state["qwen21_residual_fuse"] = resolve_flag(qwen21_residual_fuse, True)
     if text_gemv is not None:
         _state["text_gemv_enabled"] = resolve_flag(text_gemv, True)
     if w4a8 is not None:
@@ -2275,6 +2315,260 @@ def patch_qwen21_int8_cache():
     return True
 
 
+def _int8_linear_act(linear, x, input_act, act_weight=None, act_eps=0.0,
+                     residual=None, residual_scale=None):
+    """``linear(act(x))`` with the int8 weight left quantized, or None.
+
+    comfy.ops.linear_input_act hands cast_bias_weight ``compute_dtype=x.dtype``,
+    so when the weight's orig_dtype differs from the activation dtype (the
+    gfx906 case: an fp32 manual-cast model with bf16 activations) the cast
+    requantizes the int8 weight from float and then dequantizes it. The fused
+    int8 path never runs and the projection becomes a full bf16/fp16 GEMM.
+
+    The gate is the mismatch itself: when the two dtypes already agree the
+    shipped function keeps the QuantizedTensor, so this returns None and the
+    caller delegates unchanged. That makes the patch a no-op on cards/models
+    where manual_cast != activation dtype, and only takes over the wasteful
+    requantize->dequantize case (Qwen-Image 2.1, LTXV, MiniMaxH3, and any other
+    linear_input_act site with that combination).
+
+    Returns None when the weight is not a plain int8 layout or the dtypes
+    match.
+    """
+    import comfy.model_management
+    import comfy.ops
+    from comfy import quant_ops
+    from comfy_kitchen.tensor import QuantizedTensor
+    from comfy.quant_ops import TensorWiseINT8Layout
+
+    weight = linear.weight
+    if (comfy.model_management.in_training
+            or not isinstance(weight, QuantizedTensor)
+            or isinstance(x, QuantizedTensor)
+            or weight._layout_cls != "TensorWiseINT8Layout"
+            or weight.dtype == x.dtype
+            or getattr(weight._params, "transposed", False)
+            or getattr(linear, "_full_precision_mm", False)
+            or len(linear.weight_function) or len(linear.bias_function)):
+        return None
+    w, bias, stream = comfy.ops.cast_bias_weight(
+        linear, x, offloadable=True, dtype=weight.dtype, bias_dtype=x.dtype,
+        compute_dtype=x.dtype, want_requant=True)
+    try:
+        if not isinstance(w, QuantizedTensor):
+            return None
+        qdata, scale = TensorWiseINT8Layout.get_plain_tensors(w)
+        return quant_ops.ck.int8_linear(
+            x, qdata, scale, bias, x.dtype,
+            convrot=getattr(w._params, "convrot", False),
+            convrot_groupsize=getattr(w._params, "convrot_groupsize", 256),
+            input_act=input_act, input_act_weight=act_weight,
+            input_act_eps=act_eps, residual=residual,
+            residual_scale=residual_scale)
+    finally:
+        comfy.ops.uncast_bias_weight(linear, w, bias, stream)
+
+
+def patch_int8_linear_act():
+    """Keep int8 weights quantized at every ``comfy.ops.linear_input_act`` site.
+
+    One choke point covers the MLP down projections and pre-norm blocks of
+    Qwen-Image 2.1, LTXV, MiniMaxH3, Wan and the llama text encoder. On the
+    measured gfx906 shape the Qwen-Image 2.1 SwiGLU down projection alone goes
+    from a 151 ms/block bf16 rocBLAS GEMM to the int8 kernel: 7.92 -> 3.34 s
+    per forward (2.37x) with no change to the activation dtype.
+
+    The wrapper only takes the call when _int8_linear_act sees the dtype
+    mismatch that makes the shipped path dequantize; everything else goes to
+    the shipped function untouched, so models that already stay int8 (Flux,
+    Wan's default fp16, fp32 runs) measure identical. The switch is live.
+    """
+    import comfy.ops
+
+    if getattr(comfy.ops, "_gfx906_linear_act", False):
+        return True
+    original = comfy.ops.linear_input_act
+
+    def linear_input_act(linear, x, input_act, act_weight=None, act_eps=0.0,
+                         residual=None, residual_scale=None):
+        if _state.get("int8_linear_act", True):
+            out = _int8_linear_act(linear, x, input_act, act_weight, act_eps,
+                                   residual, residual_scale)
+            if out is not None:
+                _state["int8_linear_act_calls"] = _state.get("int8_linear_act_calls", 0) + 1
+                return out
+        return original(linear, x, input_act, act_weight, act_eps, residual, residual_scale)
+
+    comfy.ops.linear_input_act = linear_input_act
+    comfy.ops._gfx906_linear_act = True
+    _state["int8_linear_act_patched"] = True
+    return True
+
+
+def patch_qwen21_fp16():
+    """Run the Qwen-Image 2.1 DiT in fp16 when it came in as bf16.
+
+    gfx906 emulates bf16 in fp32 and has no fast bf16 rocBLAS tile, while fp16
+    is the card's native path. Casting the whole forward once (hidden states,
+    context, reference latents) also makes the int8 linears' out_dtype fp16 and
+    their convrot rotation fp16, instead of one cast at the attention boundary.
+    Measured at 64x64 latent: 7.92 -> 3.83 s per forward (2.07x); the output is
+    closer to an fp32 run than the bf16 baseline is (cosine 0.9945 vs 0.9880).
+
+    Only bf16 inputs are touched (fp16/fp32 models keep their dtype) and the
+    patch is installed only where comfy reports bf16 as emulated (gfx906 and
+    other old AMD), so a native-bf16 card never pays for the cast. Like the
+    attention cast this is guarded: if the fp16 pass produces a non-finite
+    output the prefix cache is dropped and the call is rerun in the model dtype.
+    """
+    import comfy.ldm.qwen_image21.model as qwen
+
+    cls = qwen.QwenImage21Transformer2DModel
+    if getattr(cls, "_gfx906_qwen21_fp16", False):
+        return True
+    original = cls._forward
+
+    def _forward(self, x, timesteps, context, ref_latents=None, image_slots=None,
+                 transformer_options={}, **kwargs):
+        if not _state.get("qwen21_fp16", True) or x.dtype != torch.bfloat16:
+            return original(self, x, timesteps, context, ref_latents, image_slots,
+                            transformer_options, **kwargs)
+        half_ctx = (context.half() if isinstance(context, torch.Tensor)
+                    and context.is_floating_point() else context)
+        half_refs = [r.half() for r in ref_latents] if ref_latents is not None else ref_latents
+        out = original(self, x.half(), timesteps, half_ctx, half_refs, image_slots,
+                       transformer_options, **kwargs)
+        if torch.isfinite(out).all():
+            _state["qwen21_fp16_calls"] = _state.get("qwen21_fp16_calls", 0) + 1
+            return out.to(x.dtype)
+        # overflowed past the block clamp: drop the fp16 prefix cache (it was
+        # filled from the failed pass) and rerun this call in the model dtype
+        if not _state.get("qwen21_fp16_overflow_logged"):
+            _state["qwen21_fp16_overflow_logged"] = True
+            logging.warning("gpu-tune: qwen21 fp16 forward overflowed; rerunning in %s. "
+                            "Set qwen21_fp16=off to skip the retry", x.dtype)
+        self.reset_prefix_cache(self.prefix_cache_enabled)
+        return original(self, x, timesteps, context, ref_latents, image_slots,
+                        transformer_options, **kwargs)
+
+    cls._forward = _forward
+    cls._gfx906_qwen21_fp16 = True
+    _state["qwen21_fp16_patched"] = True
+    return True
+
+
+def _residual_fusion_ready():
+    """True when the loaded int8 GEMM has the v2 residual epilogue."""
+    gemm = _state.get("hip_gemm_module")
+    return bool(gemm is not None and getattr(gemm, "supports_residual", lambda: False)())
+
+
+def _uniform_gate(gate, prefix_len, rows):
+    """The per-channel gate that covers every row, flattened to [D], or None.
+
+    gate is the (prefix, target) pair from _split_rows. The int8 epilogue takes
+    one residual_scale for the whole tile, so only an all-prefix or all-target
+    call can use it; the mixed first pass keeps the separate addcmul.
+    """
+    if prefix_len == 0:
+        return gate[1].reshape(-1)
+    if prefix_len == rows:
+        return gate[0].reshape(-1)
+    return None
+
+
+def _attn_with_residual(attn, residual, scale, *args, **kwargs):
+    """Run attention with its to_out GEMM adding the gated residual.
+
+    Returns (attention result, whether the residual was fused). The to_out
+    module's bound forward is shadowed for the duration of the call so the
+    shipped Attention.forward body is not duplicated.
+    """
+    to_out = attn.to_out[0]
+    plain = to_out.forward
+    used = [False]
+
+    def forward(x):
+        out = _int8_linear_act(to_out, x, None, residual=residual, residual_scale=scale)
+        if out is None:
+            return plain(x)
+        used[0] = True
+        return out
+
+    to_out.forward = forward
+    try:
+        result = attn(*args, **kwargs)
+    finally:
+        del to_out.forward
+    return result, used[0]
+
+
+def patch_qwen21_residual():
+    """Fuse the Qwen-Image 2.1 gated residuals into the int8 GEMM epilogue.
+
+    The block does x += gate * layer_out twice; both layer outputs come from an
+    int8 GEMM whose epilogue can do that. The kernel's v2 export takes
+    ``residual + rscale[n] * out`` (the same form as comfy_kitchen's
+    _apply_residual), so the separate addcmul kernel and its 66 MB round trip
+    per residual go away. Measured on gfx906 at the 4032-token shape: the MLP
+    down GEMM 14.66 -> 14.56 ms, to_out 5.02 -> 4.99 ms (~0.1% of the whole
+    step, below the pack's measurement noise); the switch is live, off restores
+    the shipped block. Only all-prefix or all-target calls fuse (one scale
+    covers every row); the mixed first pass keeps _gated_residual.
+    """
+    import comfy.ldm.qwen_image21.model as qwen
+    import comfy.ops
+
+    cls = qwen.QwenImage21TransformerBlock
+    if getattr(cls, "_gfx906_residual", False):
+        return True
+    original = cls.forward
+    gated = qwen._gated_residual
+    modulated = qwen._modulated_norm
+
+    def forward(self, x, mod, pe, attn_fn, prefix_len, transformer_options={}):
+        if not _state.get("qwen21_residual_fuse", True) or not _residual_fusion_ready():
+            return original(self, x, mod, pe, attn_fn, prefix_len, transformer_options)
+        scale1, gate1, scale2, gate2, zero = mod
+        normed = modulated(self.img_norm1, x, scale1, prefix_len, zero)
+        g = _uniform_gate(gate1, prefix_len, x.shape[1])
+        if g is None:
+            x = gated(x, self.attn(normed, pe, attn_fn, prefix_len, transformer_options),
+                      gate1, prefix_len)
+        else:
+            y, used = _attn_with_residual(self.attn, x, g, normed, pe, attn_fn,
+                                          prefix_len, transformer_options)
+            if used:
+                x = y
+                _state["qwen21_residual_calls"] = _state.get("qwen21_residual_calls", 0) + 1
+            else:
+                x = gated(x, y, gate1, prefix_len)
+        normed = modulated(self.img_norm2, x, scale2, prefix_len, zero)
+        g = _uniform_gate(gate2, prefix_len, x.shape[1])
+        fused = None
+        if g is not None and getattr(self.img_mlp, "fused", False):
+            gate_up = self.img_mlp.gate_up(normed)
+            fused = _int8_linear_act(self.img_mlp.out, gate_up, "swiglu",
+                                     residual=x, residual_scale=g)
+            if fused is None:
+                x = gated(x, comfy.ops.linear_input_act(self.img_mlp.out, gate_up, "swiglu"),
+                          gate2, prefix_len)
+            else:
+                _state["qwen21_residual_calls"] = _state.get("qwen21_residual_calls", 0) + 1
+        else:
+            x = gated(x, self.img_mlp(normed), gate2, prefix_len)
+        if fused is not None:
+            x = fused
+        if x.dtype == torch.float16:
+            x.clamp_(-65504, 65504)
+        return x
+
+    cls.forward = forward
+    cls._gfx906_residual = True
+    _state["qwen21_residual_patched"] = True
+    return True
+
+
 def split_t_conv3d(input, weight, bias, stride, padding, dilation, groups):
     """A depth>1 Conv3d as a sum of one Conv2d per depth tap.
 
@@ -2502,7 +2796,11 @@ def apply():
         _state["gemv_module"] = _install("int8 gemv", load_int8_gemv)
     _state["gemv_model"] = feature_on("gemv")
     _install("prefix kv", patch_prefix_kv)
+    _install("int8 linear_act", patch_int8_linear_act)
     _install("qwen21 int8 cache", patch_qwen21_int8_cache)
+    if bf16_is_emulated():
+        _install("qwen21 fp16", patch_qwen21_fp16)
+    _install("qwen21 residual", patch_qwen21_residual)
     # before any prompt runs: the queue thread binds execute_async when a prompt
     # starts, so a hook installed later would only report from the next one
     _install("prompt hook", _patch_prompt_end)
@@ -2700,6 +2998,18 @@ def status():
          + (f", {_state.get('qwen21_int8_calls', 0)} calls" if _state.get("qwen21_int8_calls") else "")
          + ("" if _state.get("qwen21_int8_cache") else " (fp16 dequant path)"))
         if _state.get("qwen21_int8_patched") else "qwen21 int8 cache n/a",
+        (f"qwen21 fp16 {'on' if _state.get('qwen21_fp16') else 'off'}"
+         + (f", {_state.get('qwen21_fp16_calls', 0)} calls" if _state.get("qwen21_fp16_calls") else ""))
+        if _state.get("qwen21_fp16_patched") else "qwen21 fp16 n/a",
+        (f"int8 linear_act {'on' if _state.get('int8_linear_act') else 'off'}"
+         + (f", {_state.get('int8_linear_act_calls', 0)} calls"
+            if _state.get("int8_linear_act_calls") else ""))
+        if _state.get("int8_linear_act_patched") else "int8 linear_act n/a",
+        (f"qwen21 residual fused {'on' if _state.get('qwen21_residual_fuse') else 'off'}"
+         + (f", {_state.get('qwen21_residual_calls', 0)} gemms"
+            if _state.get("qwen21_residual_calls") else "")
+         + ("" if _residual_fusion_ready() else ", kernel v2 missing"))
+        if _state.get("qwen21_residual_patched") else "qwen21 residual n/a",
         gemv_line,
         text_gemv_line,
         w4a8_line,

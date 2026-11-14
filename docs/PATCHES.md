@@ -11,6 +11,8 @@
    在 gfx906 上换成 128×256×32、4 warps、2 stages。单 token 解码（m ≤ 8）另走一套窄 tile，
    见下面「文本生成」。
 2. **convrot 融合**：蝶形 Hadamard 旋转与 int8 量化合成一个 kernel（原本两次全局读写）。
+   fp16/bf16 现在也走融合路径（K 为 2 的幂且 ≤8192）；K=12288 的 MLP 下投影因寄存器上限
+   仍走 butterfly+quantize。M=4032、fp16 实测 K=4096 0.196 → 0.149 ms、K=2048 0.108 → 0.084 ms（1.3x）。
 3. **注意力入口**：把 `[B,S,H,D]` 统一转 fp16 + 连续布局，再分发给选中的后端。
    可选 `hip` / `hand` / `gemm`，以及 ComfyUI 自带的 `basic` /
    `pytorch` / `sub_quad` / `split` 等全部后端。
@@ -33,6 +35,15 @@
 - **int8 tile 注入**：`int8_tile` 关闭时恢复上游 autotune 列表，不再注入 gfx906 tile；
   `small_batch` 单独控制 `m≤8` 的窄 tile 切换。
 - **prefix KV 复用**：`prefix_kv` 关闭时 `prefix_cached_attention` 回到 `torch.cat`。
+- **qwen21 fp16 全前向**：`qwen21_fp16`（默认 on）在模型本身是 bf16 时把整个 DiT forward
+  一次转 fp16，出口转回；64×64 latent 实测 7.92 → 3.83 s（2.07x），输出比 bf16 更接近 fp32。
+- **int8 linear_act 保持量化**：`int8_linear_act`（默认 on）包住所有
+  `comfy.ops.linear_input_act` 调用点，权重 orig_dtype 与激活 dtype 不一致（gfx906 上 bf16
+  激活 + fp32 manual cast）时不再 requantize→dequantize，SwiGLU/GeGLU 下投影留在 int8
+  内核上；Qwen-Image 2.1 实测 7.92 → 3.34 s（2.37x），dtype 一致的调用不受影响。
+- **qwen21 residual 融合**：`qwen21_residual_fuse`（默认 on）把 `x += gate * layer_out` 融进
+  `libgfx906_int8.so` 的 v2 residual epilogue（attention `to_out` + MLP down），省掉单独的
+  `addcmul`；4032 token 实测两个 GEMM 各快约 0.6%，整步约 0.1%（低于测量噪声）。
 - **int8 前缀缓存**：`qwen21_int8_cache` 让 Qwen-Image 2.1 的 int8 缓存 K/V 保持
   int8 直接进注意力内核（原路径每块反量化成 fp16）：4058+4032 token、32 head、
   d128 实测 51.2 → 34.2 ms/块（1.50x），输出 relL2 1.1e-2。默认关。

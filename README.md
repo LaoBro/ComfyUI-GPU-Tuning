@@ -60,7 +60,7 @@ textgen deltanet on, kvdecode on, llama on, qwen35 on
 `int8_attn_rotate` / `text_encoder` / `text_attention` 是模式或数值选择。文本生成的分项
 `COMFY_GPU_TUNE_*` 只在没连节点时生效，连上节点后完全由节点控制。
 
-Model Settings：`attention`、`contiguous`、`fp16_attn`、`convrot`、`int8_tile`、`small_batch`、`int8_gemm`、`int8_attn`、`int8_attn_rotate`、`qkv`、`vae`、`gemv`、`prefix_kv`、`qwen21_int8_cache`、`profile`。
+Model Settings：`attention`、`contiguous`、`fp16_attn`、`convrot`、`int8_tile`、`small_batch`、`int8_gemm`、`int8_attn`、`int8_attn_rotate`、`qkv`、`vae`、`gemv`、`prefix_kv`、`qwen21_int8_cache`、`qwen21_fp16`、`int8_linear_act`、`qwen21_residual_fuse`、`profile`。
 
 CLIP Settings：`text_encoder`、`text_attention`、`text_gemv`、`w4a8`、`image_tower`、`textgen`。
 

@@ -56,7 +56,9 @@ class GpuTuningModelSettings(io.ComfyNode):
                                        "so pick a core backend name (basic/pytorch/sub_quad/split) with off."),
                 io.Combo.Input("convrot", options=["default"] + list(CONVROT_MODES), default="default",
                                tooltip="default keeps the built-in mode. fused = rotation + int8 quantize in "
-                                       "one kernel, butterfly = rotation only, off = the original matmul."),
+                                       "one kernel, butterfly = rotation only, off = the original matmul. fused "
+                                       "covers fp32/fp16/bf16 when K is a power of two with at most 32 groups "
+                                       "(K<=8192); the K=12288 MLP down projection keeps butterfly + quantize."),
                 io.Combo.Input("int8_tile", options=["on", "off"], default="on",
                                tooltip="Keep the gfx906 int8 tile (128x256x32, 4 warps, 2 stages) in the "
                                        "kitchen autotune list. on keeps the injected tiles; off "
@@ -108,6 +110,33 @@ class GpuTuningModelSettings(io.ComfyNode):
                                        "keeps the fp16 path."),
                 io.Combo.Input("profile", options=["on", "off"], default="off",
                                tooltip="Print the tuning status once and per-call timings when each prompt finishes."),
+                io.Combo.Input("qwen21_fp16", options=["on", "off"], default="on",
+                               tooltip="Run the Qwen-Image 2.1 DiT forward in fp16 when the loaded model computes "
+                                       "in bf16: the hidden states, context and reference latents are cast once "
+                                       "for the whole forward and the output is cast back. gfx906 emulates bf16 "
+                                       "in fp32; measured 7.92 -> 3.83 s per forward at a 64x64 latent "
+                                       "(2.07x), and the fp16 output is closer to fp32 than the bf16 baseline. "
+                                       "Guarded: a non-finite fp16 pass drops the prefix cache and reruns the "
+                                       "call in the model dtype. fp16/fp32 models are left alone, and the "
+                                       "patch only installs where the card has no native bf16 (n/a elsewhere)."),
+                io.Combo.Input("int8_linear_act", options=["on", "off"], default="on",
+                               tooltip="Keep int8 weights quantized at every comfy.ops.linear_input_act site "
+                                       "(MLP down projections and pre-norm blocks). When the weight's orig_dtype "
+                                       "differs from the activation dtype (fp32 manual-cast models running bf16: "
+                                       "Qwen-Image 2.1, LTXV, MiniMaxH3), the shipped path requantizes and then "
+                                       "dequantizes the int8 weight, falling back to a full bf16 GEMM; on takes "
+                                       "the int8 kernel instead (Qwen-Image 2.1: 7.92 -> 3.34 s per forward at a "
+                                       "64x64 latent, 2.37x). Calls whose dtypes already match are left "
+                                       "untouched, so Flux / Wan's default fp16 / fp32 runs measure identical. "
+                                       "off restores the shipped call."),
+                io.Combo.Input("qwen21_residual_fuse", options=["on", "off"], default="on",
+                               tooltip="Fuse the Qwen-Image 2.1 gated residual (x += gate * layer_out) into the "
+                                       "int8 GEMM epilogue, for both the attention to_out and the SwiGLU down "
+                                       "projection. Removes the separate addcmul kernel and its ~66 MB round trip "
+                                       "per residual; measured 14.66 -> 14.56 ms on the MLP down GEMM and "
+                                       "5.02 -> 4.99 ms on to_out, about 0.1% of a step (below the pack's "
+                                       "measurement noise). Needs the v2 residual epilogue in libgfx906_int8.so; "
+                                       "the mixed first pass (prefix + target rows) keeps the shipped addcmul."),
             ],
             outputs=[io.Model.Output(display_name="model")],
         )
@@ -116,7 +145,8 @@ class GpuTuningModelSettings(io.ComfyNode):
     def execute(cls, model, attention: str, contiguous: str, fp16_attn: str,
                 convrot: str, int8_tile: str, small_batch: str, int8_gemm: str, int8_attn: str,
                 int8_attn_rotate: str, qkv: str, vae: str,
-                gemv: str, prefix_kv: str, qwen21_int8_cache: str, profile: str) -> io.NodeOutput:
+                gemv: str, prefix_kv: str, qwen21_int8_cache: str, profile: str,
+                qwen21_fp16: str, int8_linear_act: str, qwen21_residual_fuse: str) -> io.NodeOutput:
         apply()
         if fp16_attn == "force":
             fp16, amax_guard = "on", "off"
@@ -129,7 +159,9 @@ class GpuTuningModelSettings(io.ComfyNode):
                   vae=vae, gemv=gemv, prefix_kv=prefix_kv, amax_guard=amax_guard,
                   int8_tile=int8_tile, small_batch=small_batch, int8_gemm=int8_gemm,
                   int8_attn=int8_attn, int8_attn_rotate=int8_attn_rotate,
-                  qwen21_int8_cache=qwen21_int8_cache)
+                  qwen21_int8_cache=qwen21_int8_cache,
+                  qwen21_fp16=qwen21_fp16, int8_linear_act=int8_linear_act,
+                  qwen21_residual_fuse=qwen21_residual_fuse)
         return io.NodeOutput(model)
 
 

@@ -5,6 +5,8 @@
 //   w8 [N, K] int8, ws [N] f32  (per-channel weight scale)
 //   bias [N] f32 or null, out [M, N] fp16
 //   out[m][n] = (sum_k x8[m][k] * w8[n][k]) * xs[m] * ws[n] + bias[n]
+//   v2: resid [M, N] (same dtype as out) and rscale [N] f32 add
+//   out[m][n] = resid[m][n] + rscale[n] * out[m][n]
 //
 // LDS tiles are chunk-major: [buffer][16-byte K chunk][row][16 bytes]. A phase
 // of 16 lanes then reads consecutive rows (consecutive 16 B slots, all banks)
@@ -70,7 +72,8 @@ template <typename OutT, bool ALIGNED_K>
 __global__ void __launch_bounds__(NT, LBPB)
 int8_gemm_kernel(const int8_t* __restrict__ x8, const float* __restrict__ xs,
                  const int8_t* __restrict__ w8, const float* __restrict__ ws, int ws_scalar,
-                 const float* __restrict__ bias, OutT* __restrict__ out,
+                 const float* __restrict__ bias, const OutT* __restrict__ resid,
+                 const float* __restrict__ rscale, OutT* __restrict__ out,
                  int M, int N, int K) {
     __shared__ __align__(16) int8_t As[2][NCH][BM][16];
     __shared__ __align__(16) int8_t Bs[2][NCH][BN][16];
@@ -194,6 +197,9 @@ int8_gemm_kernel(const int8_t* __restrict__ x8, const float* __restrict__ xs,
             if (gn >= N) continue;
             float v = (float)acc[i][j] * sa * ws[ws_scalar ? 0 : gn];
             if (bias) v += bias[gn];
+            // residual + rscale[n] * out, the same form comfy_kitchen's
+            // _apply_residual uses; null keeps v1 bit-identical.
+            if (resid) v = (float)resid[(int64_t)gm * N + gn] + v * rscale[gn];
             dst[TSTRIDE * j] = to_out<OutT>(v);
         }
     }
@@ -202,15 +208,15 @@ int8_gemm_kernel(const int8_t* __restrict__ x8, const float* __restrict__ xs,
 template <typename OutT>
 static void launch_int8(const void* x8, const void* xs, const void* w8, const void* ws,
                         int ws_scalar, const void* bias, void* out, int M, int N, int K,
-                        int tiles, hipStream_t st) {
+                        int tiles, const void* resid, const void* rscale, hipStream_t st) {
     if (K % BK == 0)
         int8_gemm_kernel<OutT, true><<<tiles, NT, 0, st>>>(
             (const int8_t*)x8, (const float*)xs, (const int8_t*)w8, (const float*)ws, ws_scalar,
-            (const float*)bias, (OutT*)out, M, N, K);
+            (const float*)bias, (const OutT*)resid, (const float*)rscale, (OutT*)out, M, N, K);
     else
         int8_gemm_kernel<OutT, false><<<tiles, NT, 0, st>>>(
             (const int8_t*)x8, (const float*)xs, (const int8_t*)w8, (const float*)ws, ws_scalar,
-            (const float*)bias, (OutT*)out, M, N, K);
+            (const float*)bias, (const OutT*)resid, (const float*)rscale, (OutT*)out, M, N, K);
 }
 
 extern "C" int gfx906_int8_gemm(const void* x8, const void* xs, const void* w8,
@@ -220,11 +226,30 @@ extern "C" int gfx906_int8_gemm(const void* x8, const void* xs, const void* w8,
     const int tiles = cdiv(M, BM) * cdiv(N, BN);
     hipStream_t st = (hipStream_t)stream;
     if (out_dtype == 2)
-        launch_int8<float>(x8, xs, w8, ws, ws_scalar, bias, out, M, N, K, tiles, st);
+        launch_int8<float>(x8, xs, w8, ws, ws_scalar, bias, out, M, N, K, tiles, nullptr, nullptr, st);
     else if (out_dtype == 1)
-        launch_int8<hip_bfloat16>(x8, xs, w8, ws, ws_scalar, bias, out, M, N, K, tiles, st);
+        launch_int8<hip_bfloat16>(x8, xs, w8, ws, ws_scalar, bias, out, M, N, K, tiles, nullptr, nullptr, st);
     else
-        launch_int8<__half>(x8, xs, w8, ws, ws_scalar, bias, out, M, N, K, tiles, st);
+        launch_int8<__half>(x8, xs, w8, ws, ws_scalar, bias, out, M, N, K, tiles, nullptr, nullptr, st);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : (int)e;
+}
+
+// v2 adds the optional residual epilogue (residual + rscale[n] * out). Kept as a
+// separate export so an older library on disk still serves gfx906_int8_gemm.
+extern "C" int gfx906_int8_gemm_v2(const void* x8, const void* xs, const void* w8,
+                                   const void* ws, int ws_scalar, const void* bias, void* out,
+                                   int M, int N, int K, int out_dtype,
+                                   const void* resid, const void* rscale, void* stream) {
+    if (M <= 0 || N <= 0 || K <= 0) return -2;
+    const int tiles = cdiv(M, BM) * cdiv(N, BN);
+    hipStream_t st = (hipStream_t)stream;
+    if (out_dtype == 2)
+        launch_int8<float>(x8, xs, w8, ws, ws_scalar, bias, out, M, N, K, tiles, resid, rscale, st);
+    else if (out_dtype == 1)
+        launch_int8<hip_bfloat16>(x8, xs, w8, ws, ws_scalar, bias, out, M, N, K, tiles, resid, rscale, st);
+    else
+        launch_int8<__half>(x8, xs, w8, ws, ws_scalar, bias, out, M, N, K, tiles, resid, rscale, st);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : (int)e;
 }
