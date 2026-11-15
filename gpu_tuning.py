@@ -256,9 +256,12 @@ def arch_name():
     if not torch.cuda.is_available():
         return None
     props = torch.cuda.get_device_properties(0)
-    name = str(getattr(props, "gcnArchName", ""))
-    if name:
-        return name.split(":")[0] or None
+    # CUDA builds also expose gcnArchName as the marketing name; only HIP has a
+    # real gfx target there. Keep this in sync with kernels.manifest.device_arch.
+    if torch.version.hip is not None:
+        name = str(getattr(props, "gcnArchName", ""))
+        if name:
+            return name.split(":")[0] or None
     return f"sm{props.major}{props.minor}" if props.major else None
 
 
@@ -267,15 +270,14 @@ def is_amd():
 
 
 def bf16_is_emulated():
-    """True on AMD cards without native bf16 (gfx906 and other old parts).
+    """True wherever ComfyUI falls back from bf16 weights to fp32 compute.
 
-    comfy's own gate already answers this per card: should_use_bf16 is False
-    for gfx900/906 and RDNA2, and True where bf16 is a hardware path. Only the
-    emulated case wants the qwen21 fp16 forward; on a native bf16 card the
-    cast would trade precision for nothing.
+    comfy's own gate answers this per card: should_use_bf16 is False for
+    gfx900/906 and RDNA2, and also for NVIDIA parts older than sm_80 (Turing
+    sm_75 included). Qwen-Image 2.1's bf16 DiT lands in a fp32 manual cast on
+    both, so both benefit from the fp16 activation path. On a native bf16 card
+    the cast would trade precision for nothing.
     """
-    if not is_amd():
-        return False
     try:
         import comfy.model_management
         return not comfy.model_management.should_use_bf16(comfy.model_management.get_torch_device())
@@ -2250,6 +2252,12 @@ def patch_prefix_kv():
     import comfy.ldm.qwen_image21.model as qwen
     if getattr(qwen, "_gfx906_prefixkv", False):
         return True
+    # ComfyUI >= 0.39 wraps q/k/v in AttentionTensorContainer and forwards
+    # preferred_attention. Older builds (0.37) pass plain tensors and have no
+    # such kwarg; the rewritten merge only fits the new contract, so leave the
+    # shipped torch.cat path alone there instead of crashing the sampler.
+    if not hasattr(qwen, "AttentionTensorContainer"):
+        return False
 
     original = qwen.prefix_cached_attention
     _state["prefix_kv_patched"] = True

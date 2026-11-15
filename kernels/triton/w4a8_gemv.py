@@ -244,6 +244,10 @@ def _load_hip():
 
 def _probe_asm():
     """Whether the v_dot4 inline asm compiles on this device."""
+    if torch.version.hip is None:
+        # v_dot4 is a GCN/CDNA instruction. Compiling it on a CUDA device
+        # aborts the Triton process instead of raising, so never probe there.
+        return False
     a = torch.zeros(1, device="cuda", dtype=torch.int32)
     b = torch.zeros(1, device="cuda", dtype=torch.int32)
     c = torch.zeros(1, device="cuda", dtype=torch.int32)
