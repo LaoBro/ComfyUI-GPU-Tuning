@@ -10,10 +10,12 @@
 - 需要一张 CUDA 设备；CPU 上整包跳过。AMD 按 `gcnArchName`、NVIDIA 按
   `sm<major><minor>` 分表，同一厂商的不同卡也不会共用一张表。
 - 只有 `gfx906` 随包带实测表。其它架构装好后测量门默认关、走通用路径，这是预期行为。
-- comfy-kitchen 的 triton 后端由本包在启动时自行启用，不需要用户先配置；逐块 CUDA graph
-  由节点在启动时以运行时包装装上，不改 core 文件。
-- `ComfyUI 0.39.0` 只是实测环境，仓库没有版本检查。升级后所有 core 接触点最坏降级为
-  eager 解码，不需要重新生成任何文件。
+- comfy-kitchen 的 triton 后端由本包在启动时自行启用，不需要用户先配置；常驻权重的逐块
+  CUDA graph 由节点安装，core 已覆盖的 aimdo/VBAR 流式路径不重复捕获。
+- `ComfyUI 0.39.0` 是实测环境。0.44+ 的 Qwen3.5 使用 core 自带的融合 attention/KV cache，
+  节点会跳过旧的整类替换；其它 core 接触点按能力探测降级，不保证所有版本都无缝运行。
+- 0.45 的 `CombinedLinear` / `premerge` / `PrefixCache` 已纳入兼容探测：节点只在 core
+  没有对应能力时安装旧补丁。
 - 不要求 ROCm/HIP 构建：fingerprint 对 CUDA 构建同样成立。N 卡上 int8 tile 与注意力
   内核补丁不安装、文本生成改写组照常生效，`bench.py --all` 会按设备跳过用不到的
   tile / attention 站点；本包未在 N 卡实测，性能结论由有卡的人跑出来。

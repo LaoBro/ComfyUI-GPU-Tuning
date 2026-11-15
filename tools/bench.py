@@ -67,6 +67,7 @@ import build_hip_attn                                                  # noqa: E
 import refs                                                            # noqa: E402
 from kernels import manifest as manifest_mod                           # noqa: E402
 from kernels import manifest_write                                     # noqa: E402
+from patches import compat                                              # noqa: E402
 
 SITES = {
     "int8_gemv.m1": {
@@ -968,6 +969,9 @@ def run_qwen35_site(args, today):
     delta rule -- without needing a checkpoint. The timing is a proxy: at four
     layers and no cache it measures the Python-level saves, not a 24-layer TE.
     """
+    if compat.qwen35_native():
+        print("    core Qwen3.5 already provides the fused attention/cache; node site skipped")
+        return {}, {}
     import comfy.ops
     from comfy.text_encoders.qwen35 import Qwen35Config, _qwen35_layer_types
 

@@ -22,12 +22,12 @@ try:
     from .patches.profiler import patch_prompt_end as _patch_prompt_end
     from .patches.profiler import set_enabled as _set_profiler
     from .patches.profiler import enabled as _profiler_enabled
-    from .patches import fp16_trace as _fp16_trace
+    from .patches import compat, fp16_trace as _fp16_trace
 except ImportError:
     from patches.profiler import patch_prompt_end as _patch_prompt_end
     from patches.profiler import set_enabled as _set_profiler
     from patches.profiler import enabled as _profiler_enabled
-    from patches import fp16_trace as _fp16_trace
+    from patches import compat, fp16_trace as _fp16_trace
 
 INT8_TILE = {"block_m": 128, "block_n": 256, "block_k": 32, "group_size_m": 8}
 INT8_WARPS = 4
@@ -217,9 +217,14 @@ def textgen_active(name):
 
 def textgen_summary():
     ready = _state.get("textgen_ready", {})
-    return ", ".join(
-        f"{name} {'on' if textgen_active(name) else ('off (installed)' if ready.get(name) else 'n/a')}"
-        for name in TEXTGEN_ITEMS)
+    parts = []
+    for name in TEXTGEN_ITEMS:
+        if name == "qwen35" and _state.get("qwen35_core"):
+            parts.append("qwen35 core")
+        else:
+            state = "on" if textgen_active(name) else ("off (installed)" if ready.get(name) else "n/a")
+            parts.append(f"{name} {state}")
+    return ", ".join(parts)
 
 
 def _init_env_settings():
@@ -683,9 +688,11 @@ def patch_kv_decode(gate=None):
     decode without a reload.
     """
     import comfy_kitchen
-    import comfy.text_encoders.llama as llama
 
-    kv = llama.FixedKVBias
+    kv = compat.fixed_kv_bias()
+    if kv is None:
+        logging.info("gpu-tune: kv decode skipped: core llama no longer exposes FixedKVBias")
+        return False
     if getattr(kv.decode, "_gfx906_folded", False):
         return True
 
@@ -2312,6 +2319,9 @@ def patch_qwen21_int8_cache():
     mod = _hip_int8_attention()
     if mod is None or not mod.available() or not mod.rotation_ready():
         return False
+    if compat.qwen21_prefix_cache():
+        logging.info("gpu-tune: qwen21 int8 cache covers PoseBranchCache; "
+                     "core PrefixCache keeps its own quantized cache")
     if getattr(PoseBranchCache, "_gfx906_int8_cache", False):
         return True
 
@@ -2396,6 +2406,9 @@ def _int8_linear_act(linear, x, input_act, act_weight=None, act_eps=0.0,
     from comfy_kitchen.tensor import QuantizedTensor
     from comfy.quant_ops import TensorWiseINT8Layout
 
+    if compat.is_combined_linear(linear):
+        # 0.45 hands CombinedLinear to the same linear_input_act; core owns it.
+        return None
     weight = linear.weight
     if (comfy.model_management.in_training
             or not isinstance(weight, QuantizedTensor)
@@ -2490,11 +2503,11 @@ def patch_qwen21_fp16():
     original = cls._forward
 
     def _forward(self, x, timesteps, context, ref_latents=None, image_slots=None,
-                 transformer_options={}, **kwargs):
+                 transformer_options={}, prefix_cache=None, **kwargs):
         entry = _fp16_entry_dtype(self, x)
         if _state.get("dit_fp16") not in ("qwen21", "all") or entry is None:
             return original(self, x, timesteps, context, ref_latents, image_slots,
-                            transformer_options, **kwargs)
+                            transformer_options, prefix_cache=prefix_cache, **kwargs)
         cast_fp32 = getattr(self, "dtype", None) == torch.bfloat16
         half_ctx = _bf16_to_fp16(context, cast_fp32) if isinstance(context, torch.Tensor) else context
         half_refs = ([_bf16_to_fp16(r, cast_fp32) for r in ref_latents]
@@ -2502,7 +2515,7 @@ def patch_qwen21_fp16():
         _enter_fp16_stream()
         try:
             out = original(self, x.half(), timesteps, half_ctx, half_refs, image_slots,
-                           transformer_options, **kwargs)
+                           transformer_options, prefix_cache=prefix_cache, **kwargs)
         finally:
             _leave_fp16_stream()
         if torch.isfinite(out).all():
@@ -2518,7 +2531,7 @@ def patch_qwen21_fp16():
                             "Set dit_fp16 off to skip the retry", entry)
         self.reset_prefix_cache(self.prefix_cache_enabled)
         return original(self, x, timesteps, context, ref_latents, image_slots,
-                        transformer_options, **kwargs)
+                        transformer_options, prefix_cache=prefix_cache, **kwargs)
 
     cls._forward = _forward
     cls._gfx906_qwen21_fp16 = True
@@ -3044,12 +3057,14 @@ def patch_vision():
     patch = qwen35.Qwen35VisionPatchEmbed
     original_forward = model.forward
     original_proj = patch.forward
+    premerge_kw = compat.vision_premerge()
 
-    def forward(self, x, grid_thw):
+    def forward(self, x, grid_thw, premerge=None):
+        kwargs = {"premerge": premerge} if premerge_kw else {}
         if not _state.get("vision_enabled", False):
-            return original_forward(self, x, grid_thw)
+            return original_forward(self, x, grid_thw, **kwargs)
         dtype = next(self.parameters()).dtype
-        return original_forward(self, x.to(dtype), grid_thw)
+        return original_forward(self, x.to(dtype), grid_thw, **kwargs)
 
     def proj_forward(self, x):
         conv = self.proj
@@ -3187,12 +3202,19 @@ def apply():
         _state["textgen_ready"]["llama"] = bool(
             _install("llama", llama_patches.install, lambda: textgen_active("llama")))
     if install_ready("qwen35"):
-        qwen35_model = _install("qwen35 loader", load_qwen35_model)
-        if qwen35_model:
-            # the freqs table belongs to the llama item, not the qwen35 class swap
-            _state["textgen_ready"]["qwen35"] = bool(
-                _install("qwen35", qwen35_model.install, lambda: textgen_active("qwen35"),
-                         lambda: textgen_active("llama")))
+        if compat.qwen35_native():
+            # 0.44+ core already carries the fused attention and KV-cache
+            # contract this pack copied from 0.39; keep core and skip the copy.
+            _state["qwen35_core"] = True
+            logging.info("gpu-tune: core Qwen3.5 already has the fused attention/KV cache; "
+                         "node class swap skipped")
+        else:
+            qwen35_model = _install("qwen35 loader", load_qwen35_model)
+            if qwen35_model:
+                # the freqs table belongs to the llama item, not the qwen35 class swap
+                _state["textgen_ready"]["qwen35"] = bool(
+                    _install("qwen35", qwen35_model.install, lambda: textgen_active("qwen35"),
+                             lambda: textgen_active("llama")))
     # 4-bit weights: register-unpacked GEMV for decode, int8 decode for prefill
     _state["w4a8_module"] = (_install("w4a8 module", load_w4a8_gemv)
                              if install_ready("w4a8") else None)
@@ -3227,6 +3249,7 @@ def apply():
         _state["te_attention"],
         textgen_summary(),
     )
+    logging.info("gpu-tune: core-owned contracts: %s", compat.summary())
     return _state
 
 
@@ -3407,6 +3430,7 @@ def status():
         if _state.get("int8_attn_patched") else "int8 attention n/a",
         f"image tower {'weight dtype + patch gemm' if _state['vision_enabled'] else 'shipped path'}",
         f"resident graph {'on' if _state.get('resident_graph') else 'off'}",
+        f"compat core {compat.summary()}",
     ]
     manifest_line = manifest_status_line()
     if manifest_line:

@@ -8,6 +8,9 @@ node's own classes resolve their children inside this module.
 The llama.py base classes (FixedKV/FixedKVBias/RMSNorm/BaseLlama) stay shared:
 the cache objects this module creates must be the same class objects core
 checks with isinstance.
+
+0.44+ core already carries the fused attention and KV-cache contract, so
+gpu_tuning.apply skips this class swap there and keeps the core implementation.
 """
 
 import torch
