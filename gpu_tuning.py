@@ -270,17 +270,24 @@ def is_amd():
 
 
 def bf16_is_emulated():
-    """True wherever ComfyUI falls back from bf16 weights to fp32 compute.
+    """True where a card without native bf16 also has a usable fp16 path.
 
-    comfy's own gate answers this per card: should_use_bf16 is False for
-    gfx900/906 and RDNA2, and also for NVIDIA parts older than sm_80 (Turing
-    sm_75 included). Qwen-Image 2.1's bf16 DiT lands in a fp32 manual cast on
-    both, so both benefit from the fp16 activation path. On a native bf16 card
-    the cast would trade precision for nothing.
+    comfy's own gates answer this per card: should_use_bf16 is False for
+    gfx900/906 and RDNA2, and for NVIDIA parts older than sm_80, while
+    should_use_fp16 rejects the cards where fp16 is broken or slower (GTX 16
+    series, Linux GTX 10 series). Qwen-Image 2.1's bf16 DiT lands in a fp32
+    manual cast on those cards, so both benefit from the fp16 activation path.
+    On a native bf16 card the cast would trade precision for nothing.
     """
+    if not torch.cuda.is_available():
+        return False
     try:
         import comfy.model_management
-        return not comfy.model_management.should_use_bf16(comfy.model_management.get_torch_device())
+        device = comfy.model_management.get_torch_device()
+        if is_amd():
+            return not comfy.model_management.should_use_bf16(device)
+        return (not comfy.model_management.should_use_bf16(device)
+                and comfy.model_management.should_use_fp16(device))
     except Exception:
         return False
 
