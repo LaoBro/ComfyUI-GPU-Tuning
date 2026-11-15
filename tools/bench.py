@@ -480,7 +480,14 @@ def probe_order(module, candidates):
 
 
 def run_site(site, spec, shapes, args, today):
-    module = __import__(spec["module"])
+    # The triton kernels ship as kernels.triton.<name>. Older shipped tables
+    # used bare module names with arch/<gcn>/kernels on sys.path; CUDA cards
+    # have no arch kernels directory, so resolve the package path first.
+    try:
+        module = __import__(f"kernels.triton.{spec['module']}",
+                            fromlist=[spec["module"]])
+    except ModuleNotFoundError:
+        module = __import__(spec["module"])
     build = CASES[site]
     impls = implementations(module, spec["impls"])
     records, winners, ratios = {}, {}, []
@@ -984,7 +991,7 @@ def run_qwen35_site(args, today):
         linear_value_head_dim=128,
         layer_types=_qwen35_layer_types(layers),
     )
-    model = qwen35_model.Qwen35Transformer(cfg, device="cuda", dtype=torch.float32,
+    model = qwen35.Qwen35Transformer(cfg, device="cuda", dtype=torch.float32,
                                            ops=comfy.ops.disable_weight_init).cuda().float()
     gen = torch.Generator(device="cuda").manual_seed(0)
     with torch.no_grad():
@@ -1002,7 +1009,7 @@ def run_qwen35_site(args, today):
     def call(gate_on):
         # the block does in-place adds into its input, which needs no_grad like
         # any other forward; the clone keeps one run from mutating the next
-        qwen35_model._gate = (lambda: True) if gate_on else (lambda: False)
+        qwen35._gate = (lambda: True) if gate_on else (lambda: False)
         with torch.no_grad():
             return model(None, embeds=emb.clone())
 

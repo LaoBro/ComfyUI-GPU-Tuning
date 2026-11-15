@@ -61,9 +61,13 @@ def device_arch():
         if not torch.cuda.is_available():
             return None
         props = torch.cuda.get_device_properties(0)
-        name = str(getattr(props, "gcnArchName", ""))
-        if name:
-            return name.split(":")[0] or None
+        # torch >= 2.10 also exposes gcnArchName on CUDA devices, where it holds
+        # the marketing name ("NVIDIA GeForce RTX 2080 Ti"), not a gfx target.
+        # Trust it only on HIP builds; CUDA cards key the table on sm<maj><min>.
+        if torch.version.hip is not None:
+            name = str(getattr(props, "gcnArchName", ""))
+            if name:
+                return name.split(":")[0] or None
         return f"sm{props.major}{props.minor}" if props.major else None
     except Exception:                               # noqa: BLE001 - no torch, no arch
         return None
