@@ -22,8 +22,8 @@ class GpuTuningModelSettings(io.ComfyNode):
             description=(
                 "Runtime settings for the GPU Tuning pack. Values take effect on the next execution, "
                 "no restart needed. Wire it between the model loader and the sampler. Most switches "
-                "are plain on/off; vae, gemv and image_tower also offer default to follow the "
-                "measured verdict, and a few are mode choices."
+                "are plain on/off; vae, gemv, image_tower, dit_fp16 and fp16_trace also offer default "
+                "to follow the measured verdict, and a few are mode choices."
             ),
             inputs=[
                 io.Model.Input("model"),
@@ -110,15 +110,25 @@ class GpuTuningModelSettings(io.ComfyNode):
                                        "keeps the fp16 path."),
                 io.Combo.Input("profile", options=["on", "off"], default="off",
                                tooltip="Print the tuning status once and per-call timings when each prompt finishes."),
-                io.Combo.Input("qwen21_fp16", options=["on", "off"], default="on",
-                               tooltip="Run the Qwen-Image 2.1 DiT forward in fp16 when the loaded model computes "
-                                       "in bf16: the hidden states, context and reference latents are cast once "
-                                       "for the whole forward and the output is cast back. gfx906 emulates bf16 "
-                                       "in fp32; measured 7.92 -> 3.83 s per forward at a 64x64 latent "
-                                       "(2.07x), and the fp16 output is closer to fp32 than the bf16 baseline. "
-                                       "Guarded: a non-finite fp16 pass drops the prefix cache and reruns the "
-                                       "call in the model dtype. fp16/fp32 models are left alone, and the "
-                                       "patch only installs where the card has no native bf16 (n/a elsewhere)."),
+                io.Combo.Input("dit_fp16", options=["default", "off", "qwen21", "all"], default="default",
+                               tooltip="Run a bf16-weight DiT on the fp16 activation path. qwen21 (the built-in "
+                                       "default) covers Qwen-Image 2.1; all covers every other diffusion model "
+                                       "(Flux, Wan, LTXV, MiniMax H3, ...) and stays opt-in because those are "
+                                       "unmeasured. The patch casts the input activations (latents, context, extra "
+                                       "conds; A/V list latents included) once for the whole forward and restores "
+                                       "the output dtype. bf16 and the gfx906 fp32 manual-cast fallback both enter: "
+                                       "ComfyUI picks fp32 for a [bf16, fp32] dtype table because the card has no "
+                                       "native bf16. Weights are not converted: int8/convrot weights stay int8 and "
+                                       "follow the activation dtype through out_dtype/rotation, while non-int8 "
+                                       "Linear layers are hooked to run in the model's original compute dtype "
+                                       "(bf16 or fp32) and return fp16, so fp32 islands such as MiniMax H3's "
+                                       "output heads stay fp32. Qwen-Image 2.1 measured 7.92 -> 3.83 s per forward "
+                                       "(2.07x) with the boundary cast; keeping non-int8 layers in their original "
+                                       "compute dtype trades a little of that back for precision. "
+                                       "Guarded: a non-finite fp16 pass is rerun in the model dtype "
+                                       "(Qwen-Image 2.1 also drops its prefix cache). Native fp16/fp32 models are "
+                                       "left alone, and the patch only installs where the card has no native bf16 "
+                                       "(n/a elsewhere)."),
                 io.Combo.Input("int8_linear_act", options=["on", "off"], default="on",
                                tooltip="Keep int8 weights quantized at every comfy.ops.linear_input_act site "
                                        "(MLP down projections and pre-norm blocks). When the weight's orig_dtype "
@@ -137,6 +147,21 @@ class GpuTuningModelSettings(io.ComfyNode):
                                        "5.02 -> 4.99 ms on to_out, about 0.1% of a step (below the pack's "
                                        "measurement noise). Needs the v2 residual epilogue in libgfx906_int8.so; "
                                        "the mixed first pass (prefix + target rows) keeps the shipped addcmul."),
+                io.Combo.Input("fp16_trace", options=["default", "off", "on"], default="default",
+                               tooltip="Overflow diagnostic for the activation fp16 path. on hooks every leaf "
+                                       "module of the diffusion model and samples input/output abs-max, "
+                                       "isfinite and the count above 60000; a prompt-end report lists the "
+                                       "modules whose output went non-finite (in call order), the top sites "
+                                       "by abs-max, and (for MiniMax H3) dedicated probes for _mod_scale_shift, "
+                                       "_mod_gate, Attention and MLP, which module hooks cannot see. "
+                                       "Set COMFY_GPU_TUNE_FP16_TRACE_DTYPE=bf16 or fp32 (default fp16) and run "
+                                       "with dit_fp16 off for the reference pass: compare peaks, then scale "
+                                       "S = ceil(reference_peak / 60000), ideally a power of two, like the "
+                                       "attention /4 and FFN w3 /32 workaround in ComfyUI PR #11187. "
+                                       "The samples are device-side reductions and the report syncs once per "
+                                       "prompt, but the extra hooks and max kernels cost speed, so turn it "
+                                       "off after diagnosis. default follows COMFY_GPU_TUNE_FP16_TRACE "
+                                       "(off when unset)."),
             ],
             outputs=[io.Model.Output(display_name="model")],
         )
@@ -146,7 +171,8 @@ class GpuTuningModelSettings(io.ComfyNode):
                 convrot: str, int8_tile: str, small_batch: str, int8_gemm: str, int8_attn: str,
                 int8_attn_rotate: str, qkv: str, vae: str,
                 gemv: str, prefix_kv: str, qwen21_int8_cache: str, profile: str,
-                qwen21_fp16: str, int8_linear_act: str, qwen21_residual_fuse: str) -> io.NodeOutput:
+                dit_fp16: str, int8_linear_act: str, qwen21_residual_fuse: str,
+                fp16_trace: str) -> io.NodeOutput:
         apply()
         if fp16_attn == "force":
             fp16, amax_guard = "on", "off"
@@ -160,8 +186,8 @@ class GpuTuningModelSettings(io.ComfyNode):
                   int8_tile=int8_tile, small_batch=small_batch, int8_gemm=int8_gemm,
                   int8_attn=int8_attn, int8_attn_rotate=int8_attn_rotate,
                   qwen21_int8_cache=qwen21_int8_cache,
-                  qwen21_fp16=qwen21_fp16, int8_linear_act=int8_linear_act,
-                  qwen21_residual_fuse=qwen21_residual_fuse)
+                  dit_fp16=dit_fp16, int8_linear_act=int8_linear_act,
+                  qwen21_residual_fuse=qwen21_residual_fuse, fp16_trace=fp16_trace)
         return io.NodeOutput(model)
 
 

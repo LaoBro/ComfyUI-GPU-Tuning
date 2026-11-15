@@ -11,6 +11,11 @@ import sys
 
 import torch
 
+try:
+    from . import fp16_trace
+except ImportError:
+    import fp16_trace
+
 MAX_RECORDS = 20000
 
 ORDER = ("model_forward", "attention", "cache_attn", "int8_linear", "norm", "rope", "residual")
@@ -182,6 +187,12 @@ def patch_prompt_end():
                 report = summary(before, _clock_reference() if before is not None else None)
                 if report:
                     logging.info("gfx906 profiler\n%s", report)
+            try:
+                trace = fp16_trace.take_report()
+            except Exception as exc:  # a diagnostic must never break the prompt
+                trace = f"fp16 trace failed: {exc}"
+            if trace:
+                logging.info("gfx906 fp16 trace\n%s", trace)
 
     execute_async._gfx906_prompt_end = True
     execution.PromptExecutor.execute_async = execute_async

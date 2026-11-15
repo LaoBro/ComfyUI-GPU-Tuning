@@ -22,10 +22,12 @@ try:
     from .patches.profiler import patch_prompt_end as _patch_prompt_end
     from .patches.profiler import set_enabled as _set_profiler
     from .patches.profiler import enabled as _profiler_enabled
+    from .patches import fp16_trace as _fp16_trace
 except ImportError:
     from patches.profiler import patch_prompt_end as _patch_prompt_end
     from patches.profiler import set_enabled as _set_profiler
     from patches.profiler import enabled as _profiler_enabled
+    from patches import fp16_trace as _fp16_trace
 
 INT8_TILE = {"block_m": 128, "block_n": 256, "block_k": 32, "group_size_m": 8}
 INT8_WARPS = 4
@@ -63,6 +65,15 @@ ATTENTION_KERNELS = ("hand", "gemm", "hip")
 # Node switches are three-state: "default" keeps the startup/env value,
 # "on"/"off" are explicit overrides. None is the internal spelling of "default".
 TRISTATE = ("default", "on", "off")
+# Which bf16 DiT forwards get the fp16 cast. qwen21 is the measured default;
+# all generalizes it to every other diffusion model and stays opt-in.
+DIT_FP16_SCOPES = ("off", "qwen21", "all")
+DIT_FP16_DEFAULT = "qwen21"
+# kwargs that keep their dtype/identity while the activation stream is fp16:
+# masks are range data, transformer_options is hook/plumbing state.
+FP16_KEEP_DTYPE = ("transformer_options", "denoise_mask", "audio_denoise_mask",
+                   "concat_mask", "mask", "padding_mask", "attention_mask",
+                   "latent_shapes")
 # Text-generation group: the CLIP node's textgen switch covers all four.
 TEXTGEN_ITEMS = ("deltanet", "kvdecode", "llama", "qwen35")
 
@@ -135,8 +146,10 @@ _state = {
     "int8_attn_patched": False,
     "qwen21_int8_cache": False,
     "qwen21_int8_patched": False,
-    "qwen21_fp16": True,
-    "qwen21_fp16_patched": False,
+    "dit_fp16": DIT_FP16_DEFAULT,
+    "dit_fp16_patched": False,
+    "fp16_trace": False,
+    "fp16_stream_active": 0,
     "int8_linear_act": True,
     "int8_linear_act_patched": False,
     "qwen21_residual_fuse": True,
@@ -173,6 +186,22 @@ def flag_value(value):
 def resolve_flag(value, env_value):
     want = flag_value(value)
     return bool(env_value) if want is None else want
+
+
+def resolve_dit_fp16(value):
+    """off / qwen21 / all; None or "default" follows the env.
+
+    The old qwen21_fp16 widget wrote on/off, so those values keep their
+    meaning: on is the measured Qwen-Image 2.1 path, off disables the cast.
+    """
+    text = "" if value is None else str(value).strip().lower()
+    if text in ("", "default"):
+        text = os.getenv("COMFY_GPU_TUNE_DIT_FP16", DIT_FP16_DEFAULT).strip().lower()
+    if text in ("on", "1", "true", "yes"):
+        return "qwen21"
+    if text in ("0", "false", "no"):
+        return "off"
+    return text if text in DIT_FP16_SCOPES else DIT_FP16_DEFAULT
 
 
 def textgen_requested(name):
@@ -213,6 +242,10 @@ def _init_env_settings():
                               for item in os.getenv("COMFY_GPU_TUNE_FORCE", "").replace(",", " ").split()
                               if item.strip()}
     _state["te_dequant_env"] = os.getenv("COMFY_GPU_TUNE_TE_DEQUANT", "").strip().lower()
+    _state["dit_fp16"] = resolve_dit_fp16(None)
+    _state["fp16_trace"] = env_flag("COMFY_GPU_TUNE_FP16_TRACE", "0")
+    _fp16_trace.set_dtype(os.getenv("COMFY_GPU_TUNE_FP16_TRACE_DTYPE", "fp16"))
+    _fp16_trace.set_enabled(_state["fp16_trace"])
 
 
 def arch_name():
@@ -1639,7 +1672,8 @@ def configure(attention=None, convrot=None, profile=None, text_encoder=None,
               vae=None, gemv=None, textgen=None, prefix_kv=None, text_gemv=None, w4a8=None,
               amax_guard=None, int8_tile=None, small_batch=None, image_tower=None,
               int8_gemm=None, int8_attn=None, int8_attn_rotate=None, qwen21_int8_cache=None,
-              qwen21_fp16=None, int8_linear_act=None, qwen21_residual_fuse=None):
+              dit_fp16=None, int8_linear_act=None, qwen21_residual_fuse=None,
+              fp16_trace=None):
     """Runtime settings, used by the GPU Tuning nodes.
 
     Every argument is three-state: None/"default" keeps the built-in default
@@ -1707,8 +1741,14 @@ def configure(attention=None, convrot=None, profile=None, text_encoder=None,
         _state["prefix_kv_enabled"] = resolve_flag(prefix_kv, True)
     if qwen21_int8_cache is not None:
         _state["qwen21_int8_cache"] = resolve_flag(qwen21_int8_cache, False)
-    if qwen21_fp16 is not None:
-        _state["qwen21_fp16"] = resolve_flag(qwen21_fp16, True)
+    if dit_fp16 is not None:
+        _state["dit_fp16"] = resolve_dit_fp16(dit_fp16)
+    if fp16_trace is not None:
+        want = flag_value(fp16_trace)
+        if want is None:
+            want = env_flag("COMFY_GPU_TUNE_FP16_TRACE", "0")
+        _state["fp16_trace"] = want
+        _fp16_trace.set_enabled(want)
     if int8_linear_act is not None:
         _state["int8_linear_act"] = resolve_flag(int8_linear_act, True)
     if qwen21_residual_fuse is not None:
@@ -2406,20 +2446,26 @@ def patch_int8_linear_act():
 
 
 def patch_qwen21_fp16():
-    """Run the Qwen-Image 2.1 DiT in fp16 when it came in as bf16.
+    """Run the Qwen-Image 2.1 DiT on the fp16 activation path.
+
+    This is the measured qwen21 scope of dit_fp16; patch_dit_fp16 below
+    generalizes it to other bf16-weight DiTs.
 
     gfx906 emulates bf16 in fp32 and has no fast bf16 rocBLAS tile, while fp16
-    is the card's native path. Casting the whole forward once (hidden states,
-    context, reference latents) also makes the int8 linears' out_dtype fp16 and
-    their convrot rotation fp16, instead of one cast at the attention boundary.
-    Measured at 64x64 latent: 7.92 -> 3.83 s per forward (2.07x); the output is
-    closer to an fp32 run than the bf16 baseline is (cosine 0.9945 vs 0.9880).
+    is the card's native path. The trigger is the model's bf16 weight dtype,
+    not the incoming tensor: ComfyUI resolves a [bf16, fp32] dtype table to
+    manual_cast=fp32 on this card, so the DiT can be entered as fp32. Both bf16
+    and that fp32 fallback are cast to fp16 here (hidden states, context,
+    reference latents), and the output returns to the entry dtype.
 
-    Only bf16 inputs are touched (fp16/fp32 models keep their dtype) and the
-    patch is installed only where comfy reports bf16 as emulated (gfx906 and
-    other old AMD), so a native-bf16 card never pays for the cast. Like the
-    attention cast this is guarded: if the fp16 pass produces a non-finite
-    output the prefix cache is dropped and the call is rerun in the model dtype.
+    Weights are not converted: int8/convrot weights stay int8 and follow the
+    activation dtype through out_dtype/rotation; non-int8 Linear layers run in
+    the model's original compute dtype and return fp16. Measured at 64x64
+    latent with the boundary cast: 7.92 -> 3.83 s per forward (2.07x).
+
+    Like the attention cast this is guarded: if the fp16 pass produces a
+    non-finite output the prefix cache is dropped and the call is rerun in the
+    model dtype.
     """
     import comfy.ldm.qwen_image21.model as qwen
 
@@ -2430,23 +2476,31 @@ def patch_qwen21_fp16():
 
     def _forward(self, x, timesteps, context, ref_latents=None, image_slots=None,
                  transformer_options={}, **kwargs):
-        if not _state.get("qwen21_fp16", True) or x.dtype != torch.bfloat16:
+        entry = _fp16_entry_dtype(self, x)
+        if _state.get("dit_fp16") not in ("qwen21", "all") or entry is None:
             return original(self, x, timesteps, context, ref_latents, image_slots,
                             transformer_options, **kwargs)
-        half_ctx = (context.half() if isinstance(context, torch.Tensor)
-                    and context.is_floating_point() else context)
-        half_refs = [r.half() for r in ref_latents] if ref_latents is not None else ref_latents
-        out = original(self, x.half(), timesteps, half_ctx, half_refs, image_slots,
-                       transformer_options, **kwargs)
+        cast_fp32 = getattr(self, "dtype", None) == torch.bfloat16
+        half_ctx = _bf16_to_fp16(context, cast_fp32) if isinstance(context, torch.Tensor) else context
+        half_refs = ([_bf16_to_fp16(r, cast_fp32) for r in ref_latents]
+                     if ref_latents is not None else ref_latents)
+        _enter_fp16_stream()
+        try:
+            out = original(self, x.half(), timesteps, half_ctx, half_refs, image_slots,
+                           transformer_options, **kwargs)
+        finally:
+            _leave_fp16_stream()
         if torch.isfinite(out).all():
             _state["qwen21_fp16_calls"] = _state.get("qwen21_fp16_calls", 0) + 1
-            return out.to(x.dtype)
+            if entry == torch.float32:
+                _state["qwen21_fp16_fp32_calls"] = _state.get("qwen21_fp16_fp32_calls", 0) + 1
+            return out.to(entry)
         # overflowed past the block clamp: drop the fp16 prefix cache (it was
         # filled from the failed pass) and rerun this call in the model dtype
         if not _state.get("qwen21_fp16_overflow_logged"):
             _state["qwen21_fp16_overflow_logged"] = True
             logging.warning("gpu-tune: qwen21 fp16 forward overflowed; rerunning in %s. "
-                            "Set qwen21_fp16=off to skip the retry", x.dtype)
+                            "Set dit_fp16 off to skip the retry", entry)
         self.reset_prefix_cache(self.prefix_cache_enabled)
         return original(self, x, timesteps, context, ref_latents, image_slots,
                         transformer_options, **kwargs)
@@ -2454,6 +2508,290 @@ def patch_qwen21_fp16():
     cls._forward = _forward
     cls._gfx906_qwen21_fp16 = True
     _state["qwen21_fp16_patched"] = True
+    return True
+
+
+def _bf16_to_fp16(value, cast_fp32=False):
+    """Cast activation tensors in an argument tree to fp16.
+
+    bf16 is the normal case (a bf16 model that reached the DiT as bf16).
+    cast_fp32 covers the gfx906 manual-cast fallback: a bf16 checkpoint whose
+    inference dtype resolves to fp32 (H3, Qwen-Image 2.1) still enters the DiT
+    as fp32, and the stream is what we want in fp16. t, masks and ids are
+    float32/int and are never passed through here.
+    """
+    if isinstance(value, torch.Tensor):
+        if value.dtype == torch.bfloat16 or (cast_fp32 and value.dtype == torch.float32):
+            return value.half()
+        return value
+    if isinstance(value, list):
+        return [_bf16_to_fp16(item, cast_fp32) for item in value]
+    if isinstance(value, tuple):
+        return type(value)(_bf16_to_fp16(item, cast_fp32) for item in value)
+    if isinstance(value, dict):
+        return {key: _bf16_to_fp16(item, cast_fp32) for key, item in value.items()}
+    return value
+
+
+def _first_activation(value):
+    """The first floating tensor in an argument tree, or None.
+
+    An A/V model (MiniMax H3) passes its latents as a list, so looking at
+    positional argument 0 as a tensor is not enough.
+    """
+    if isinstance(value, torch.Tensor):
+        return value if value.is_floating_point() else None
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            found = _first_activation(item)
+            if found is not None:
+                return found
+    elif isinstance(value, dict):
+        for item in value.values():
+            found = _first_activation(item)
+            if found is not None:
+                return found
+    return None
+
+
+def _fp16_entry_dtype(model, tensor):
+    """The activation dtype to restore to, or None when the patch should skip.
+
+    A bf16 checkpoint on gfx906 has bf16 weights but the DiT can be entered
+    with fp32 activations: ComfyUI's manual-cast fallback is fp32 because the
+    model's dtype table does not advertise fp16. Both bf16 and that fp32
+    fallback are eligible; a model whose own dtype is fp32/fp16 is not.
+    """
+    if tensor is None or not tensor.is_floating_point():
+        return None
+    if tensor.dtype == torch.bfloat16:
+        return torch.bfloat16
+    if tensor.dtype == torch.float32 and getattr(model, "dtype", None) == torch.bfloat16:
+        return torch.float32
+    return None
+
+
+def _quantized_weight(weight):
+    # comfy ships more than one QuantizedTensor class; the layout tag is the
+    # stable marker, the dtype check covers a wrapper whose dtype is int8.
+    if getattr(weight, "_layout_cls", None) is not None:
+        return True
+    if type(weight).__name__ == "QuantizedTensor":
+        return True
+    try:
+        from comfy_kitchen.tensor import QuantizedTensor
+    except ImportError:
+        return False
+    return isinstance(weight, QuantizedTensor)
+
+
+def _fp16_weight_pre_hook(module, args, kwargs):
+    """Run a non-int8 Linear in the model's original compute dtype.
+
+    The stream is fp16; an int8 weight consumes it directly. A normal
+    bf16/fp32 weight keeps its own compute dtype (the dtype the model used
+    before the cast), so the patch only changes the activation stream and
+    never downcasts a weight. The fp32 islands in a model like MiniMax H3 hit
+    this path and stay fp32.
+    """
+    if not _state.get("fp16_stream_active"):
+        return None
+    module._gfx906_fp16_cast = False
+    target = getattr(module, "_gfx906_fp16_weight_dtype", None)
+    if target is None or target == torch.float16:
+        return None
+    weight = getattr(module, "weight", None)
+    if (weight is None or weight.dtype == torch.float16
+            or weight.dtype not in (torch.bfloat16, torch.float32)
+            or _quantized_weight(weight)):
+        return None
+    if args and isinstance(args[0], torch.Tensor):
+        if args[0].dtype != torch.float16:
+            return None
+        module._gfx906_fp16_cast = True
+        return (args[0].to(target), *args[1:]), kwargs
+    value = kwargs.get("input") if kwargs else None
+    if isinstance(value, torch.Tensor) and value.dtype == torch.float16:
+        module._gfx906_fp16_cast = True
+        return args, {**kwargs, "input": value.to(target)}
+    return None
+
+
+def _fp16_weight_post_hook(module, args, output):
+    """Return only the upcast Linear result to the fp16 stream."""
+    if not _state.get("fp16_stream_active"):
+        return None
+    if not getattr(module, "_gfx906_fp16_cast", False):
+        return None
+    module._gfx906_fp16_cast = False
+    if isinstance(output, torch.Tensor) and output.is_floating_point() \
+            and output.dtype != torch.float16:
+        return output.half()
+    return None
+
+
+def _linear_like(module):
+    """Linear or comfy's mixed-precision Linear (not a plain nn.Linear)."""
+    return isinstance(module, torch.nn.Linear) or (
+        hasattr(module, "in_features") and hasattr(module, "out_features")
+        and hasattr(module, "weight"))
+
+
+def _install_fp16_weight_policy(model, target_dtype):
+    """Hook non-int8 Linear layers so their weights keep the compute dtype."""
+    if target_dtype is None or target_dtype == torch.float16:
+        return
+    if (getattr(model, "_gfx906_fp16_weight_hooks", False)
+            and getattr(model, "_gfx906_fp16_weight_dtype", None) == target_dtype):
+        return
+    for module in model.modules():
+        if not _linear_like(module):
+            continue
+        module._gfx906_fp16_weight_dtype = target_dtype
+        if getattr(module, "_gfx906_fp16_weight_hooked", False):
+            continue
+        module.register_forward_pre_hook(_fp16_weight_pre_hook, with_kwargs=True)
+        module.register_forward_hook(_fp16_weight_post_hook)
+        module._gfx906_fp16_weight_hooked = True
+    model._gfx906_fp16_weight_hooks = True
+    model._gfx906_fp16_weight_dtype = target_dtype
+
+
+def _enter_fp16_stream():
+    _state["fp16_stream_active"] = _state.get("fp16_stream_active", 0) + 1
+
+
+def _leave_fp16_stream():
+    _state["fp16_stream_active"] = max(0, _state.get("fp16_stream_active", 1) - 1)
+
+
+def _fp16_to_dtype(value, dtype):
+    """The inverse of _bf16_to_fp16: only the tensors we cast are restored."""
+    if isinstance(value, torch.Tensor):
+        return value.to(dtype) if value.dtype == torch.float16 else value
+    if isinstance(value, list):
+        return [_fp16_to_dtype(item, dtype) for item in value]
+    if isinstance(value, tuple):
+        return type(value)(_fp16_to_dtype(item, dtype) for item in value)
+    if isinstance(value, dict):
+        return {key: _fp16_to_dtype(item, dtype) for key, item in value.items()}
+    return value
+
+
+def _all_finite(value):
+    if isinstance(value, torch.Tensor):
+        return not value.is_floating_point() or bool(torch.isfinite(value).all())
+    if isinstance(value, (list, tuple)):
+        return all(_all_finite(item) for item in value)
+    if isinstance(value, dict):
+        return all(_all_finite(item) for item in value.values())
+    return True
+
+
+def _install_dit_fp16_forward(model):
+    """Lazily wrap one diffusion model class with the activation fp16 path.
+
+    The wrapper sits at the shipped forward boundary, after BaseModel has
+    already cast the latents, context and extra conds. A bf16-weight model is
+    eligible whether it arrives as bf16 or as gfx906's fp32 manual-cast
+    fallback; activation trees (including A/V list latents) are converted
+    once, the fp16 outputs return to the entry dtype, and non-int8 Linear
+    layers keep their original compute dtype through forward hooks.
+    """
+    cls = type(model)
+    if getattr(cls, "_gfx906_dit_fp16_model", False):
+        return
+    original = cls.forward
+
+    def forward(self, *args, **kwargs):
+        if _state.get("dit_fp16") != "all":
+            return original(self, *args, **kwargs)
+        anchor = (_first_activation(args[0]) if args
+                  else _first_activation(kwargs.get("x")))
+        entry = _fp16_entry_dtype(self, anchor)
+        if entry is None:
+            return original(self, *args, **kwargs)
+        cast_fp32 = getattr(self, "dtype", None) == torch.bfloat16
+        half_args = list(args)
+        if half_args:
+            half_args[0] = _bf16_to_fp16(half_args[0], cast_fp32)
+        # transformer_options and masks are plumbing/range data, not the
+        # activation stream; keep their dtype and their dict identity.
+        half_kwargs = {key: (value if key in FP16_KEEP_DTYPE
+                             else _bf16_to_fp16(value, cast_fp32))
+                       for key, value in kwargs.items()}
+        _enter_fp16_stream()
+        try:
+            out = original(self, *half_args, **half_kwargs)
+        finally:
+            _leave_fp16_stream()
+        if not _all_finite(out):
+            if not _state.get("dit_fp16_overflow_logged"):
+                _state["dit_fp16_overflow_logged"] = True
+                logging.warning("gpu-tune: %s fp16 forward overflowed; rerunning in %s. "
+                                "Set dit_fp16 qwen21 (or off) to skip the retry",
+                                cls.__name__, entry)
+            _state["dit_fp16_fallbacks"] = _state.get("dit_fp16_fallbacks", 0) + 1
+            return original(self, *args, **kwargs)
+        _state["dit_fp16_calls"] = _state.get("dit_fp16_calls", 0) + 1
+        if entry == torch.float32:
+            _state["dit_fp16_fp32_calls"] = _state.get("dit_fp16_fp32_calls", 0) + 1
+        return _fp16_to_dtype(out, entry)
+
+    cls.forward = forward
+    cls._gfx906_dit_fp16_model = True
+
+
+def patch_dit_fp16():
+    """Generalize the qwen21 activation fp16 path to every bf16-weight DiT.
+
+    patch_qwen21_fp16 covers one measured class; this installs the same cast
+    on each other diffusion model's first call, gated live by dit_fp16=all.
+    Qwen-Image 2.1 keeps its own wrapper because that one also drops the
+    prefix cache when the fp16 pass overflows.
+
+    The trigger is the model's bf16 weight dtype, so a DiT entered through
+    gfx906's fp32 manual-cast fallback (MiniMax H3, Qwen-Image 2.1) is
+    eligible too. Only activations change dtype: int8 weights stay int8 and
+    non-int8 Linear layers are hooked to compute in the model's original
+    dtype. Other models are unmeasured, so all is opt-in: a non-finite fp16
+    pass is rerun once in the model dtype, and native fp16/fp32 models never
+    enter the path.
+    """
+    import comfy.model_base
+
+    base = comfy.model_base.BaseModel
+    if getattr(base, "_gfx906_dit_fp16_base", False):
+        return True
+    original = base._apply_model
+    qwen21 = getattr(comfy.model_base, "QwenImage21", None)
+
+    def _apply_model(self, *args, **kwargs):
+        if _state.get("dit_fp16") == "all" and not (
+                qwen21 is not None and isinstance(self, qwen21)):
+            _install_dit_fp16_forward(self.diffusion_model)
+        # install the weight policy before the trace hooks: the trace must see
+        # the post-hook fp16 result, not the dtype we upcast to for a weight.
+        target = None
+        if _state.get("dit_fp16") in ("qwen21", "all"):
+            get_dtype = getattr(self, "get_dtype_inference", None)
+            if get_dtype is not None:
+                target = get_dtype()
+        if target in (torch.bfloat16, torch.float32):
+            _install_fp16_weight_policy(self.diffusion_model, target)
+        trace_on = _fp16_trace.enabled()
+        if trace_on:
+            _fp16_trace.install(self.diffusion_model)
+            _fp16_trace.begin_forward()
+        try:
+            return original(self, *args, **kwargs)
+        finally:
+            if trace_on:
+                _fp16_trace.end_forward()
+
+    base._apply_model = _apply_model
+    base._gfx906_dit_fp16_base = True
+    _state["dit_fp16_patched"] = True
     return True
 
 
@@ -2800,6 +3138,7 @@ def apply():
     _install("qwen21 int8 cache", patch_qwen21_int8_cache)
     if bf16_is_emulated():
         _install("qwen21 fp16", patch_qwen21_fp16)
+        _install("dit fp16", patch_dit_fp16)
     _install("qwen21 residual", patch_qwen21_residual)
     # before any prompt runs: the queue thread binds execute_async when a prompt
     # starts, so a hook installed later would only report from the next one
@@ -2979,6 +3318,11 @@ def status():
         w4a8_line = "w4a8 off (installed)"
     else:
         w4a8_line = "w4a8 n/a"
+    qwen21_calls = _state.get("qwen21_fp16_calls", 0)
+    qwen21_fp32 = _state.get("qwen21_fp16_fp32_calls", 0)
+    all_calls = _state.get("dit_fp16_calls", 0)
+    all_fp32 = _state.get("dit_fp16_fp32_calls", 0)
+    trace_summary = _fp16_trace.hooked_summary()
     lines = [
         f"arch {_state['arch']}",
         f"comfy-kitchen triton backend "
@@ -2998,9 +3342,24 @@ def status():
          + (f", {_state.get('qwen21_int8_calls', 0)} calls" if _state.get("qwen21_int8_calls") else "")
          + ("" if _state.get("qwen21_int8_cache") else " (fp16 dequant path)"))
         if _state.get("qwen21_int8_patched") else "qwen21 int8 cache n/a",
-        (f"qwen21 fp16 {'on' if _state.get('qwen21_fp16') else 'off'}"
-         + (f", {_state.get('qwen21_fp16_calls', 0)} calls" if _state.get("qwen21_fp16_calls") else ""))
-        if _state.get("qwen21_fp16_patched") else "qwen21 fp16 n/a",
+        (f"dit fp16 {_state.get('dit_fp16', DIT_FP16_DEFAULT)}"
+         + (f", qwen21 {qwen21_calls} calls"
+            + (f" ({qwen21_fp32} fp32 entry)" if qwen21_fp32 else "")
+            if qwen21_calls else "")
+         + (f", all {all_calls} calls"
+            + (f" ({all_fp32} fp32 entry)" if all_fp32 else "")
+            if all_calls else "")
+         + (f", {_state.get('dit_fp16_fallbacks', 0)} fallback"
+            if _state.get("dit_fp16_fallbacks") else "")
+         + (", generic unavailable" if _state.get("dit_fp16") == "all"
+            and not _state.get("dit_fp16_patched") else ""))
+        if _state.get("qwen21_fp16_patched") or _state.get("dit_fp16_patched")
+        else "dit fp16 n/a",
+        (f"fp16 trace {'on' if _state.get('fp16_trace') else 'off'}"
+         + (f" {_fp16_trace.dtype_summary()}"
+            + (f", {trace_summary}" if trace_summary else "")
+            if _state.get("fp16_trace") else "")
+         + (" (report at prompt end)" if _state.get("fp16_trace") else "")),
         (f"int8 linear_act {'on' if _state.get('int8_linear_act') else 'off'}"
          + (f", {_state.get('int8_linear_act_calls', 0)} calls"
             if _state.get("int8_linear_act_calls") else ""))

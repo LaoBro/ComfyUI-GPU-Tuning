@@ -3,7 +3,7 @@
 [README](../README.md) · [CONFIG](CONFIG.md) · [GFX906](GFX906.md) · [PORTING](PORTING.md) · [HIP_KERNELS](HIP_KERNELS.md)
 
 这一层回答“它为什么快”：八个补丁各改了什么，以及单 token 文本生成的完整推导。
-安装与节点开关见 [README](../README.md) 与 [CONFIG.md](CONFIG.md)。
+安装见 [README](../README.md)，节点开关见 [CONFIG.md](CONFIG.md)。
 
 ## 八个补丁
 
@@ -35,8 +35,11 @@
 - **int8 tile 注入**：`int8_tile` 关闭时恢复上游 autotune 列表，不再注入 gfx906 tile；
   `small_batch` 单独控制 `m≤8` 的窄 tile 切换。
 - **prefix KV 复用**：`prefix_kv` 关闭时 `prefix_cached_attention` 回到 `torch.cat`。
-- **qwen21 fp16 全前向**：`qwen21_fp16`（默认 on）在模型本身是 bf16 时把整个 DiT forward
-  一次转 fp16，出口转回；64×64 latent 实测 7.92 → 3.83 s（2.07x），输出比 bf16 更接近 fp32。
+- **bf16 权重 DiT 的激活 fp16**：`dit_fp16`（默认 `qwen21`）以模型权重 dtype 为判定，把 latent
+  （含 A/V list）、context、extra conds 一次性转 fp16，出口还原；入口是 bf16 或 gfx906 的
+  fp32 manual-cast fallback 都可以。权重不动：int8/convrot 保持 int8，非 int8 Linear 用原计算
+  dtype（bf16/fp32）跑并返回 fp16。Qwen-Image 2.1 64×64 latent 实测 7.92 → 3.83 s（2.07x）；
+  `all` 推广到其它 bf16 权重模型（未实测所以 opt-in），`off` 关闭；非有限结果会用原 dtype 重跑。
 - **int8 linear_act 保持量化**：`int8_linear_act`（默认 on）包住所有
   `comfy.ops.linear_input_act` 调用点，权重 orig_dtype 与激活 dtype 不一致（gfx906 上 bf16
   激活 + fp32 manual cast）时不再 requantize→dequantize，SwiGLU/GeGLU 下投影留在 int8
@@ -103,7 +106,7 @@ bench 的 `w4a16.m1` 站点 266.6 → 93.3 us（4096x4096@m1）、496.8 → 172.
 m=2..8 为 11-45 → 18-238 GB/s（1.6-5.3x）；与 Triton 路径的差在 fp32
 舍入内（归一化 ≤3.0e-7），fp16 输出另含 1 ulp 舍入（≤4.9e-4）。
 `COMFY_GPU_TUNE_W4A16_HIP=off` 回退 Triton；m>8、fp16 激活的多行批等不合形状的批
-仍走 Triton（多行内核按 fp32 激活在 LDS 里摆 M 行，见 [HIP_KERNELS.md](HIP_KERNELS.md) 附录）。
+仍走 Triton（多行内核按 fp32 激活在 LDS 里摆 M 行，见 [GFX906_EXPERIMENTS.md](GFX906_EXPERIMENTS.md)）。
 fp16 激活 + `v_dot2_f32_f16` 的内核（`w4a16_gemv_h`）现在**是均匀格点（无 codebook）
 检查点的默认 feed**：3.4-7.2x over Triton（204-291 GB/s），数值与无损版同级（fp32 输出
 2.4e-7、fp16 输出 1 ulp），因为 `code-8` 的 16 个值在 fp16 里精确可表示。带 codebook 的
