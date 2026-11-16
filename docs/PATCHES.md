@@ -56,8 +56,8 @@
   `comfy_kitchen_int8` 的模型、int8 minimax VAE）跑本包的 int8 输入内核（默认关：
   输出 relL2 1.1–1.3e-2，fp16 内核 2.5e-4）；`int8_attn_rotate` 是它的量化旋转
   精度开关（0/64/128）。
-- **文本生成组**：`textgen` 默认 on，一次控制 `deltanet`、`kvdecode`、`llama`、`qwen35` 四项；
-  不连该节点时才按各自环境变量独立生效。
+- **文本生成组**：`textgen` 默认 on，一次控制 `deltanet`、`llama`、`qwen35` 三项；
+  不连该节点时才按各自环境变量独立生效。KV decode 折叠已烘焙进 vendored Qwen3.5，不再是独立补丁项。
 - **fp16 输入策略**：`fp16_attn` 三选一（`guarded` / `force` / `off`），合并了旧版的 `fp16` 与 `amax_guard`。
 
 ## 文本生成（单 token 解码）

@@ -26,9 +26,9 @@ it, so the table adds up instead of counting a block's attention twice.
     ... --clip X --set image_tower=off --set textgen=off
     ... --clip X --list-classes                     # the census, to pick --wrap names
 
-The four textgen items have no configure() entry; A/B them with the env
-switches that apply() reads: COMFY_GPU_TUNE_DELTANET, _KVDECODE, _LLAMA,
-_QWEN35.
+The textgen items have no configure() entry; A/B them with the env
+switches that apply() reads: COMFY_GPU_TUNE_DELTANET, _LLAMA, _QWEN35.
+(KV decode folding is baked into the vendored Qwen3.5 fork, not a separate item.)
 
 ComfyUI flags pass through (--disable-cuda-graphs, --highvram). Library use
 parses an empty argv unless comfy.options.args_parsing is set first, so this

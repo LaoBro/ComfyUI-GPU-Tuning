@@ -189,6 +189,20 @@ def _patch_generate():
         qwen35 = None
     if qwen35 is not None and getattr(qwen35, "Qwen35", None) is not None:
         _wrap_generate(qwen35.Qwen35)
+    # The vendored fork owns its own BaseGenerate/Qwen35 class copies (core's
+    # volatile qwen35/llama classes are not used). Wrap those too, otherwise
+    # their generate() never drops stale graphs and the next decode replays a
+    # graph into recycled buffers -> HSA fault. Only wrap when the fork is
+    # installed, to avoid importing vendor on cores where it is disabled.
+    try:
+        from vendor import qwen35 as vendor_qwen35
+    except ImportError:
+        vendor_qwen35 = None
+    if vendor_qwen35 is not None and getattr(vendor_qwen35, "_installed", False):
+        from vendor.qwen35 import llama_base as vendor_llama_base
+        from vendor.qwen35 import model as vendor_model
+        _wrap_generate(vendor_llama_base.BaseGenerate)
+        _wrap_generate(vendor_model.Qwen35)
     return patched
 
 

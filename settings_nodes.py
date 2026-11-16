@@ -234,10 +234,11 @@ class GpuTuningClipSettings(io.ComfyNode):
                                        "card. default keeps the manifest verdict: unmeasured cards stay on "
                                        "the shipped path, tools/bench.py --vision writes the verdict."),
                 io.Combo.Input("textgen", options=["on", "off"], default="on",
-                               tooltip="Text-generation patches: DeltaNet decode kernels, folded KV decode, "
-                                       "llama RMSNorm/RoPE caching and the Qwen3.5 compute classes. on "
-                                       "(default) enables all four, off disables them all without a reload. "
-                                       "Without this node the COMFY_GPU_TUNE_DELTANET/KVDECODE/LLAMA/ "
+                               tooltip="Text-generation patches: DeltaNet decode kernels, "
+                                       "llama RMSNorm/RoPE caching and the vendored Qwen3.5 compute "
+                                       "classes (KV decode folding is baked into the fork). on "
+                                       "(default) enables all three, off disables them all without a "
+                                       "reload. Without this node the COMFY_GPU_TUNE_DELTANET/LLAMA/ "
                                        "QWEN35/GRAPH knobs decide each item."),
             ],
             outputs=[io.Clip.Output(display_name="clip")],

@@ -75,7 +75,7 @@ FP16_KEEP_DTYPE = ("transformer_options", "denoise_mask", "audio_denoise_mask",
                    "concat_mask", "mask", "padding_mask", "attention_mask",
                    "latent_shapes")
 # Text-generation group: the CLIP node's textgen switch covers all four.
-TEXTGEN_ITEMS = ("deltanet", "kvdecode", "llama", "qwen35")
+TEXTGEN_ITEMS = ("deltanet", "llama", "qwen35")
 
 
 def stock_backend(name):
@@ -218,8 +218,15 @@ def textgen_active(name):
 def textgen_summary():
     ready = _state.get("textgen_ready", {})
     parts = []
+    vendor = _state.get("qwen35_vendor_obj")
     for name in TEXTGEN_ITEMS:
-        if name == "qwen35" and _state.get("qwen35_core"):
+        if name == "qwen35" and _state.get("qwen35_vendor"):
+            entry = "qwen35 vendored@%s" % _state["qwen35_vendor"]
+            drift = vendor.boundary_drift() if vendor else []
+            if drift:
+                entry += " DRIFT(%s)" % ",".join(drift)
+            parts.append(entry)
+        elif name == "qwen35" and _state.get("qwen35_core"):
             parts.append("qwen35 core")
         else:
             state = "on" if textgen_active(name) else ("off (installed)" if ready.get(name) else "n/a")
@@ -236,7 +243,6 @@ def _init_env_settings():
     """
     _state["textgen_env"] = {
         "deltanet": env_flag("COMFY_GPU_TUNE_DELTANET"),
-        "kvdecode": env_flag("COMFY_GPU_TUNE_KVDECODE"),
         "llama": env_flag("COMFY_GPU_TUNE_LLAMA"),
         "qwen35": env_flag("COMFY_GPU_TUNE_QWEN35"),
         "graph": env_flag("COMFY_GPU_TUNE_GRAPH"),
@@ -675,52 +681,6 @@ def measured_suffix(module):
     return f"measured {measured}/{total}"
 
 
-def patch_kv_decode(gate=None):
-    """4-D GQA matmul in FixedKVBias.decode.
-
-    The 5-D form broadcasts the KV over the GQA groups, and ATen answers that by
-    materializing a transposed copy of the whole capacity-sized cache once per
-    layer per step: 37 MB at a 2.3k prompt, 0.73 ms per layer here. Folding the
-    groups into the query rows removes the copy; the math is unchanged (bmm
-    blocking order only, <= 7e-7).
-
-    ``gate`` is read per call, so the node switch can fall back to the shipped
-    decode without a reload.
-    """
-    import comfy_kitchen
-
-    kv = compat.fixed_kv_bias()
-    if kv is None:
-        logging.info("gpu-tune: kv decode skipped: core llama no longer exposes FixedKVBias")
-        return False
-    if getattr(kv.decode, "_gfx906_folded", False):
-        return True
-
-    original = kv.decode
-
-    def decode(self, xq, xk, xv, num_kv_heads):
-        if gate is not None and not gate():
-            return original(self, xq, xk, xv, num_kv_heads)
-        batch_size, num_heads, seq, head_dim = xq.shape
-        self.key.index_copy_(2, self.position[:seq], xk)
-        self.value.index_copy_(2, self.position[:seq], xv)
-        if seq == 1 and self.seqlen is not None:
-            out = comfy_kitchen.flash_attention_decode(xq.transpose(1, 2), self.key.transpose(1, 2), self.value.transpose(1, 2), self.seqlen)
-            return out.reshape(batch_size, seq, num_heads * head_dim)
-        groups = num_heads // num_kv_heads
-        q = xq.reshape(batch_size, num_kv_heads, groups * seq, head_dim) * head_dim ** -0.5
-        bias = self.bias[..., self.bias.shape[-2] - seq:, :].unsqueeze(1)
-        scores = torch.matmul(q, self.key.transpose(-1, -2)).view(batch_size, num_kv_heads, groups, seq, -1).add_(bias)
-        probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(xq.dtype)
-        out = torch.matmul(probs.reshape(batch_size, num_kv_heads, groups * seq, -1), self.value)
-        out = out.view(batch_size, num_kv_heads, groups, seq, head_dim)
-        return out.permute(0, 3, 1, 2, 4).reshape(batch_size, seq, num_heads * head_dim)
-
-    decode._gfx906_folded = True
-    kv.decode = decode
-    return True
-
-
 def load_deltanet():
     """The DeltaNet decode kernel module, or None when Triton is unavailable."""
     try:
@@ -755,6 +715,18 @@ def load_qwen35_model():
         except ImportError:
             return None
     return qwen35
+
+
+def load_qwen35_vendor():
+    """The version-pinned Qwen3.5 encoder, or None when unavailable."""
+    try:
+        from .vendor import qwen35 as vendor_qwen35
+    except ImportError:                                   # imported as a top-level module
+        try:
+            from vendor import qwen35 as vendor_qwen35
+        except ImportError:
+            return None
+    return vendor_qwen35
 
 
 def load_resident_graph():
@@ -3195,19 +3167,31 @@ def apply():
             if _state["delta_prefill_enabled"]:
                 _install("deltanet prefill", deltanet_kernels.install_prefill,
                          lambda: textgen_active("deltanet"))
-    _state["textgen_ready"]["kvdecode"] = bool(
-        _install("kv decode", patch_kv_decode, lambda: textgen_active("kvdecode")))
     llama_patches = _install("llama loader", load_llama_patches)
     if llama_patches:
         _state["textgen_ready"]["llama"] = bool(
             _install("llama", llama_patches.install, lambda: textgen_active("llama")))
     if install_ready("qwen35"):
-        if compat.qwen35_native():
-            # 0.44+ core already carries the fused attention and KV-cache
-            # contract this pack copied from 0.39; keep core and skip the copy.
+        vendor_qwen35 = _install("qwen35 vendor loader", load_qwen35_vendor)
+        if vendor_qwen35:
+            # Version-pinned encoder: own the model classes instead of patching
+            # core's volatile internals. Core 0.44+ swapped in CombinedLinear,
+            # FixedKVCache and deferred DeltaNet kernels that fall back to torch
+            # on gfx906; the vendored 0.39 classes keep the fused decode path on
+            # every core version. te()/tokenizer() are the stable factory
+            # boundary core calls in sd.py, so swapping those two attributes is
+            # enough -- no core file is touched.
+            _state["qwen35_vendor"] = vendor_qwen35.fork_base()
+            _state["qwen35_vendor_obj"] = vendor_qwen35
+            _state["textgen_ready"]["qwen35"] = bool(
+                _install("qwen35 vendored", vendor_qwen35.install,
+                         lambda: textgen_active("qwen35")))
+        elif compat.qwen35_native():
+            # Fallback when the vendor is absent: 0.44+ core already carries the
+            # fused attention and KV-cache contract this pack copied from 0.39.
             _state["qwen35_core"] = True
-            logging.info("gpu-tune: core Qwen3.5 already has the fused attention/KV cache; "
-                         "node class swap skipped")
+            logging.info("gpu-tune: vendored Qwen3.5 unavailable; core already has the "
+                         "fused attention/KV cache, node class swap skipped")
         else:
             qwen35_model = _install("qwen35 loader", load_qwen35_model)
             if qwen35_model:
@@ -3431,6 +3415,9 @@ def status():
         f"image tower {'weight dtype + patch gemm' if _state['vision_enabled'] else 'shipped path'}",
         f"resident graph {'on' if _state.get('resident_graph') else 'off'}",
         f"compat core {compat.summary()}",
+        f"vendored qwen35: {_state.get('qwen35_vendor') or 'off'}"
+        + (f" DRIFT({','.join(_state['qwen35_vendor_obj'].boundary_drift())})"
+           if _state.get("qwen35_vendor_obj") and _state["qwen35_vendor_obj"].boundary_drift() else ""),
     ]
     manifest_line = manifest_status_line()
     if manifest_line:

@@ -23,7 +23,7 @@
 `text_encoder`（`int8`/`default`）、`text_attention`（只有 `default`）。
 
 节点里所有值都是显式的，没有“沿用启动 env”的隐式状态。文本生成的分项 env
-（`DELTANET` / `KVDECODE` / `LLAMA` / `QWEN35` / `GRAPH`）只在**没连 CLIP 节点**时生效，
+（`DELTANET` / `LLAMA` / `QWEN35` / `GRAPH`）只在**没连 CLIP 节点**时生效，
 供 `tools/chain_profile.py` 逐项归因；连上节点后由 `textgen` 的 `on`/`off` 完全接管。
 
 ### 节点开关清单
@@ -192,9 +192,8 @@ m ≤ 1 的解码仍走 GEMV；m < 128 直接回落 Triton（128 行 tile 在更
 | `COMFY_GPU_TUNE_ARCH` | 空 | 强制指定目标架构目录（没插卡开发用）。见 [PORTING.md](PORTING.md) |
 | `COMFY_GPU_TUNE_ARCH_KERNELS` | 空 | 追加内核 `.so` 搜索目录。见 [PORTING.md](PORTING.md) |
 | `COMFY_GPU_TUNE_DELTANET` | `1` | textgen 分项基准旋钮：DeltaNet 解码 Triton 内核 |
-| `COMFY_GPU_TUNE_KVDECODE` | `1` | 同上：折叠 GQA 的 KV decode |
 | `COMFY_GPU_TUNE_LLAMA` | `1` | 同上：llama RMSNorm 预计算 + RoPE 频率表 |
-| `COMFY_GPU_TUNE_QWEN35` | `1` | 同上：Qwen3.5 计算类替换（等价改写，逐方法对过 core） |
+| `COMFY_GPU_TUNE_QWEN35` | `1` | 同上：vendored Qwen3.5 计算类（含烘焙的 KV decode 折叠、split-half RoPE 等 gfx906 优化） |
 | `COMFY_GPU_TUNE_GRAPH` | `1` | textgen 分项基准旋钮：权重常驻时的逐块 CUDA graph；连上节点时由 `textgen` 的 `on`/`off` 覆盖 |
 | `COMFY_GPU_TUNE_F16_GEMM` | `1`/`0` | 非量化 fp16 linear 的 HIP GEMM；`off` 强制关掉做 A/B。缺省值由 manifest 的 `feature.f16_gemm` 决定，未实测卡为 `0`。见 [GFX906_EXPERIMENTS.md](GFX906_EXPERIMENTS.md) |
 | `COMFY_GPU_TUNE_DIT_FP16` | 空 | `dit_fp16` 的 `default` 值：`off` / `qwen21` / `all`；未设时等于 `qwen21` |

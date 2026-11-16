@@ -12,10 +12,21 @@
 - 只有 `gfx906` 随包带实测表。其它架构装好后测量门默认关、走通用路径，这是预期行为。
 - comfy-kitchen 的 triton 后端由本包在启动时自行启用，不需要用户先配置；常驻权重的逐块
   CUDA graph 由节点安装，core 已覆盖的 aimdo/VBAR 流式路径不重复捕获。
-- `ComfyUI 0.39.0` 是实测环境。0.44+ 的 Qwen3.5 使用 core 自带的融合 attention/KV cache，
-  节点会跳过旧的整类替换；其它 core 接触点按能力探测降级，不保证所有版本都无缝运行。
+- Qwen3.5 文本编码器是**版本锁定**的：`vendor/qwen35/` 自带一份 0.39.0 的计算实现
+  （`FORK_BASE` 标注来源 tag），启动时把 `comfy.text_encoders.qwen35.te/tokenizer` 这两个
+  工厂换成自带版本，让所有 core 版本都跑同一套优化。`te()` 的签名从 0.39 到 0.45.4 不变，
+  是稳定的注入边界。0.44+ core 改用 `CombinedLinear` / `FixedKVCache` / deferred DeltaNet，
+  这些在 gfx906 上回退到 torch、实测慢约 3 倍，所以不再让位给 core。gfx906 的解码优化
+  （split-half RoPE、合并 A/B GEMV、depthwise conv tap 求和、stacked q/k 归一化、KV decode
+  的 GQA group 折叠、RMSNorm 预计算权重、频率表缓存）已**直接烘焙进** `model.py` /
+  `llama_base.py`——不再靠运行时按类打补丁（那样打在 core 类上、够不到 fork 的类副本）。
+  因此旧的 `kv decode` 独立补丁项已移除：`FixedKVBias.decode` 的 seq==1 flash 路径本就是
+  stock 0.39 自带、seq>1 的 group 折叠已烘焙进 fork。`comfy_kitchen.*` 上的 Triton 内核和
+  `comfy.model_prefetch` 上的图补丁是全局符号，自带模型照常受益。
+  `COMFY_GPU_TUNE_QWEN35=off` 可退回 core 实现。参考副本在 `vendor/qwen35/reference/`，
+  用 `tools/vendor_selftest.py` 自检烘焙标记与边界。
 - 0.45 的 `CombinedLinear` / `premerge` / `PrefixCache` 已纳入兼容探测：节点只在 core
-  没有对应能力时安装旧补丁。
+  没有对应能力时安装旧补丁（仅在没有自带 Qwen3.5 实现时的回退路径）。
 - 不要求 ROCm/HIP 构建：fingerprint 对 CUDA 构建同样成立。N 卡上 int8 tile 与注意力
   内核补丁不安装、文本生成改写组照常生效，`bench.py --all` 会按设备跳过用不到的
   tile / attention 站点；本包未在 N 卡实测，性能结论由有卡的人跑出来。
@@ -158,7 +169,27 @@ fingerprint 含 ROCm 版本、Torch 构建号、Triton 版本和目标架构。�
 # 不开 ComfyUI 看判定 / 改内核后的 parity 与数值 A/B
 .venv/bin/python custom_nodes/ComfyUI-GPU-Tuning/tools/status.py
 .venv/bin/python custom_nodes/ComfyUI-GPU-Tuning/tools/verify_backends.py
+
+# 自带 Qwen3.5 的 fork 自检；以及上游改动摘要（struct 要移植 / compute 我们自带）
+.venv/bin/python custom_nodes/ComfyUI-GPU-Tuning/tools/vendor_selftest.py
+.venv/bin/python custom_nodes/ComfyUI-GPU-Tuning/tools/vendor_forward_diff.py
+#   --repo /path/to/ComfyUI --ref origin/master --save-diff /tmp/up.diff
 ```
+
+`vendor_forward_diff.py` 在 `FORK_BASE` 与上游 ref 之间 diff `qwen35.py`，按 AST 把每个
+hunk 归到它所属的定义，再按层分组：**STRUCT**（config / tokenizer / `te` 工厂，core 调用或
+决定权重键 —— 必须移植）、**VISION**（编码路径，图像条件退化才移植）、**COMPUTE**
+（解码数学，我们锁定 —— 只有实测更快才搬单个函数）。它还会校验注入边界（`te`/`tokenizer`
+签名）和权重键配置是否变动；变动会在开头以 `[!!]` 标出，这就是 fork 会失效的信号。
+
+注入边界做了防御：core 以后给 `te()` 传自带 fork 不认识的新 kwarg（如 master 的
+`vocab_size`/`tokenizer_json`）时，节点不会崩——未知参数被丢弃并打一次 WARNING，同时在
+`status()` / `textgen_summary()` 里以 `DRIFT(...)` 常驻可见。STRUCT 层已移植上游 master 的
+`vocab_size` / `tokenizer_json`（含嵌入 tokenizer 的 stop token 推导、按词表取 image/pad
+token id、以及 tokenizer 数据目录重定向到 core 安装位置），这两个参数现在会被识别并转发，
+不会再报 DRIFT；词表裁剪 checkpoint 可正常加载。节点开关关掉时走 core 原生工厂，参数原样
+透传。将来 core 若再加**新的** kwarg，同样由这套兜底 + 告警机制保护，届时按工具提示继续
+移植即可。
 
 手工指定 tile：`COMFY_GPU_TUNE_TILE_CONFIG` 让该卡视为「已实测」、列表只放这一个配置、
 不跑 autotune；`COMFY_GPU_TUNE_SMALL_TILE_CONFIG` 只换窄 tile 候选。两者都是启动期读取，

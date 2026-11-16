@@ -67,25 +67,25 @@ NO_KITCHEN = {"enable_triton_backend": lambda: None}
 
 
 def textgen_group():
-    """The env sets the per-item defaults; the node switch overrides all four."""
+    """The env sets the per-item defaults; the node switch overrides all three."""
     items = tuning.TEXTGEN_ITEMS
     with fresh():
-        os.environ.update(COMFY_GPU_TUNE_DELTANET="0", COMFY_GPU_TUNE_KVDECODE="1",
+        os.environ.update(COMFY_GPU_TUNE_DELTANET="0",
                           COMFY_GPU_TUNE_LLAMA="no", COMFY_GPU_TUNE_QWEN35="yes")
         tuning._init_env_settings()
         check("textgen env defaults", [tuning.textgen_requested(name) for name in items],
-              [False, True, False, True])
+              [False, False, True])
 
         with patched(**NO_KITCHEN):
             tuning.configure(textgen="off")
             check("textgen off beats every env", [tuning.textgen_requested(name) for name in items],
-                  [False, False, False, False])
+                  [False, False, False])
             tuning.configure(textgen="on")
             check("textgen on beats every env", [tuning.textgen_requested(name) for name in items],
-                  [True, True, True, True])
+                  [True, True, True])
             tuning.configure(textgen="default")
             check("textgen default returns to env", [tuning.textgen_requested(name) for name in items],
-                  [False, True, False, True])
+                  [False, False, True])
 
 
 def tile_specs():
