@@ -158,6 +158,7 @@ _state = {
     "small_batch_enabled": True,
     "tile_measured": False,
     "native": None,
+    "stream_load": False,
 }
 
 
@@ -739,6 +740,18 @@ def load_resident_graph():
         except ImportError:
             return None
     return resident_graph
+
+
+def load_stream_load():
+    """The --highvram safetensors file-slice loader."""
+    try:
+        from .patches import stream_load
+    except ImportError:                                   # imported as a top-level module
+        try:
+            from patches import stream_load
+        except ImportError:
+            return None
+    return stream_load
 
 
 def _gemv_rotation_ok(groupsize, device, dtype):
@@ -3083,6 +3096,11 @@ def apply():
         logging.info("gpu-tuning skipped: %s", _state["reason"])
         return _state
 
+    # before any checkpoint is loaded: on --highvram this swaps the legacy
+    # host-staged copies for comfy-aimdo file-slice reads into VRAM
+    stream_load = load_stream_load()
+    if stream_load is not None:
+        _state["stream_load"] = bool(_install("stream load", stream_load.install))
     _state["native"] = native_backend()
     on_amd = is_amd()
     if on_amd and _state["native"]:
@@ -3345,6 +3363,8 @@ def status():
     all_calls = _state.get("dit_fp16_calls", 0)
     all_fp32 = _state.get("dit_fp16_fp32_calls", 0)
     trace_summary = _fp16_trace.hooked_summary()
+    stream_load = load_stream_load()
+    stream_load_line = f"stream load {stream_load.summary() if stream_load is not None else 'n/a'}"
     lines = [
         f"arch {_state['arch']}",
         f"comfy-kitchen triton backend "
@@ -3406,6 +3426,7 @@ def status():
         f"text encoder {'int8' if _state['te_int8'] else 'default (dequantize per call)'}"
         + f", lm_head {'int8' if _state.get('logits_patched') and _state['te_int8'] else 'default'}"
         + f", encoder attention {_state['te_attention']}",
+        stream_load_line,
         f"int8 attention "
         + ("on" if _state.get("int8_attn_enabled") else "off")
         + (f", rotate {_state.get('int8_attn_rotate', 128)}" if _state.get("int8_attn_enabled") else "")
