@@ -14,6 +14,7 @@ import comfy.model_prefetch
 import comfy.ops
 import comfy.ldm.common_dit
 import comfy.clip_model
+from comfy_kitchen.tensor import QuantizedTensor
 
 import comfy.text_encoders.qwen_vl as qwen_vl
 
@@ -1140,7 +1141,17 @@ class BaseGenerate:
             module = self.model.lm_head
         else:
             module = self.model.embed_tokens
+        weight = module.weight
 
+        # Baked-in gfx906 optimization (was the patch_logits patch on core's
+        # BaseGenerate, which cannot reach this vendored class copy). Keeping
+        # an int8 head quantized avoids dequantizing it on every token: the
+        # quantized GEMV consumes it directly. Token choice is unchanged on
+        # real activations (argmax/top-5 identical, max |dlogit| < 0.1 on a
+        # 16.4 scale -- the same approximation the encoder already makes).
+        if (isinstance(weight, QuantizedTensor) and weight.device == input.device
+                and not module.weight_function and not module.bias_function):
+            return torch.nn.functional.linear(input, weight, None)
         if not module.comfy_cast_weights:
             return torch.nn.functional.linear(input, module.weight.to(x), None)
         with comfy.ops.CastBiasWeightContext(module, input, offloadable=True) as (weight, _bias):

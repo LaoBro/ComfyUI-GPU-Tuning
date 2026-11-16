@@ -78,6 +78,11 @@ def main():
         check("model.py baked opt %s" % marker, marker in vendored_src, True)
     check("llama_base.py baked RMSNorm prepared weight",
           "_prepared_weight" in llama_src, True)
+    # int8 lm_head logits: the core patch_logits cannot reach the fork's class
+    # copy; without this baked GEMV the int8_convrot 9B dequantizes the head
+    # every token (~4x slower: 31 -> 7 it/s on the real checkpoint).
+    check("llama_base.py baked int8 logits GEMV",
+          "isinstance(weight, QuantizedTensor) and weight.device == input.device" in llama_src, True)
     # The freq-table cache must slice the position axis (dim 2). Slicing the
     # last axis returns an empty tensor once start >= feature dim (~64), which
     # feeds a null pointer to apply_rope_kernel and hangs the GPU on first decode.
