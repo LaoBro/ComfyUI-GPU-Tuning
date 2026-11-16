@@ -18,11 +18,15 @@
   是稳定的注入边界。0.44+ core 改用 `CombinedLinear` / `FixedKVCache` / deferred DeltaNet，
   这些在 gfx906 上回退到 torch、实测慢约 3 倍，所以不再让位给 core。gfx906 的解码优化
   （split-half RoPE、合并 A/B GEMV、depthwise conv tap 求和、stacked q/k 归一化、KV decode
-  的 GQA group 折叠、RMSNorm 预计算权重、频率表缓存）已**直接烘焙进** `model.py` /
-  `llama_base.py`——不再靠运行时按类打补丁（那样打在 core 类上、够不到 fork 的类副本）。
-  因此旧的 `kv decode` 独立补丁项已移除：`FixedKVBias.decode` 的 seq==1 flash 路径本就是
-  stock 0.39 自带、seq>1 的 group 折叠已烘焙进 fork。`comfy_kitchen.*` 上的 Triton 内核和
-  `comfy.model_prefetch` 上的图补丁是全局符号，自带模型照常受益。
+  的 GQA group 折叠、RMSNorm 预计算权重、频率表缓存、int8 lm_head 的 logits GEMV）已
+  **直接烘焙进** `model.py` / `llama_base.py`——不再靠运行时按类打补丁（那样打在 core
+  类上、够不到 fork 的类副本）。int8 lm_head 那条尤其关键：core 的 `patch_logits` 和
+  `resident_graph` 的 generate 包裹都够不到 fork 类，漏掉会让 int8_convrot 9B 每个 token
+  反量化整个 head，实测从 31 it/s 掉到 7 it/s；烘焙后恢复。因此旧的 `kv decode` 独立补丁项
+  已移除：`FixedKVBias.decode` 的 seq==1 flash 路径本就是 stock 0.39 自带、seq>1 的 group
+  折叠已烘焙进 fork。`comfy_kitchen.*` 上的 Triton 内核和 `comfy.model_prefetch` 上的图补丁
+  是全局符号，自带模型照常受益；`resident_graph._patch_generate` 额外把 fork 的
+  `BaseGenerate`/`Qwen35.generate` 也包进来，否则旧图不丢弃会在非 MTP 路径触发 HSA fault。
   `COMFY_GPU_TUNE_QWEN35=off` 可退回 core 实现。参考副本在 `vendor/qwen35/reference/`，
   用 `tools/vendor_selftest.py` 自检烘焙标记与边界。
 - 0.45 的 `CombinedLinear` / `premerge` / `PrefixCache` 已纳入兼容探测：节点只在 core
